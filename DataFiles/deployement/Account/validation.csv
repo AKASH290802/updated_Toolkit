@@ -1,0 +1,3 @@
+Rule Name,Error Field,Error Message,Active,Description
+Valid_Warranty_Account_Type,Top of Page,Not a valid Warranty Account Type,False,
+Updating_Account_Type_Not_Allowed,Top of Page,Warranty Account Type cannot be updated here,True,

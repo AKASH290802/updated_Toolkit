@@ -1,0 +1,13 @@
+pandas
+sqlalchemy
+simple_salesforce
+os
+logging
+pyodbc
+urllib
+tkinter
+json
+csv
+re
+sys
+concurrent

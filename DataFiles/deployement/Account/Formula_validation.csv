@@ -1,0 +1,20 @@
+ValidationName,ErrorConditionFormula,FieldName,ObjectName,Active
+Valid_Warranty_Account_Type,"IF( 
+				OR(
+								 		ISPICKVAL(WOD_2__Warranty_Account_Type__c,''),
+									ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Dealer'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Customer'), 
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Service Location'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Other'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Supplier'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Service Dealer'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'National Account'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Sales Company'),
+								ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Importer')
+						)  
+				, 
+	   FALSE,
+				TRUE			
+	)",", , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ",Account,False
+Updating_Account_Type_Not_Allowed,"NOT(ISNEW()) &&  (  NOT(ISNULL( EDI_Reference_Code__c )) && NOT(ISBLANK(EDI_Reference_Code__c))) &&
+ISCHANGED( WOD_2__Warranty_Account_Type__c ) && NOT(ISPICKVAL(WOD_2__Warranty_Account_Type__c,'Supplier'))",", , , , , , , , , , , , , ",Account,True

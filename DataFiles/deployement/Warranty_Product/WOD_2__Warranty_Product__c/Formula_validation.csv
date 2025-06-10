@@ -1,0 +1,18 @@
+ValidationName,ErrorConditionFormula,FieldName,ObjectName,Active
+Units_of_Measure_Validation,"IF( 
+				OR(
+								 		ISPICKVAL(WOD_2__Units_Of_Measure__c,''),
+									ISPICKVAL(WOD_2__Units_Of_Measure__c,'EA'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'Gallons'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'Miles'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'Hours'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'MIT'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'H'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'GAL'),
+								ISPICKVAL(WOD_2__Units_Of_Measure__c,'M')
+						)  
+				, 
+	   FALSE,
+				TRUE			
+	)",", , , , , , , , , , , , , , , , , , , , , , , , , , , , , ",Warranty_Product,True
+Name_Protection,ISCHANGED(Name) && NOT(($Profile.Name == 'Integration User' || $Profile.Name == 'System Administrator')),", , , , , , , , , , ",Warranty_Product,False

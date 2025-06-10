@@ -1,0 +1,36 @@
+{
+
+"fcs2": {
+	"username": "durairaj.marimuthu@tavant.com.pcs",
+	"password": "Tavant@123",
+	"security_token": "eXEHADCcX7PP3sHQnkIiqpFGg",
+	"domain": "test"
+},
+ "sql" : {
+	  "server": "kbtdmsqlserver.database.windows.net",
+	  "database": "KbtDmSQLDB",
+	  "username": "kbtdmadmin",
+	  "password": "KbtDm123$",
+	  "driver": "{ODBC Driver 17 for SQL Server}"
+  },
+  "deployement": {
+	"username": "data.migration@tavant.com.kubotaeuprod.deployment",
+	"password": "Welcome@789",
+	"security_token": "eDzmfhBD2048YYiCVfBiwIJGe",
+	"domain": "test"
+},
+  "dinesh":{
+	"username":"sagarverma@salesforce.com",
+	"password":"Justice@2024",
+	"security_token":"uLyX0GvcthpEZFEn1y8uK11dv",
+	"domain":"login"
+  },
+  "sql2" : {
+	"server": ".\\SQLEXPRESS",
+	"database": "dm_toolkit",
+	"username": "",
+	"password": "",
+	"driver": "{ODBC Driver 17 for SQL Server}",
+	"Trusted_Connection":"yes"
+}
+}
