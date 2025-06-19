@@ -6,6 +6,8 @@ import dataset.Connections as Connections
 import dataset.Org_selection as Org_selection
 import tkinter as tk
 from tkinter import filedialog
+import json
+import tkinter.ttk as ttk  # Add this import at the top
 
 
 def select_file():
@@ -35,8 +37,74 @@ def select_file():
     print("Selected file:", file_path)
     return file_path
 
-selected_org = Org_selection.org_select()
-object_name = input("Enter Salesforce Object Name: ").strip()
+def select_org_dropdown(orgs):
+    selected = {'value': None}
+    def on_select():
+        selected['value'] = var.get()
+        win.destroy()
+    root = tk.Tk()
+    root.withdraw()
+    win = tk.Toplevel()
+    win.title("Select Salesforce Org")
+    win.geometry("600x250")
+    win.grab_set()
+    tk.Label(win, text="Select Salesforce Org:").pack(pady=20)
+    var = tk.StringVar(win)
+    var.set(orgs[0])
+    dropdown = tk.OptionMenu(win, var, *orgs)
+    dropdown.config(width=60)
+    dropdown.pack(padx=20, pady=20)
+    btn = tk.Button(win, text="Select", command=on_select)
+    btn.pack(pady=20)
+    win.wait_window()
+    root.destroy()
+    return selected['value']
+
+def select_object_dropdown(sf):
+    # Get object names (custom + 'Account')
+    objects = [
+        obj['name'] for obj in sf.describe()['sobjects']
+        if obj['name'].endswith('__c') or obj['name'].lower() == 'account'
+    ]
+    selected_object = {'value': None}
+    def on_select(event=None):
+        selected_object['value'] = combo.get()
+        root.destroy()  # Fix: use root instead of win
+    def on_type(event):
+        typed = combo.get().strip().lower()
+        if not typed:
+            combo['values'] = objects
+        else:
+            filtered = [obj for obj in objects if typed in obj.lower()]
+            combo['values'] = filtered
+        if combo['values']:
+            combo.event_generate('<Down>')
+    root = tk.Tk()
+    root.title("Select Salesforce Object")
+    root.geometry("400x120")
+    label = tk.Label(root, text="Choose a Salesforce object:")
+    label.pack(pady=10)
+    combo = ttk.Combobox(root, values=objects, width=50)
+    combo.pack(pady=5)
+    combo.bind("<<ComboboxSelected>>", on_select)
+    combo.bind("<KeyRelease>", on_type)
+    combo.focus_set()
+    root.mainloop()
+    return selected_object['value']
+
+with open(r'C:\DM_toolkit\Services\linkedservices.json', 'r') as f:
+    creds = json.load(f)
+orgs = list(creds.keys())
+selected_org = select_org_dropdown(orgs)
+if not selected_org or selected_org not in creds:
+    raise ValueError(f"Org '{selected_org}' not found in credentials file.")
+
+# Connect to Salesforce for object dropdown
+# Fix: Use correct argument name for org selection
+sf_conn = Connections.get_salesforce_connection(file_path=r"C:\DM_toolkit\Services\linkedservices.json", org_name=selected_org)
+object_name = select_object_dropdown(sf_conn)
+if not object_name:
+    raise ValueError("No Salesforce object selected.")
 res = selected_org + "_" + object_name
 
 def safe_func_name(name):
