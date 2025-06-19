@@ -28,7 +28,7 @@ def validate_all(data_csv):
     results = pd.DataFrame(index=df.index)
     
     # Apply each validation function
-    results['validate_Updating_Account_Type_Not_Allowed'] = validate_Updating_Account_Type_Not_Allowed(df)
+    results['validate_Units_of_Measure_Validation'] = validate_Units_of_Measure_Validation(df)
     
     # Add summary column
     results['is_valid'] = results.all(axis=1)

@@ -1,0 +1,8 @@
+{
+    "CurrencyIsoCode": "CurrencyIsoCode",
+    "TWOD_Request_Message__c": "TWOD_Request_Message__c",
+    "TWOD_Response_Message__c": "TWOD_Response_Message__c",
+    "TWOD_Status__c": "TWOD_Status__c",
+    "TWOD_Type__c": "TWOD_Type__c",
+    "TWOD_Warranty_Coverages__c": "TWOD_Warranty_Coverages__c"
+}

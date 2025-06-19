@@ -1,3 +1,5 @@
+import sys
+sys.path.append(r"C:\DM_toolkit")  # Add project root to sys.path
 import pandas as pd
 import sys
 import os
@@ -8,7 +10,7 @@ rootfolder="DataFiles"
 object_name=input("Enter object name:   ")
 selected_org=Org_selection.org_select()
 object_folder = os.path.join(rootfolder, selected_org, object_name)
-mapping_paths=os.path.join(object_folder,"Mapping.csv")
+mapping_paths=os.path.join(object_folder,"details.csv")
 data_path=os.path.join(object_folder,f'sql_{selected_org}__{object_name}.csv')
 
 mapping_df=pd.read_csv(mapping_paths)

@@ -1,0 +1,16 @@
+Rule Name,Error Field,Error Message,Active,Description
+Account_Otherthan_IRW_ISP_Canbe_Created,Type,You are not allowed to create this Account Type,False,"If user tries to create any other type other than RWS, ISP using New button, there should be error message"
+DTAG_RestrictMultipleBUforWholeSale,Top of Page,Only one Business Unit can be added for Wholesaler.,True,
+DTAG_Restrict_For_Released_Status,Top of Page,"Landed Cost Calculation, Participating in Remanufacturing, Dealer Discount Group (Parts), Labor Units are mandatory for Released Account.",False,"Validation for Released Account. Mandatory fields (Landed Cost Calculation, Participating in Remanufacturing, Dealer Discount Group (Parts), Labor Units)
+28th July 2024:CLARA-19812 This is deactivated & moved to AccountAssociation/AccountTrigger"
+DTAG_WACanCreateRWSOnly,Top of Page,Warranty Admin can only create RWS account,True,Warranty Admin will only be able to create RWS account
+DTAG_WACannotRealeaseAccount,Top of Page,Warranty Admin cannot release an account,False,Warranty Admin cannot release an account
+ParenAcc_cant_ActiveInactv_for_Released,Status,"The account status cannot be changed,The Parent account has a lower status.",False,Parent account cant be in Active/Inactive for Released Child account
+Parent_Account_Mandatory_Except_HQ,Parent Account,A account without a parent account can't be activated!,False,If the Account being activated or released has a parent defined except HQ
+Parent_cannot_be_Draft_for_Child_active,Status,"The account status cannot be changed,The Parent account has a lower status.",True,
+Restrict_For_ActiveOrReleased_Status,Top of Page,"Account Number, Type, Business Unit are mandatory for Active/Released",True,"Validation for Active/Released these fields are mandatory (Account Number, Type, Business Unit)"
+ValidFromIsRequiredForReleased,Top of Page,Valid From Date is required for Released Accounts,True,Valid From date is required for the Released accounts.
+DT_Billing_country_should_be_AU_or_NZ,Top of Page,Billing country should be AU or NZ,True,Billing country should be AU or NZ
+DTAG_Restrict_CurrencyforReleased,Account Currency,Account Currency is mandatory for Released Account.,True,"Validation for Released Account. Mandatory fields (Dealer Discount Group (Parts),Labor Units,Participating in Remanufacturingy) for wholesaler() and RWS accounts. CLARA-19812"
+DTAG_Restrict_For_Released_Status_New,Top of Page,"Dealer Discount Group (Parts), Labor Units, Participating in Remanufacturing are mandatory for Released Account.",True,"Validation for Released Account. Mandatory fields (Dealer Discount Group (Parts),Labor Units,Participating in Remanufacturingy) for wholesaler() and RWS accounts. CLARA-19812"
+DTAG_Restrict_LandedCost_ReleasedStatus,Landed Cost Calculation,Landed Cost Calculation is mandatory for Released Account.,True,Validation for Released Account. Mandatory fields (Landed Cost Calculation) for wholesaler() CLARA-19812

@@ -1,25 +1,70 @@
+import sys
+sys.path.append(r"C:\DM_toolkit")  # Add project root to sys.path
 import pandas as pd
 import re
 import os
-import sys
 from uuid import uuid4
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import dataset.Org_selection as Org_selection
+import tkinter as tk
+from tkinter import filedialog
 
-# Configure paths
-rootfolder = "DataFiles"
+# --- Org selection as picklist ---
+def select_org(orgs):
+    import tkinter as tk
+    selected = {'value': None}
+    def on_select():
+        selected['value'] = var.get()
+        win.destroy()
+    root = tk.Tk()
+    root.withdraw()
+    win = tk.Toplevel()
+    win.title("Select Salesforce Org")
+    win.geometry("600x250")
+    win.grab_set()
+    tk.Label(win, text="Select Salesforce Org:").pack(pady=20)
+    var = tk.StringVar(win)
+    var.set(orgs[0])
+    dropdown = tk.OptionMenu(win, var, *orgs)
+    dropdown.config(width=60)
+    dropdown.pack(padx=20, pady=20)
+    btn = tk.Button(win, text="Select", command=on_select)
+    btn.pack(pady=20)
+    win.wait_window()
+    root.destroy()
+    return selected['value']
+
+import json
+with open(r'C:\DM_toolkit\Services\linkedservices.json', 'r') as f:
+    creds = json.load(f)
+orgs = list(creds.keys())
+selected_org = select_org(orgs)
+if not selected_org or selected_org not in creds:
+    raise ValueError(f"Org '{selected_org}' not found in credentials file.")
+
+# --- Object name input ---
 object_name = input("Enter object name:   ")
-selected_org = Org_selection.org_select()
-object_folder = os.path.join(rootfolder, selected_org, object_name)
-details_path = os.path.join(object_folder, "details.csv")
-file_name=input("enter file name: ")
-data_path = os.path.join(object_folder, file_name)
 
-# data_path = os.path.join(object_folder, f'sql_{selected_org}__{object_name}.csv')
+object_folder = os.path.join("DataFiles", selected_org, object_name)
+details_path=tk.filedialog.askopenfilename(
+    title="Select details file",  
+        filetypes=[("CSV files", "*.csv"), ("All files", "*")]
+)
+# details_path = os.path.join(object_folder, "details.csv")
+
+
+# --- File open dialog for data file ---
+tk.Tk().withdraw()
+file_name = filedialog.askopenfilename(
+    title="Select data file for validation",
+    filetypes=[("CSV files", "*.csv"), ("All files", "*")]
+)
+if not file_name:
+    raise ValueError("No data file selected.")
+data_path = file_name
 
 # Load the CSV files
 mapping_df = pd.read_csv(details_path)
-# Use low_memory=False to handle mixed for types warning
 data_df = pd.read_csv(data_path, low_memory=False)
 
 # Initialize the Issues column

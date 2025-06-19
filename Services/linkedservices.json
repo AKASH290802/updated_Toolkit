@@ -6,6 +6,13 @@
 	"security_token": "eXEHADCcX7PP3sHQnkIiqpFGg",
 	"domain": "test"
 },
+
+"jayashree": {
+	"username": "heardmdev01@tavant.com.dtaupqa",
+	"password": "Hera@1234",
+	"security_token": "",
+	"domain": "test"
+},
  "sql" : {
 	  "server": "kbtdmsqlserver.database.windows.net",
 	  "database": "KbtDmSQLDB",

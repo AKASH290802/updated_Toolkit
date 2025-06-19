@@ -1,0 +1,2 @@
+Rule Name,Error Field,Error Message,Active,Description
+Rate_should_be_Greater_than_0,Top of Page,Rates Cannot be Less than 0,True,

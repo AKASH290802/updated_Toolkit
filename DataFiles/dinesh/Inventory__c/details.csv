@@ -1,0 +1,13 @@
+Field Name,Label,Type,Required,Unique,Picklist Values
+Id,Record ID,id,True,False,
+OwnerId,Owner ID,reference,True,False,
+IsDeleted,Deleted,boolean,True,False,
+Name,Inventory Name,string,False,False,
+CreatedDate,Created Date,datetime,True,False,
+CreatedById,Created By ID,reference,True,False,
+LastModifiedDate,Last Modified Date,datetime,True,False,
+LastModifiedById,Last Modified By ID,reference,True,False,
+SystemModstamp,System Modstamp,datetime,True,False,
+LastActivityDate,Last Activity Date,date,False,False,
+Account__c,Dealer,reference,True,False,
+WarrantyProduct__c,WarrantyProduct,reference,True,False,
