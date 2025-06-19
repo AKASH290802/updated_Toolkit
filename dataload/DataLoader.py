@@ -298,6 +298,11 @@ try:
         else:
             row['errors'] = str(res.get('errors'))
             error_rows.append(row)
+    # Save raw input as raw.csv
+    df.to_csv(os.path.join(object_folder, "raw.csv"), index=False)
+    # Save mapped/transformed data as transformed_file.csv
+    df_mapped.to_csv(os.path.join(object_folder, "transformed_file.csv"), index=False)
+    # Save source.csv as the file actually sent to Salesforce (should match transformed_file.csv)
     df_mapped.to_csv(os.path.join(object_folder, "source.csv"), index=False)
     pd.DataFrame(success_rows).to_csv(os.path.join(object_folder, "success.csv"), index=False)
     pd.DataFrame(error_rows).to_csv(os.path.join(object_folder, "error.csv"), index=False)
