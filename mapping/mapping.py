@@ -139,7 +139,9 @@ def generate_mapping(object_name):
         mapping = {field: field for field in fields}
 
         # Save mapping to JSON file in the object folder
-        root_folder = "DataFiles"
+        root_folder = "C:\\DM_toolkit\\mapping_logs"
+        if not os.path.exists(root_folder):
+            os.makedirs(root_folder)
         object_folder = os.path.join(root_folder, selected_org, object_name)
         os.makedirs(object_folder, exist_ok=True)
         output_file = os.path.join(object_folder, "mapping.json")

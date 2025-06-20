@@ -1,10 +1,7 @@
 import pandas as pd
 
-df=pd.read_excel(r"C:\Users\dinesh.verma\Downloads\DamageCodeDAtaLoad.xls")
+df=pd.read_excel(r"C:\DM_toolkit\Unit Testing Generates\jayashree\WOD_2__Warranty_Code__c\unitTest_WOD_2__Warranty_Code__c.xlsx")
 
-df=df.rename(columns={
-    'RecordTypeName': 'RecordType.name'})
 
-print(df.columns)
 
-print(df.head(5))
+print(df)

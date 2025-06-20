@@ -54,7 +54,16 @@ file_path = filedialog.askopenfilename(
 )
 if not file_path:
     raise ValueError("No CSV file selected.")
-source_df = pd.read_csv(file_path)
+
+if file_path.endswith('.xls'):
+    source_df = pd.read_excel(file_path)
+elif file_path.endswith('.xlsx'):
+    source_df = pd.read_excel(file_path)
+elif file_path.endswith('.csv'):
+    try:
+        source_df = pd.read_csv(file_path)
+    except UnicodeDecodeError:
+        source_df = pd.read_csv(file_path, encoding='latin1')
 print("Source data\n", source_df.head(5))
 
 # --- Select Salesforce Object ---
