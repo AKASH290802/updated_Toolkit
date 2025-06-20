@@ -1,4 +1,5 @@
 {
+    "Source":"Salesforce",
     "Id": "Id",
     "Name": "Name",
     "CurrencyIsoCode": "CurrencyIsoCode",

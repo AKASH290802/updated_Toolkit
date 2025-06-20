@@ -1,42 +1,16 @@
 import pandas as pd
-import tkinter as tk
-from tkinter import ttk
 
-df=pd.read_excel(r"C:\Users\dinesh.verma\Downloads\DamageCodeDAtaLoad.xls", engine='xlrd')  # Use xlrd for .xls files
-columns = list(df.columns)
+a=['name','roll_no','marks']
+j=[]
+for i in a:
+    j.append(f'{i}:{i}')
+print(j)
 
-# Create main Tkinter window
-root = tk.Tk()
-root.title("Column Selector")
-root.geometry("300x100")
+# The following lines print the results of set operations:
+# Set of Salesforce fields: ...      # Shows all unique field names in sf_fields
+# Intersection: ...                  # Shows common elements between sf_fields and other_fields
+# Difference: ...                    # Shows elements in sf_fields but not in other_fields
+# Union: ...                         # Shows all unique elements from both sets
 
-# Variable to store selected column
-select_col = tk.StringVar(root)
-select_col.set(columns[0] if columns else "No columns")  # Default value
-
-# Function to print selected column
-def print_selected_column(*args):
-    print(f"Selected column: {select_col.get()}")
-
-# Create menu bar
-menubar = tk.Menu(root)
-root.config(menu=menubar)
-
-# Create Columns menu
-columns_menu = tk.Menu(menubar, tearoff=0)
-menubar.add_cascade(label="Columns", menu=columns_menu)
-
-# Add column names to menu
-for col in columns:
-    columns_menu.add_radiobutton(
-        label=col,
-        value=col,
-        variable=select_col,
-        command=print_selected_column
-    )
-
-# Trace changes to select_col
-select_col.trace_add("write", print_selected_column)
-
-# Start the main loop
-root.mainloop()
+# These print statements are for demonstration of set operations in Python.
+# Remove or comment them out if you do not want to see these outputs.
