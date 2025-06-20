@@ -106,12 +106,15 @@ def get_salesforce_fields(object_name):
         # Retrieve object metadata
         schema = getattr(sf_conn, object_name).describe()
         fields = schema['fields']
-        # Filter updateable fields, excluding 'id', 'isdeleted', 'sic', 'createdby'
-        excluded_keywords = ['id', 'isdeleted', 'sic', 'createdby']
-        field_names = [
-            field['name'] for field in fields
-            if field['updateable'] and not any(keyword.lower() in field['name'].lower() for keyword in excluded_keywords)
-        ]
+        # Always include 'Id' as the first field
+        field_names = ['Id']
+        # Filter updateable fields, excluding 'isdeleted', 'sic', 'createdby'
+        excluded_keywords = ['OwnerId','isdeleted', 'sic', 'createdby']
+        for field in fields:
+            if field['name'] == 'Id':
+                continue  # Already added
+            if field['updateable'] and not any(keyword.lower() in field['name'].lower() for keyword in excluded_keywords):
+                field_names.append(field['name'])
         # Add external id fields if not already present
         external_id_fields = [field['name'] for field in fields if field.get('externalId', False)]
         for ext_id in external_id_fields:

@@ -33,7 +33,18 @@ if load_mechanism == 'file':
     if not file_path:
         logger.error("No file path provided.")
         raise ValueError("File path cannot be empty")
-    df = pd.read_csv(file_path) if file_path.endswith('.csv') else pd.read_excel(file_path)
+    if file_path.endswith('.xls'):
+        df=pd.read_excel(file_path, engine='xlrd')  # Use xlrd for .xls files
+    elif file_path.endswith('.xlsx'):
+        df = pd.read_excel(file_path, engine='openpyxl')
+    elif file_path.endswith('.csv'):
+        try:
+            df = pd.read_csv(file_path)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding='latin1')
+    else:
+        logger.error("Unsupported file format. Please select a CSV or Excel file.")
+        raise ValueError("Unsupported file format")
     logger.info(f"Data loaded from {file_path} with {len(df)} records")
     # --- Ask table name first ---
     table_name = input("Enter table name to use in SQL:   ").strip()

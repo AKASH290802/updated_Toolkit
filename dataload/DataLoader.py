@@ -1,3 +1,5 @@
+import sys
+sys.path.append(r"C:\DM_toolkit")  # Add project root to sys.path
 import pandas as pd
 import json
 import simple_salesforce as sf
@@ -6,6 +8,7 @@ import tkinter.filedialog
 import tkinter.messagebox
 import os
 import tkinter.simpledialog
+import dataset.Connections as Connections
 
 # --- Step 1: Select Salesforce Org ---
 def select_org(orgs):
@@ -46,21 +49,56 @@ sf_conn = sf.Salesforce(
     domain=creds[selected_org]['domain']
 )
 
-# --- Step 2: Select Data File ---
-tkinter.Tk().withdraw()
-file = tkinter.filedialog.askopenfilename(
-    title="Select CSV or Excel File",
-    filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xls"), ("All files", "*.*")]
-)
-if not file:
-    raise ValueError("No data file selected.")
+# --- Ask user for data source ---
+def select_data_source():
+    import tkinter as tk
+    selected = {'value': None}
+    def on_select():
+        selected['value'] = var.get()
+        win.destroy()
+    root = tk.Tk()
+    root.withdraw()
+    win = tk.Toplevel()
+    win.title("Select Data Source")
+    win.geometry("400x200")
+    win.grab_set()
+    tk.Label(win, text="Select data source:").pack(pady=20)
+    var = tk.StringVar(win)
+    var.set("file")
+    dropdown = tk.OptionMenu(win, var, "file", "sql")
+    dropdown.config(width=30)
+    dropdown.pack(padx=20, pady=20)
+    btn = tk.Button(win, text="Select", command=on_select)
+    btn.pack(pady=20)
+    win.wait_window()
+    root.destroy()
+    return selected['value']
 
-if file.endswith('.xls'):
-    df = pd.read_excel(file)
-elif file.endswith('.csv'):
-    df = pd.read_csv(file)
+data_source = select_data_source()
+
+if data_source == "sql":
+    # Use Connections.get_sql_connection for SQL connection
+    sql_conn, engine = Connections.get_sql_connection()
+    query = tkinter.simpledialog.askstring("SQL Query", "Enter SQL query to fetch data:")
+    if not query:
+        raise ValueError("No SQL query provided.")
+    df = pd.read_sql(query, engine)
+elif data_source == "file":
+    tkinter.Tk().withdraw()
+    file = tkinter.filedialog.askopenfilename(
+        title="Select CSV or Excel File",
+        filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xls"), ("All files", "*.*")]
+    )
+    if not file:
+        raise ValueError("No data file selected.")
+    if file.endswith('.xls'):
+        df = pd.read_excel(file)
+    elif file.endswith('.csv'):
+        df = pd.read_csv(file)
+    else:
+        raise ValueError("Unsupported file format. Please select a CSV or Excel file.")
 else:
-    raise ValueError("Unsupported file format. Please select a CSV or Excel file.")
+    raise ValueError("Invalid data source selected.")
 
 # --- Step 3: Select Mapping File ---
 mapping_file = tkinter.filedialog.askopenfilename(
@@ -264,14 +302,27 @@ external_id_name = None
 if operation == 'upsert':
     root = tkinter.Tk()
     root.withdraw()
-    try:
-        external_id_name = tkinter.simpledialog.askstring(
-            "Input",
-            "Enter the Salesforce External ID field name to use for upsert (e.g. External_Id__c): ",
-            parent=root
-        )
-    finally:
-        root.destroy()
+    from tkinter import ttk
+    selectable_columns = [col for col in df_mapped.columns if col.lower() != 'id']
+    selected = {'value': None}
+    def on_select_dropdown():
+        selected['value'] = combo.get()
+        win.destroy()
+    win = tkinter.Toplevel()
+    win.title("Select External ID Field")
+    win.geometry("600x200")
+    win.grab_set()
+    label = tkinter.Label(win, text="Select the Salesforce External ID field for upsert (Id cannot be used):")
+    label.pack(pady=10)
+    combo = ttk.Combobox(win, values=selectable_columns, width=60)
+    if selectable_columns:
+        combo.set(selectable_columns[0])
+    combo.pack(pady=10)
+    btn = tkinter.Button(win, text="Select", command=on_select_dropdown)
+    btn.pack(pady=20)
+    win.wait_window()
+    root.destroy()
+    external_id_name = selected['value']
     if not external_id_name:
         raise ValueError("No External ID field name provided.")
     if external_id_name not in df_mapped.columns:
