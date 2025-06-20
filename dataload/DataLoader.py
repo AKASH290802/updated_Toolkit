@@ -277,7 +277,7 @@ if operation == 'upsert':
     if external_id_name not in df_mapped.columns:
         raise ValueError(f"{external_id_name} column is missing in the mapped data.")
 
-root_folder = r'DatFiles'
+root_folder = r'DataLoader_Logs'
 data_load_folder = os.path.join(root_folder, 'DataLoad')
 org_folder = os.path.join(data_load_folder, f'DataLoad_{selected_org}')
 object_folder = os.path.join(org_folder, selected_object)
