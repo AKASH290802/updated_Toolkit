@@ -9,6 +9,11 @@ import logging
 import tkinter as tk
 from tkinter import simpledialog, filedialog
 
+sql_avialale=input("Do you have SQL Server connection available? (yes/no): ").strip().lower()
+if sql_avialale=="no":
+    print("Please set up SQL Server connection in linkedservices.json file.")
+    sys.exit(0)
+
 # Configure logging (console only, no file)
 logging.basicConfig(
     level=logging.INFO,
@@ -18,7 +23,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # load data into sql using salesforce query or excel/csv file using dataframe
+
 load_mechanism = input("Enter the load mechanism (salesforce/file): ").lower()
+print("Please select the data source outside of VS Code, as it does not support GUI dialogs.")
+
 if load_mechanism not in ['salesforce', 'file']:
     logger.error("Invalid load mechanism. Please enter 'salesforce' or 'file'.")
     raise ValueError("Invalid load mechanism")
@@ -221,3 +229,5 @@ try:
     logger.info("SQL connection closed")
 except Exception as e:
     logger.error(f"Error closing SQL connection failed: {e}")
+
+
