@@ -88,8 +88,11 @@ if data_source == "sql":
     df = pd.read_sql(query, engine)
 elif data_source == "file":
     tkinter.Tk().withdraw()
+    # Set default directory to DataLoader_Logs folder
+    default_data_dir = os.path.join(project_root, 'DataLoader_Logs')
     file = tkinter.filedialog.askopenfilename(
         title="Select CSV or Excel File",
+        initialdir=default_data_dir,
         filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
     )
     if not file:
@@ -112,79 +115,10 @@ elif data_source == "file":
 else:
     raise ValueError("Invalid data source selected.")
 
+# Use data as-is (no mapping needed for pre-transformed data)
+df_mapped = df.copy()
 
-def ask_for_mapping():
-    import tkinter as tk
-    selected = {'value': None}
-    def on_yes():
-        selected['value'] = 'yes'
-        win.destroy()
-    def on_no():
-        selected['value'] = 'no'
-        win.destroy()
-    root = tk.Tk()
-    root.withdraw()
-    win = tk.Toplevel()
-    win.title("Mapping File")
-    win.geometry("400x150")
-    win.grab_set()
-    tk.Label(win, text="Do you have a mapping file?").pack(pady=20)
-    button_frame = tk.Frame(win)
-    button_frame.pack(pady=20)
-    tk.Button(button_frame, text="Yes", command=on_yes, width=10).pack(side=tk.LEFT, padx=10)
-    tk.Button(button_frame, text="No", command=on_no, width=10).pack(side=tk.LEFT, padx=10)
-    win.wait_window()
-    root.destroy()
-    return selected['value']
-
-mapping_files = ask_for_mapping()
-if mapping_files=='yes':
-# --- Step 3: Select Mapping File ---
-    # Set default directory to mapping_logs folder
-    default_mapping_dir = os.path.join(project_root, 'mapping_logs')
-    
-    mapping_file = tkinter.filedialog.askopenfilename(
-        title="Select Mapping JSON File",
-        initialdir=default_mapping_dir,
-        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-    )
-    if not mapping_file:
-        raise ValueError("No mapping file selected.")
-
-    try:
-        with open(mapping_file, 'r') as f:
-            mapping = json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        raise ValueError(f"Error reading mapping file: {e}")
-    
-    # --- Step 4: Apply Mapping ---
-    # Filter mapping to only include columns that exist in the input DataFrame
-    filtered_mapping = {k: v for k, v in mapping.items() if k in df.columns}
-else:
-    print('run mapping.py to create mapping file')
-    # If no mapping file, use all columns as-is
-    mapping = {}
-    filtered_mapping = {col: col for col in df.columns}
-if not filtered_mapping:
-    raise ValueError("None of the columns in the mapping file match the columns in the data file.")
-
-# Rename DataFrame columns based on the filtered mapping
-try:
-    df_mapped = df.rename(columns=filtered_mapping)
-    # Keep only the columns that were mapped
-    df_mapped = df_mapped[list(filtered_mapping.values())]
-except Exception as e:
-    raise ValueError(f"Error applying mapping: {e}")
-
-# Log ignored mappings
-ignored_mappings = [k for k in mapping.keys() if k not in df.columns]
-if ignored_mappings:
-    tkinter.messagebox.showwarning(
-        "Ignored Mappings",
-        f"The following columns in the mapping file were ignored as they are not in the data file: {', '.join(ignored_mappings)}"
-    )
-
-# --- Step 5: Select Operation (insert/upsert) ---
+# --- Step 3: Select Operation (insert/upsert) ---
 def select_operation():
     import tkinter as tk
     selected = {'value': None}
@@ -213,7 +147,7 @@ operation = select_operation()
 if operation not in ['insert', 'upsert']:
     raise ValueError("Operation must be 'insert' or 'upsert'.")
 
-# --- Step 6: Select Salesforce Object ---
+# --- Step 4: Select Salesforce Object ---
 object_list = list(sf_conn.describe()['sobjects'])
 object_names = [obj['name'] for obj in object_list]
 filtered_objects = [name for name in object_names if name.lower() == 'account' or 'wod' in name.lower()]
@@ -264,88 +198,7 @@ if not selected_object or selected_object not in filtered_objects:
     raise ValueError("No valid Salesforce object selected.")
 print(f"Selected Salesforce object: {selected_object}")
 
-# --- Step 7: Validate Lookup Fields ---
-# Get the object's field metadata
-object_metadata = getattr(sf_conn, selected_object).describe()
-lookup_fields = {}
-for field in object_metadata['fields']:
-    if field['type'] in ['reference'] and field['name'] in df_mapped.columns:
-        lookup_fields[field['name']] = field['referenceTo'][0] if field['referenceTo'] else None
-
-# --- Step 8: Prompt for Lookup Field Matching ---
-lookup_match_fields = {}
-for lookup_field, related_object in lookup_fields.items():
-    if related_object:
-        # Get the related object's metadata to list available fields
-        try:
-            related_metadata = getattr(sf_conn, related_object).describe()
-            field_names = [f['name'] for f in related_metadata['fields']]
-        except Exception as e:
-            tkinter.messagebox.showerror(
-                "Metadata Error",
-                f"Failed to retrieve metadata for {related_object}: {e}"
-            )
-            raise
-        root = tkinter.Tk()
-        root.withdraw()
-        # Use a dropdown for match_field selection for each lookup field
-        match_field = {'value': None}
-        def on_select_dropdown():
-            match_field['value'] = combo.get()
-            win.destroy()
-        win = tkinter.Toplevel()
-        win.title(f"Select Match Field for {lookup_field}")
-        win.geometry("600x200")
-        win.grab_set()
-        label = tkinter.Label(win, text=f"Select the field on {related_object} to match values for {lookup_field}:")
-        label.pack(pady=10)
-        from tkinter import ttk
-        combo = ttk.Combobox(win, values=field_names, width=60)
-        combo.set('Name' if 'Name' in field_names else field_names[0])
-        combo.pack(pady=10)
-        btn = tkinter.Button(win, text="Select", command=on_select_dropdown)
-        btn.pack(pady=20)
-        win.wait_window()
-        root.destroy()
-        selected_match_field = match_field['value']
-        if not selected_match_field:
-            raise ValueError(f"No matching field provided for {lookup_field}")
-        if selected_match_field not in field_names:
-            raise ValueError(f"Invalid field '{selected_match_field}' for {related_object}. Choose from: {', '.join(field_names)}")
-        lookup_match_fields[lookup_field] = selected_match_field
-
-# --- Step 9: Automatically Resolve Lookup Values ---
-# This loop will handle all lookup fields, one by one, using the mapping selected above.
-for lookup_field, related_object in lookup_fields.items():
-    if lookup_field in df_mapped.columns and related_object:
-        match_field = lookup_match_fields.get(lookup_field, 'Name')
-        unique_values = df_mapped[lookup_field].dropna().unique()
-        for value in unique_values:
-            # Check if the value is already a valid Salesforce ID (15 or 18 characters)
-            if isinstance(value, str) and len(value) in [15, 18] and value.isalnum():
-                continue
-            # Query Salesforce for the ID using the specified field
-            try:
-                # Escape single quotes in the value to prevent SOQL injection
-                escaped_value = str(value).replace("'", "\\'")
-                result = sf_conn.query(f"SELECT Id FROM {related_object} WHERE {match_field} = '{escaped_value}'")
-                if result['records']:
-                    salesforce_id = result['records'][0]['Id']
-                    df_mapped.loc[df_mapped[lookup_field] == value, lookup_field] = salesforce_id
-                else:
-                    tkinter.messagebox.showerror(
-                        "Lookup Field Error",
-                        f"No record found in {related_object} with {match_field} = '{value}' for lookup field '{lookup_field}'."
-                    )
-                    raise ValueError(f"No record found in {related_object} for {match_field} = '{value}'")
-            except Exception as e:
-                tkinter.messagebox.showerror(
-                    "Lookup Field Error",
-                    f"Failed to map '{value}' for lookup field '{lookup_field}' in {related_object}: {e}"
-                )
-                raise
-
-# --- Step 10: Prepare Data and Perform Load ---
+# --- Step 5: Prepare Data and Perform Load ---
 df_mapped.columns = df_mapped.columns.str.strip()
 
 # Clean the data to handle NaN, infinity, and other problematic values
@@ -410,6 +263,240 @@ def validate_json_compliance(df):
 
 if not validate_json_compliance(df_mapped):
     raise ValueError("Data contains values that are not JSON compliant. Please check your data for NaN, infinity, or other problematic values.")
+
+# --- Data Preview and Confirmation ---
+def show_data_preview(df, selected_object):
+    """Show data preview with Load/Cancel options and customizable preview settings"""
+    import tkinter as tk
+    from tkinter import ttk
+    
+    user_choice = {'value': None}
+    preview_rows = {'value': 100}  # Default 100 rows
+    selected_fields = {'value': list(df.columns)}  # Default all fields
+    
+    def show_settings():
+        """Show settings dialog for preview customization"""
+        settings_choice = {'rows': 100, 'fields': list(df.columns)}
+        
+        def on_settings_ok():
+            try:
+                # Get number of rows
+                rows = int(rows_entry.get())
+                if rows <= 0:
+                    tkinter.messagebox.showerror("Invalid Input", "Number of rows must be greater than 0")
+                    return
+                if rows > len(df):
+                    rows = len(df)
+                    tkinter.messagebox.showinfo("Info", f"Adjusted to maximum available rows: {len(df)}")
+                
+                settings_choice['rows'] = rows
+                
+                # Get selected fields
+                selected_indices = fields_listbox.curselection()
+                if not selected_indices:
+                    tkinter.messagebox.showerror("Invalid Selection", "Please select at least one field")
+                    return
+                
+                selected_fields_list = [fields_listbox.get(i) for i in selected_indices]
+                settings_choice['fields'] = selected_fields_list
+                
+                settings_win.destroy()
+                
+            except ValueError:
+                tkinter.messagebox.showerror("Invalid Input", "Please enter a valid number for rows")
+        
+        def on_settings_cancel():
+            settings_win.destroy()
+        
+        def select_all_fields():
+            fields_listbox.select_set(0, tk.END)
+        
+        def clear_all_fields():
+            fields_listbox.selection_clear(0, tk.END)
+        
+        settings_win = tk.Toplevel()
+        settings_win.title("Preview Settings")
+        settings_win.geometry("500x600")
+        settings_win.grab_set()
+        
+        # Rows setting
+        rows_frame = tk.Frame(settings_win)
+        rows_frame.pack(pady=10, padx=20, fill=tk.X)
+        tk.Label(rows_frame, text="Number of rows to preview:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        rows_entry = tk.Entry(rows_frame, width=10)
+        rows_entry.insert(0, str(preview_rows['value']))
+        rows_entry.pack(anchor=tk.W, pady=5)
+        tk.Label(rows_frame, text=f"(Maximum available: {len(df)})", font=("Arial", 9), fg="gray").pack(anchor=tk.W)
+        
+        # Fields setting
+        fields_frame = tk.Frame(settings_win)
+        fields_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        tk.Label(fields_frame, text="Select fields to preview:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        
+        # Fields listbox with scrollbar
+        listbox_frame = tk.Frame(fields_frame)
+        listbox_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        fields_listbox = tk.Listbox(listbox_frame, selectmode=tk.EXTENDED, height=15)
+        fields_scrollbar = tk.Scrollbar(listbox_frame, orient=tk.VERTICAL, command=fields_listbox.yview)
+        fields_listbox.configure(yscrollcommand=fields_scrollbar.set)
+        
+        for field in df.columns:
+            fields_listbox.insert(tk.END, field)
+        
+        # Select all fields by default
+        fields_listbox.select_set(0, tk.END)
+        
+        fields_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fields_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Selection buttons
+        selection_frame = tk.Frame(fields_frame)
+        selection_frame.pack(fill=tk.X, pady=5)
+        tk.Button(selection_frame, text="Select All", command=select_all_fields, width=12).pack(side=tk.LEFT, padx=5)
+        tk.Button(selection_frame, text="Clear All", command=clear_all_fields, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # Control buttons
+        button_frame = tk.Frame(settings_win)
+        button_frame.pack(pady=20)
+        tk.Button(button_frame, text="OK", command=on_settings_ok, bg="#4CAF50", fg="white", 
+                 font=("Arial", 10, "bold"), width=12).pack(side=tk.LEFT, padx=10)
+        tk.Button(button_frame, text="Cancel", command=on_settings_cancel, bg="#f44336", fg="white", 
+                 font=("Arial", 10, "bold"), width=12).pack(side=tk.LEFT, padx=10)
+        
+        settings_win.wait_window()
+        return settings_choice
+    
+    def refresh_preview():
+        """Refresh the preview with current settings"""
+        settings = show_settings()
+        if settings:
+            preview_rows['value'] = settings['rows']
+            selected_fields['value'] = settings['fields']
+            update_preview_display()
+    
+    def update_preview_display():
+        """Update the preview display with current settings"""
+        # Clear existing items
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        # Update tree columns
+        tree.configure(columns=selected_fields['value'])
+        
+        # Configure column headings and widths
+        for col in selected_fields['value']:
+            tree.heading(col, text=col)
+            tree.column(col, width=120, minwidth=80)
+        
+        # Add data to treeview
+        preview_df = df[selected_fields['value']].head(preview_rows['value'])
+        for idx, row in preview_df.iterrows():
+            # Convert row values to strings and handle None values
+            values = [str(val) if val is not None else '' for val in row.values]
+            tree.insert('', tk.END, values=values)
+        
+        # Update info labels
+        records_label.config(text=f"Total Records: {len(df)} | Showing: {len(preview_df)} rows | Columns: {len(selected_fields['value'])}")
+        preview_label.config(text=f"Showing first {preview_rows['value']} rows of {len(selected_fields['value'])} selected columns")
+    
+    def on_load():
+        user_choice['value'] = 'load'
+        preview_win.destroy()
+    
+    def on_cancel():
+        user_choice['value'] = 'cancel'
+        preview_win.destroy()
+    
+    root = tk.Tk()
+    root.withdraw()
+    
+    preview_win = tk.Toplevel()
+    preview_win.title("Data Preview - Confirm Load")
+    preview_win.geometry("1200x800")
+    preview_win.grab_set()
+    
+    # Header info
+    header_frame = tk.Frame(preview_win)
+    header_frame.pack(pady=10, padx=20, fill=tk.X)
+    
+    tk.Label(header_frame, text=f"Data Preview for Salesforce Object: {selected_object}", 
+             font=("Arial", 14, "bold")).pack()
+    
+    # Dynamic info labels
+    records_label = tk.Label(header_frame, text=f"Total Records: {len(df)} | Showing: {preview_rows['value']} rows | Columns: {len(df.columns)}", 
+                            font=("Arial", 10))
+    records_label.pack()
+    
+    preview_label = tk.Label(header_frame, text=f"Showing first {preview_rows['value']} rows of {len(selected_fields['value'])} selected columns", 
+                            font=("Arial", 10))
+    preview_label.pack(pady=(5,0))
+    
+    # Settings button
+    settings_frame = tk.Frame(preview_win)
+    settings_frame.pack(pady=5)
+    tk.Button(settings_frame, text="Customize Preview (Rows/Fields)", command=refresh_preview, 
+             bg="#2196F3", fg="white", font=("Arial", 10, "bold")).pack()
+    
+    # Data preview frame
+    data_frame = tk.Frame(preview_win)
+    data_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+    
+    # Create Treeview for data display
+    tree = ttk.Treeview(data_frame, columns=list(df.columns), show='headings', height=20)
+    
+    # Configure column headings and widths
+    for col in df.columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=120, minwidth=80)
+    
+    # Add scrollbars
+    v_scrollbar = ttk.Scrollbar(data_frame, orient=tk.VERTICAL, command=tree.yview)
+    h_scrollbar = ttk.Scrollbar(data_frame, orient=tk.HORIZONTAL, command=tree.xview)
+    tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+    
+    # Pack scrollbars and treeview
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    # Initial data load
+    update_preview_display()
+    
+    # Button frame
+    button_frame = tk.Frame(preview_win)
+    button_frame.pack(pady=20)
+    
+    # Load button (green)
+    load_btn = tk.Button(button_frame, text="Load Data to Salesforce", 
+                        command=on_load, bg="#4CAF50", fg="white", 
+                        font=("Arial", 12, "bold"), width=20, height=2)
+    load_btn.pack(side=tk.LEFT, padx=20)
+    
+    # Cancel button (red)
+    cancel_btn = tk.Button(button_frame, text="Cancel", 
+                          command=on_cancel, bg="#f44336", fg="white", 
+                          font=("Arial", 12, "bold"), width=20, height=2)
+    cancel_btn.pack(side=tk.LEFT, padx=20)
+    
+    preview_win.wait_window()
+    root.destroy()
+    
+    return user_choice['value']
+
+# Show data preview and get user confirmation
+print(f"Preparing data preview for {len(df_mapped)} records...")
+user_decision = show_data_preview(df_mapped, selected_object)
+
+if user_decision != 'load':
+    print("=" * 60)
+    print("✗ DATA LOADING CANCELLED BY USER")
+    print("✗ User cancelled the data loading operation.")
+    print("✗ No data was loaded to Salesforce.")
+    print("=" * 60)
+    exit()
+
+print("✓ User confirmed data loading. Proceeding...")
 
 # --- Batch Size Selection ---
 batch_size = 10000  # Default batch size
