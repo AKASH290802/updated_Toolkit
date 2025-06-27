@@ -1,0 +1,5 @@
+Rule Name,Error Field,Error Message,Active,Description
+Nvt_Make_Active_Mandatory,Active,Complete this field.,True,
+Nvt_Make_DSM_Mandatory,DSM,DSM can only be chosen if Warranty Account Type is Dealer/National Account,True,
+Nvt_Make_Primary_Email_Id_Mandatory,Primary Email Id,Complete this field.,True,
+Nvt_Make_warrenty_Dealer_Mandatory,Warranty Dealer Type,Warrenty Dealer type is mandatory when warranty account type is Dealer,True,

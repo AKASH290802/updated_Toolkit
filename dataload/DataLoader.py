@@ -1,5 +1,8 @@
 import sys
-sys.path.append(r"C:\DM_toolkit")  # Add project root to sys.path
+import os
+# Get the project root directory dynamically
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)  # Add project root to sys.path
 import pandas as pd
 import json
 import simple_salesforce as sf
@@ -35,7 +38,7 @@ def select_org(orgs):
     root.destroy()
     return selected['value']
 
-with open(r'C:\DM_toolkit\Services\linkedservices.json', 'r') as f:
+with open(os.path.join(project_root, 'Services', 'linkedservices.json'), 'r') as f:
     creds = json.load(f)
 orgs = list(creds.keys())
 selected_org = select_org(orgs)
@@ -87,33 +90,81 @@ elif data_source == "file":
     tkinter.Tk().withdraw()
     file = tkinter.filedialog.askopenfilename(
         title="Select CSV or Excel File",
-        filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xls"), ("All files", "*.*")]
+        filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
     )
     if not file:
         raise ValueError("No data file selected.")
-    if file.endswith('.xls'):
-        df = pd.read_excel(file)
-    elif file.endswith('.csv'):
-        df = pd.read_csv(file)
-    else:
-        raise ValueError("Unsupported file format. Please select a CSV or Excel file.")
+    try:
+        if file.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(file)
+        elif file.endswith('.csv'):
+            df = pd.read_csv(file)
+        else:
+            raise ValueError("Unsupported file format. Please select a CSV or Excel file.")
+        
+        # Validate that we have data
+        if df.empty:
+            raise ValueError("The selected file is empty.")
+        
+        print(f"Loaded {len(df)} rows and {len(df.columns)} columns from data file.")
+    except Exception as e:
+        raise ValueError(f"Error reading data file: {e}")
 else:
     raise ValueError("Invalid data source selected.")
 
+
+def ask_for_mapping():
+    import tkinter as tk
+    selected = {'value': None}
+    def on_yes():
+        selected['value'] = 'yes'
+        win.destroy()
+    def on_no():
+        selected['value'] = 'no'
+        win.destroy()
+    root = tk.Tk()
+    root.withdraw()
+    win = tk.Toplevel()
+    win.title("Mapping File")
+    win.geometry("400x150")
+    win.grab_set()
+    tk.Label(win, text="Do you have a mapping file?").pack(pady=20)
+    button_frame = tk.Frame(win)
+    button_frame.pack(pady=20)
+    tk.Button(button_frame, text="Yes", command=on_yes, width=10).pack(side=tk.LEFT, padx=10)
+    tk.Button(button_frame, text="No", command=on_no, width=10).pack(side=tk.LEFT, padx=10)
+    win.wait_window()
+    root.destroy()
+    return selected['value']
+
+mapping_files = ask_for_mapping()
+if mapping_files=='yes':
 # --- Step 3: Select Mapping File ---
-mapping_file = tkinter.filedialog.askopenfilename(
-    title="Select Mapping JSON File",
-    filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-)
-if not mapping_file:
-    raise ValueError("No mapping file selected.")
+    # Set default directory to mapping_logs folder
+    default_mapping_dir = os.path.join(project_root, 'mapping_logs')
+    
+    mapping_file = tkinter.filedialog.askopenfilename(
+        title="Select Mapping JSON File",
+        initialdir=default_mapping_dir,
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    )
+    if not mapping_file:
+        raise ValueError("No mapping file selected.")
 
-with open(mapping_file, 'r') as f:
-    mapping = json.load(f)
-
-# --- Step 4: Apply Mapping ---
-# Filter mapping to only include columns that exist in the input DataFrame
-filtered_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+    try:
+        with open(mapping_file, 'r') as f:
+            mapping = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        raise ValueError(f"Error reading mapping file: {e}")
+    
+    # --- Step 4: Apply Mapping ---
+    # Filter mapping to only include columns that exist in the input DataFrame
+    filtered_mapping = {k: v for k, v in mapping.items() if k in df.columns}
+else:
+    print('run mapping.py to create mapping file')
+    # If no mapping file, use all columns as-is
+    mapping = {}
+    filtered_mapping = {col: col for col in df.columns}
 if not filtered_mapping:
     raise ValueError("None of the columns in the mapping file match the columns in the data file.")
 
@@ -296,7 +347,114 @@ for lookup_field, related_object in lookup_fields.items():
 
 # --- Step 10: Prepare Data and Perform Load ---
 df_mapped.columns = df_mapped.columns.str.strip()
-df_mapped = df_mapped.where(pd.notnull(df_mapped), None)
+
+# Clean the data to handle NaN, infinity, and other problematic values
+def clean_dataframe_for_salesforce(df):
+    """Clean DataFrame to make it JSON compliant for Salesforce"""
+    df_clean = df.copy()
+    
+    # Replace NaN, inf, -inf with None
+    df_clean = df_clean.replace([float('inf'), float('-inf')], None)
+    df_clean = df_clean.where(pd.notnull(df_clean), None)
+    
+    # Convert numpy data types to Python native types
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            # Handle string columns - convert NaN to None and strip whitespace
+            df_clean[col] = df_clean[col].apply(
+                lambda x: str(x).strip() if pd.notnull(x) and str(x).strip() != 'nan' and str(x).strip() != '' else None
+            )
+        elif pd.api.types.is_numeric_dtype(df_clean[col]):
+            # Handle numeric columns - ensure they're JSON compliant
+            if pd.api.types.is_integer_dtype(df_clean[col]):
+                # Convert to nullable integer, then to regular int where possible
+                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                df_clean[col] = df_clean[col].apply(lambda x: int(x) if pd.notnull(x) and x == x else None)
+            else:
+                # Convert to float, handling NaN
+                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                df_clean[col] = df_clean[col].apply(lambda x: float(x) if pd.notnull(x) and x == x and abs(x) != float('inf') else None)
+        elif pd.api.types.is_datetime64_any_dtype(df_clean[col]):
+            # Handle datetime columns
+            df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ').where(pd.notnull(df_clean[col]), None)
+        elif pd.api.types.is_bool_dtype(df_clean[col]):
+            # Handle boolean columns
+            df_clean[col] = df_clean[col].apply(lambda x: bool(x) if pd.notnull(x) else None)
+    
+    return df_clean
+
+df_mapped = clean_dataframe_for_salesforce(df_mapped)
+
+# Additional validation - check for any remaining problematic values
+def validate_json_compliance(df):
+    """Validate that DataFrame can be converted to JSON"""
+    try:
+        test_records = df.head(1).to_dict('records')
+        json.dumps(test_records, allow_nan=False)
+        return True
+    except (ValueError, TypeError) as e:
+        print(f"Data validation failed: {e}")
+        
+        # Try to identify problematic columns
+        for col in df.columns:
+            try:
+                test_data = df[col].head(5).to_list()
+                json.dumps(test_data, allow_nan=False)
+            except (ValueError, TypeError) as col_error:
+                print(f"  - Column '{col}' contains problematic values: {col_error}")
+                print(f"    Sample values: {df[col].head(5).to_list()}")
+                print(f"    Data type: {df[col].dtype}")
+                print(f"    Unique values (first 10): {df[col].unique()[:10]}")
+        
+        return False
+
+if not validate_json_compliance(df_mapped):
+    raise ValueError("Data contains values that are not JSON compliant. Please check your data for NaN, infinity, or other problematic values.")
+
+# --- Batch Size Selection ---
+batch_size = 10000  # Default batch size
+if len(df_mapped) > 10000:
+    def select_batch_size():
+        import tkinter as tk
+        selected = {'value': None}
+        def on_select():
+            try:
+                size = int(entry.get())
+                if size > 0:
+                    selected['value'] = size
+                    win.destroy()
+                else:
+                    tkinter.messagebox.showerror("Invalid Input", "Batch size must be greater than 0")
+            except ValueError:
+                tkinter.messagebox.showerror("Invalid Input", "Please enter a valid number")
+        
+        root = tk.Tk()
+        root.withdraw()
+        win = tk.Toplevel()
+        win.title("Select Batch Size")
+        win.geometry("400x200")
+        win.grab_set()
+        tk.Label(win, text=f"You have {len(df_mapped)} records.").pack(pady=10)
+        tk.Label(win, text="Enter batch size for processing:").pack(pady=5)
+        entry = tk.Entry(win, width=20)
+        entry.insert(0, "10000")  # Default value
+        entry.pack(pady=10)
+        entry.focus_set()
+        btn = tk.Button(win, text="OK", command=on_select)
+        btn.pack(pady=20)
+        win.wait_window()
+        root.destroy()
+        return selected['value']
+    
+    user_batch_size = select_batch_size()
+    if user_batch_size:
+        batch_size = user_batch_size
+    else:
+        raise ValueError("No batch size selected.")
+    
+    print(f"Processing {len(df_mapped)} records in batches of {batch_size}")
+else:
+    print(f"Processing {len(df_mapped)} records (single batch)")
 
 external_id_name = None
 if operation == 'upsert':
@@ -332,41 +490,140 @@ root_folder = r'DataLoader_Logs'
 data_load_folder = os.path.join(root_folder, 'DataLoad')
 org_folder = os.path.join(data_load_folder, f'DataLoad_{selected_org}')
 object_folder = os.path.join(org_folder, selected_object)
+batches_folder = os.path.join(object_folder, 'Batches')
 os.makedirs(object_folder, exist_ok=True)
+os.makedirs(batches_folder, exist_ok=True)
+
+# Function to process data in batches
+def process_in_batches(df_data, batch_size, operation, external_id_name=None):
+    """Process DataFrame in batches and return combined results"""
+    total_records = len(df_data)
+    num_batches = (total_records + batch_size - 1) // batch_size  # Ceiling division
+    
+    all_success_rows = []
+    all_error_rows = []
+    batch_results = []
+    
+    print(f"Processing {total_records} records in {num_batches} batches...")
+    
+    for batch_num in range(num_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, total_records)
+        batch_df = df_data.iloc[start_idx:end_idx].copy()
+        
+        print(f"Processing Batch {batch_num + 1}/{num_batches} ({len(batch_df)} records)...")
+        
+        # Convert batch to records
+        batch_records = batch_df.to_dict('records')
+        
+        try:
+            # Perform bulk operation for this batch
+            if operation == 'upsert':
+                results = getattr(sf_conn.bulk, selected_object).upsert(batch_records, external_id_field=external_id_name)
+            else:
+                results = getattr(sf_conn.bulk, selected_object).insert(batch_records)
+            
+            # Process results for this batch
+            batch_success_rows = []
+            batch_error_rows = []
+            
+            for i, res in enumerate(results):
+                row = batch_df.iloc[i].copy()
+                if res.get('success'):
+                    batch_success_rows.append(row)
+                    all_success_rows.append(row)
+                else:
+                    row['errors'] = str(res.get('errors'))
+                    batch_error_rows.append(row)
+                    all_error_rows.append(row)
+            
+            # Save batch-specific files
+            batch_file_prefix = f"{selected_object}_Batch{batch_num + 1}"
+            
+            # Save batch source data
+            batch_df.to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_source.csv"), index=False)
+            
+            # Save batch results
+            if batch_success_rows:
+                pd.DataFrame(batch_success_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_success.csv"), index=False)
+            
+            if batch_error_rows:
+                pd.DataFrame(batch_error_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_error.csv"), index=False)
+            
+            batch_results.append({
+                'batch_num': batch_num + 1,
+                'total_records': len(batch_df),
+                'success_count': len(batch_success_rows),
+                'error_count': len(batch_error_rows)
+            })
+            
+            print(f"Batch {batch_num + 1} completed: {len(batch_success_rows)} success, {len(batch_error_rows)} errors")
+            
+        except Exception as e:
+            print(f"Batch {batch_num + 1} failed: {e}")
+            # Mark all records in this batch as errors
+            for i in range(len(batch_df)):
+                row = batch_df.iloc[i].copy()
+                row['errors'] = f"Batch processing failed: {str(e)}"
+                all_error_rows.append(row)
+            
+            batch_results.append({
+                'batch_num': batch_num + 1,
+                'total_records': len(batch_df),
+                'success_count': 0,
+                'error_count': len(batch_df)
+            })
+    
+    return all_success_rows, all_error_rows, batch_results
 
 try:
-    if operation == 'upsert':
-        results = getattr(sf_conn.bulk, selected_object).upsert(df_mapped.to_dict('records'), external_id_field=external_id_name)
-    else:
-        results = getattr(sf_conn.bulk, selected_object).insert(df_mapped.to_dict('records'))
-    print("Bulk operation results:", len(results))
-    success_rows = []
-    error_rows = []
-    for i, res in enumerate(results):
-        row = df_mapped.iloc[i].copy()
-        if res.get('success'):
-            success_rows.append(row)
-        else:
-            row['errors'] = str(res.get('errors'))
-            error_rows.append(row)
-    # Save raw input as raw.csv
+    print(f"Starting {operation} operation for {len(df_mapped)} records...")
+    
+    # Process data in batches
+    success_rows, error_rows, batch_results = process_in_batches(df_mapped, batch_size, operation, external_id_name)
+    
+    # Print batch summary
+    print("\nBatch Processing Summary:")
+    for batch_info in batch_results:
+        print(f"Batch {batch_info['batch_num']}: {batch_info['success_count']} success, {batch_info['error_count']} errors out of {batch_info['total_records']} records")
+    
+    total_success = len(success_rows)
+    total_errors = len(error_rows)
+    print(f"\nOverall Results: {total_success} success, {total_errors} errors out of {len(df_mapped)} total records")
+    # Save consolidated files
     df.to_csv(os.path.join(object_folder, "raw.csv"), index=False)
-    # Save mapped/transformed data as transformed_file.csv
     df_mapped.to_csv(os.path.join(object_folder, "transformed_file.csv"), index=False)
-    # Save source.csv as the file actually sent to Salesforce (should match transformed_file.csv)
     df_mapped.to_csv(os.path.join(object_folder, "source.csv"), index=False)
-    pd.DataFrame(success_rows).to_csv(os.path.join(object_folder, "success.csv"), index=False)
-    pd.DataFrame(error_rows).to_csv(os.path.join(object_folder, "error.csv"), index=False)
-    print(f"Results saved to {object_folder}/source.csv, success.csv, and error.csv")
+    
+    if success_rows:
+        pd.DataFrame(success_rows).to_csv(os.path.join(object_folder, "success.csv"), index=False)
+    else:
+        # Create empty success file
+        pd.DataFrame(columns=df_mapped.columns).to_csv(os.path.join(object_folder, "success.csv"), index=False)
+    
+    if error_rows:
+        pd.DataFrame(error_rows).to_csv(os.path.join(object_folder, "error.csv"), index=False)
+    else:
+        # Create empty error file
+        error_columns = list(df_mapped.columns) + ['errors']
+        pd.DataFrame(columns=error_columns).to_csv(os.path.join(object_folder, "error.csv"), index=False)
+    
+    print(f"Results saved to {object_folder}/")
+    print(f"Batch details saved to {batches_folder}/")
+    
     if error_rows:
         tkinter.messagebox.showwarning(
             "Load Completed with Errors",
-            f"{len(error_rows)} records failed to load. Check {object_folder}/error.csv for details."
+            f"{len(error_rows)} out of {len(df_mapped)} records failed to load.\n\n"
+            f"Check {object_folder}/error.csv for details.\n"
+            f"Batch details available in {batches_folder}/"
         )
     else:
         tkinter.messagebox.showinfo(
-            "Load Completed",
-            f"Data {operation}ed successfully into Salesforce {selected_object} object."
+            "Load Completed Successfully",
+            f"All {len(df_mapped)} records {operation}ed successfully into Salesforce {selected_object} object.\n\n"
+            f"Processed in {len(batch_results)} batch(es).\n"
+            f"Results saved to {object_folder}/"
         )
 except Exception as e:
     tkinter.messagebox.showerror(

@@ -13,6 +13,12 @@
 	"security_token": "",
 	"domain": "test"
 },
+"navitas_UAT": {
+	"username": "data.migration@tavant.com.nav.uat",
+	"password": "QuickFix@2025",
+	"security_token": "",
+	"domain": "test"
+},
  "sql" : {
 	  "server": "kbtdmsqlserver.database.windows.net",
 	  "database": "KbtDmSQLDB",
