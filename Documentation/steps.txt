@@ -18,6 +18,8 @@ Object_selection.py:
 We have created a python script called Object_selection.py which will allow you to select the salesforce object you want to work with.
 
 org_selection.py:
+in line number 2,
+add your new/updated org name which is already update in linkedservice.json
 We have created a python script called org_selection.py which will allow you to select the salesforce org you want to work with.
 
 

@@ -1,0 +1,2 @@
+Start_Time,End_Time,Processing_Duration_Seconds,Processing_Duration_Formatted,Total_Records,Total_Success,Total_Errors,Total_Unprocessed,Success_Rate_Percent,Error_Rate_Percent,Operation,Salesforce_Object,Salesforce_Org,Total_Batches,Parallel_Processing,Log_Generated_At
+2025-06-28 23:54:11,2025-06-28 23:57:45,214.49,0:03:34,84601,70400,14201,0,83.21,16.79,insert,Account,dinesh,9,True,2025-06-28 23:57:47

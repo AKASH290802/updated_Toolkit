@@ -12,6 +12,12 @@ import tkinter.messagebox
 import os
 import tkinter.simpledialog
 import dataset.Connections as Connections
+from dataload.batch_config import select_batch_and_parallel_settings, simple_batch_size_dialog
+import concurrent.futures
+import threading
+import time
+import datetime
+import csv
 
 # --- Step 1: Select Salesforce Org ---
 def select_org(orgs):
@@ -498,50 +504,47 @@ if user_decision != 'load':
 
 print("✓ User confirmed data loading. Proceeding...")
 
-# --- Batch Size Selection ---
+# --- Batch Size and Parallel Processing Selection ---
 batch_size = 10000  # Default batch size
-if len(df_mapped) > 10000:
-    def select_batch_size():
-        import tkinter as tk
-        selected = {'value': None}
-        def on_select():
-            try:
-                size = int(entry.get())
-                if size > 0:
-                    selected['value'] = size
-                    win.destroy()
-                else:
-                    tkinter.messagebox.showerror("Invalid Input", "Batch size must be greater than 0")
-            except ValueError:
-                tkinter.messagebox.showerror("Invalid Input", "Please enter a valid number")
-        
-        root = tk.Tk()
-        root.withdraw()
-        win = tk.Toplevel()
-        win.title("Select Batch Size")
-        win.geometry("400x200")
-        win.grab_set()
-        tk.Label(win, text=f"You have {len(df_mapped)} records.").pack(pady=10)
-        tk.Label(win, text="Enter batch size for processing:").pack(pady=5)
-        entry = tk.Entry(win, width=20)
-        entry.insert(0, "10000")  # Default value
-        entry.pack(pady=10)
-        entry.focus_set()
-        btn = tk.Button(win, text="OK", command=on_select)
-        btn.pack(pady=20)
-        win.wait_window()
-        root.destroy()
-        return selected['value']
+parallel_batches = 1  # Default sequential processing
+
+if len(df_mapped) > 5000:  # Show advanced settings for larger datasets
+    batch_settings = select_batch_and_parallel_settings(len(df_mapped))
     
-    user_batch_size = select_batch_size()
+    # Check if user cancelled
+    if batch_settings.get('cancelled', True):
+        print("=" * 60)
+        print("✗ BATCH PROCESSING CANCELLED BY USER")
+        print("✗ User cancelled the batch processing configuration.")
+        print("✗ Operation aborted.")
+        print("=" * 60)
+        exit()
+    
+    batch_size = batch_settings['batch_size']
+    parallel_batches = batch_settings['parallel_batches']
+    
+    total_batches = (len(df_mapped) + batch_size - 1) // batch_size
+    print(f"Processing {len(df_mapped):,} records in {total_batches} batches of {batch_size:,} records each")
+    if parallel_batches > 1:
+        print(f"Using parallel processing: {parallel_batches} batches simultaneously")
+    else:
+        print("Using sequential processing")
+        
+elif len(df_mapped) > 10000:  # Simple batch size dialog for medium datasets
+    user_batch_size = simple_batch_size_dialog(len(df_mapped))
     if user_batch_size:
         batch_size = user_batch_size
+        print(f"Processing {len(df_mapped):,} records in batches of {batch_size:,}")
     else:
-        raise ValueError("No batch size selected.")
-    
-    print(f"Processing {len(df_mapped)} records in batches of {batch_size}")
+        print("=" * 60)
+        print("✗ BATCH SIZE SELECTION CANCELLED")
+        print("✗ No batch size selected.")
+        print("✗ Operation aborted.")
+        print("=" * 60)
+        exit()
 else:
-    print(f"Processing {len(df_mapped)} records (single batch)")
+    print(f"Processing {len(df_mapped):,} records (single batch)")
+    parallel_batches = 1
 
 external_id_name = None
 if operation == 'upsert':
@@ -581,9 +584,167 @@ batches_folder = os.path.join(object_folder, 'Batches')
 os.makedirs(object_folder, exist_ok=True)
 os.makedirs(batches_folder, exist_ok=True)
 
-# Function to process data in batches
-def process_in_batches(df_data, batch_size, operation, external_id_name=None):
-    """Process DataFrame in batches and return combined results"""
+# Function to create detailed log file
+def create_processing_log(start_time, end_time, total_records, success_count, error_count, 
+                         batch_results, operation, selected_object, selected_org, object_folder):
+    """Create a comprehensive CSV log file with processing details"""
+    
+    # Calculate processing metrics
+    processing_duration = end_time - start_time
+    unprocessed_count = total_records - success_count - error_count
+    success_rate = (success_count / total_records * 100) if total_records > 0 else 0
+    error_rate = (error_count / total_records * 100) if total_records > 0 else 0
+    
+    # Create summary log file
+    summary_log_file = os.path.join(object_folder, "processing_summary.csv")
+    
+    with open(summary_log_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write header
+        writer.writerow([
+            'Start_Time', 'End_Time', 'Processing_Duration_Seconds', 'Processing_Duration_Formatted',
+            'Total_Records', 'Total_Success', 'Total_Errors', 'Total_Unprocessed',
+            'Success_Rate_Percent', 'Error_Rate_Percent', 'Operation', 'Salesforce_Object', 
+            'Salesforce_Org', 'Total_Batches', 'Parallel_Processing', 'Log_Generated_At'
+        ])
+        
+        # Format times for readability
+        start_time_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+        end_time_str = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+        duration_formatted = str(datetime.timedelta(seconds=int(processing_duration)))
+        log_generated_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Determine if parallel processing was used
+        parallel_used = any(batch.get('processing_time', 0) > 0 for batch in batch_results) and len(batch_results) > 1
+        
+        # Write summary data
+        writer.writerow([
+            start_time_str, end_time_str, f"{processing_duration:.2f}", duration_formatted,
+            total_records, success_count, error_count, unprocessed_count,
+            f"{success_rate:.2f}", f"{error_rate:.2f}", operation, selected_object,
+            selected_org, len(batch_results), parallel_used, log_generated_at
+        ])
+    
+    # Create detailed batch log file
+    batch_log_file = os.path.join(object_folder, "batch_processing_details.csv")
+    
+    with open(batch_log_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write header
+        writer.writerow([
+            'Batch_Number', 'Batch_Records', 'Batch_Success', 'Batch_Errors', 
+            'Batch_Processing_Time_Seconds', 'Batch_Success_Rate_Percent', 
+            'Batch_Error_Rate_Percent', 'Batch_Status', 'Error_Details'
+        ])
+        
+        # Write batch details
+        for batch in batch_results:
+            batch_success_rate = (batch['success_count'] / batch['total_records'] * 100) if batch['total_records'] > 0 else 0
+            batch_error_rate = (batch['error_count'] / batch['total_records'] * 100) if batch['total_records'] > 0 else 0
+            batch_status = "SUCCESS" if batch['error_count'] == 0 else "PARTIAL" if batch['success_count'] > 0 else "FAILED"
+            error_details = batch.get('error', '') if 'error' in batch else ''
+            
+            writer.writerow([
+                batch['batch_num'], batch['total_records'], batch['success_count'], 
+                batch['error_count'], f"{batch.get('processing_time', 0):.2f}",
+                f"{batch_success_rate:.2f}", f"{batch_error_rate:.2f}", 
+                batch_status, error_details
+            ])
+    
+    return summary_log_file, batch_log_file
+
+# Function to process data in batches with parallel processing support
+def create_sf_connection(org_creds):
+    """Create a new Salesforce connection for thread safety"""
+    return sf.Salesforce(
+        username=org_creds['username'],
+        password=org_creds['password'],
+        security_token=org_creds['security_token'],
+        domain=org_creds['domain']
+    )
+
+def process_single_batch(batch_data, batch_num, operation, external_id_name, selected_object, org_creds, batches_folder):
+    """Process a single batch - designed to be thread-safe"""
+    try:
+        # Create new SF connection for this thread
+        thread_sf_conn = create_sf_connection(org_creds)
+        
+        batch_df, start_time = batch_data
+        print(f"[Batch {batch_num}] Starting processing of {len(batch_df)} records...")
+        
+        # Convert batch to records
+        batch_records = batch_df.to_dict('records')
+        
+        # Perform bulk operation for this batch
+        if operation == 'upsert':
+            results = getattr(thread_sf_conn.bulk, selected_object).upsert(batch_records, external_id_field=external_id_name)
+        else:
+            results = getattr(thread_sf_conn.bulk, selected_object).insert(batch_records)
+        
+        # Process results for this batch
+        batch_success_rows = []
+        batch_error_rows = []
+        
+        for i, res in enumerate(results):
+            row = batch_df.iloc[i].copy()
+            if res.get('success'):
+                batch_success_rows.append(row)
+            else:
+                row['errors'] = str(res.get('errors'))
+                batch_error_rows.append(row)
+        
+        # Save batch-specific files
+        batch_file_prefix = f"{selected_object}_Batch{batch_num}"
+        
+        # Save batch source data
+        batch_df.to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_source.csv"), index=False)
+        
+        # Save batch results
+        if batch_success_rows:
+            pd.DataFrame(batch_success_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_success.csv"), index=False)
+        
+        if batch_error_rows:
+            pd.DataFrame(batch_error_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_error.csv"), index=False)
+        
+        processing_time = time.time() - start_time
+        print(f"[Batch {batch_num}] Completed in {processing_time:.2f}s: {len(batch_success_rows)} success, {len(batch_error_rows)} errors")
+        
+        return {
+            'batch_num': batch_num,
+            'total_records': len(batch_df),
+            'success_count': len(batch_success_rows),
+            'error_count': len(batch_error_rows),
+            'success_rows': batch_success_rows,
+            'error_rows': batch_error_rows,
+            'processing_time': processing_time
+        }
+        
+    except Exception as e:
+        processing_time = time.time() - start_time if 'start_time' in locals() else 0
+        print(f"[Batch {batch_num}] Failed in {processing_time:.2f}s: {e}")
+        
+        # Mark all records in this batch as errors
+        error_rows = []
+        for i in range(len(batch_df)):
+            row = batch_df.iloc[i].copy()
+            row['errors'] = f"Batch processing failed: {str(e)}"
+            error_rows.append(row)
+        
+        return {
+            'batch_num': batch_num,
+            'total_records': len(batch_df),
+            'success_count': 0,
+            'error_count': len(batch_df),
+            'success_rows': [],
+            'error_rows': error_rows,
+            'processing_time': processing_time,
+            'error': str(e)
+        }
+
+def process_in_batches(df_data, batch_size, operation, parallel_batches=1, external_id_name=None):
+    """Process DataFrame in batches with optional parallel processing support"""
     total_records = len(df_data)
     num_batches = (total_records + batch_size - 1) // batch_size  # Ceiling division
     
@@ -591,92 +752,134 @@ def process_in_batches(df_data, batch_size, operation, external_id_name=None):
     all_error_rows = []
     batch_results = []
     
-    print(f"Processing {total_records} records in {num_batches} batches...")
+    print(f"Processing {total_records:,} records in {num_batches} batches...")
+    if parallel_batches > 1:
+        print(f"Using parallel processing with {parallel_batches} simultaneous batches")
+    else:
+        print("Using sequential processing")
     
-    for batch_num in range(num_batches):
-        start_idx = batch_num * batch_size
-        end_idx = min(start_idx + batch_size, total_records)
-        batch_df = df_data.iloc[start_idx:end_idx].copy()
+    # Get org credentials for thread-safe connections
+    org_creds = creds[selected_org]
+    
+    if parallel_batches == 1:
+        # Sequential processing (traditional method)
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_records)
+            batch_df = df_data.iloc[start_idx:end_idx].copy()
+            
+            print(f"Processing Batch {batch_num + 1}/{num_batches} ({len(batch_df)} records)...")
+            
+            batch_data = (batch_df, time.time())
+            result = process_single_batch(batch_data, batch_num + 1, operation, external_id_name, 
+                                        selected_object, org_creds, batches_folder)
+            
+            # Collect results
+            all_success_rows.extend(result['success_rows'])
+            all_error_rows.extend(result['error_rows'])
+            batch_results.append(result)
+    else:
+        # Parallel processing
+        print(f"Preparing {num_batches} batches for parallel processing...")
         
-        print(f"Processing Batch {batch_num + 1}/{num_batches} ({len(batch_df)} records)...")
+        # Prepare batch data
+        batch_data_list = []
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_records)
+            batch_df = df_data.iloc[start_idx:end_idx].copy()
+            batch_data_list.append((batch_df, time.time()))
         
-        # Convert batch to records
-        batch_records = batch_df.to_dict('records')
-        
-        try:
-            # Perform bulk operation for this batch
-            if operation == 'upsert':
-                results = getattr(sf_conn.bulk, selected_object).upsert(batch_records, external_id_field=external_id_name)
-            else:
-                results = getattr(sf_conn.bulk, selected_object).insert(batch_records)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_batches) as executor:
+            # Submit all batches
+            future_to_batch = {}
+            for i, batch_data in enumerate(batch_data_list):
+                batch_num = i + 1
+                future = executor.submit(process_single_batch, batch_data, batch_num, operation, 
+                                       external_id_name, selected_object, org_creds, batches_folder)
+                future_to_batch[future] = batch_num
             
-            # Process results for this batch
-            batch_success_rows = []
-            batch_error_rows = []
-            
-            for i, res in enumerate(results):
-                row = batch_df.iloc[i].copy()
-                if res.get('success'):
-                    batch_success_rows.append(row)
-                    all_success_rows.append(row)
-                else:
-                    row['errors'] = str(res.get('errors'))
-                    batch_error_rows.append(row)
-                    all_error_rows.append(row)
-            
-            # Save batch-specific files
-            batch_file_prefix = f"{selected_object}_Batch{batch_num + 1}"
-            
-            # Save batch source data
-            batch_df.to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_source.csv"), index=False)
-            
-            # Save batch results
-            if batch_success_rows:
-                pd.DataFrame(batch_success_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_success.csv"), index=False)
-            
-            if batch_error_rows:
-                pd.DataFrame(batch_error_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_error.csv"), index=False)
-            
-            batch_results.append({
-                'batch_num': batch_num + 1,
-                'total_records': len(batch_df),
-                'success_count': len(batch_success_rows),
-                'error_count': len(batch_error_rows)
-            })
-            
-            print(f"Batch {batch_num + 1} completed: {len(batch_success_rows)} success, {len(batch_error_rows)} errors")
-            
-        except Exception as e:
-            print(f"Batch {batch_num + 1} failed: {e}")
-            # Mark all records in this batch as errors
-            for i in range(len(batch_df)):
-                row = batch_df.iloc[i].copy()
-                row['errors'] = f"Batch processing failed: {str(e)}"
-                all_error_rows.append(row)
-            
-            batch_results.append({
-                'batch_num': batch_num + 1,
-                'total_records': len(batch_df),
-                'success_count': 0,
-                'error_count': len(batch_df)
-            })
+            # Collect results as they complete
+            completed_batches = 0
+            for future in concurrent.futures.as_completed(future_to_batch):
+                batch_num = future_to_batch[future]
+                completed_batches += 1
+                
+                try:
+                    result = future.result()
+                    
+                    # Collect results
+                    all_success_rows.extend(result['success_rows'])
+                    all_error_rows.extend(result['error_rows'])
+                    batch_results.append(result)
+                    
+                    print(f"Completed {completed_batches}/{num_batches} batches - Batch {batch_num}: {result['success_count']} success, {result['error_count']} errors")
+                    
+                except Exception as e:
+                    print(f"Batch {batch_num} execution failed: {str(e)}")
+                    # Create error result for failed batch
+                    batch_df = batch_data_list[batch_num - 1][0]
+                    error_rows = []
+                    for i in range(len(batch_df)):
+                        row = batch_df.iloc[i].copy()
+                        row['errors'] = f"Thread execution failed: {str(e)}"
+                        error_rows.append(row)
+                    
+                    error_result = {
+                        'batch_num': batch_num,
+                        'total_records': len(batch_df),
+                        'success_count': 0,
+                        'error_count': len(batch_df),
+                        'success_rows': [],
+                        'error_rows': error_rows,
+                        'processing_time': 0,
+                        'error': str(e)
+                    }
+                    
+                    all_error_rows.extend(error_result['error_rows'])
+                    batch_results.append(error_result)
+    
+    # Sort batch results by batch number for consistent reporting
+    batch_results.sort(key=lambda x: x['batch_num'])
     
     return all_success_rows, all_error_rows, batch_results
 
 try:
     print(f"Starting {operation} operation for {len(df_mapped)} records...")
     
-    # Process data in batches
-    success_rows, error_rows, batch_results = process_in_batches(df_mapped, batch_size, operation, external_id_name)
+    # Record start time for logging
+    operation_start_time = time.time()
+    operation_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Operation started at: {operation_start_timestamp}")
+    
+    # Process data in batches with optional parallel processing
+    success_rows, error_rows, batch_results = process_in_batches(
+        df_mapped, batch_size, operation, parallel_batches, external_id_name
+    )
+    
+    # Record end time for logging
+    operation_end_time = time.time()
+    operation_end_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Operation completed at: {operation_end_timestamp}")
     
     # Print batch summary
     print("\nBatch Processing Summary:")
+    total_processing_time = sum(batch_info.get('processing_time', 0) for batch_info in batch_results)
     for batch_info in batch_results:
-        print(f"Batch {batch_info['batch_num']}: {batch_info['success_count']} success, {batch_info['error_count']} errors out of {batch_info['total_records']} records")
+        processing_time = batch_info.get('processing_time', 0)
+        print(f"Batch {batch_info['batch_num']}: {batch_info['success_count']} success, {batch_info['error_count']} errors "
+              f"out of {batch_info['total_records']} records ({processing_time:.2f}s)")
     
     total_success = len(success_rows)
     total_errors = len(error_rows)
-    print(f"\nOverall Results: {total_success} success, {total_errors} errors out of {len(df_mapped)} total records")
+    total_unprocessed = len(df_mapped) - total_success - total_errors
+    avg_batch_time = total_processing_time / len(batch_results) if batch_results else 0
+    
+    print(f"\nOverall Results: {total_success:,} success, {total_errors:,} errors, {total_unprocessed:,} unprocessed out of {len(df_mapped):,} total records")
+    print(f"Average batch processing time: {avg_batch_time:.2f} seconds")
+    print(f"Total operation time: {operation_end_time - operation_start_time:.2f} seconds")
+    if parallel_batches > 1:
+        print(f"Parallel processing used: {parallel_batches} simultaneous batches")
     # Save consolidated files
     df.to_csv(os.path.join(object_folder, "raw.csv"), index=False)
     df_mapped.to_csv(os.path.join(object_folder, "transformed_file.csv"), index=False)
@@ -698,19 +901,49 @@ try:
     print(f"Results saved to {object_folder}/")
     print(f"Batch details saved to {batches_folder}/")
     
+    # Generate comprehensive log files
+    print("Generating processing log files...")
+    try:
+        summary_log_file, batch_log_file = create_processing_log(
+            operation_start_time, operation_end_time, len(df_mapped), 
+            total_success, total_errors, batch_results, operation, 
+            selected_object, selected_org, object_folder
+        )
+        print(f"Processing summary log saved to: {summary_log_file}")
+        print(f"Batch details log saved to: {batch_log_file}")
+    except Exception as log_error:
+        print(f"Warning: Failed to generate log files: {log_error}")
+    
+    # Calculate final processing metrics for display
+    processing_duration = operation_end_time - operation_start_time
+    success_rate = (total_success / len(df_mapped) * 100) if len(df_mapped) > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print(f"PROCESSING COMPLETED SUCCESSFULLY")
+    print(f"{'='*60}")
+    print(f"Start Time: {operation_start_timestamp}")
+    print(f"End Time: {operation_end_timestamp}")
+    print(f"Duration: {processing_duration:.2f} seconds ({datetime.timedelta(seconds=int(processing_duration))})")
+    print(f"Success Rate: {success_rate:.2f}%")
+    print(f"Records Processed: {total_success + total_errors:,} / {len(df_mapped):,}")
+    print(f"{'='*60}")
+    
     if error_rows:
         tkinter.messagebox.showwarning(
             "Load Completed with Errors",
-            f"{len(error_rows)} out of {len(df_mapped)} records failed to load.\n\n"
+            f"{len(error_rows):,} out of {len(df_mapped):,} records failed to load.\n\n"
             f"Check {object_folder}/error.csv for details.\n"
-            f"Batch details available in {batches_folder}/"
+            f"Batch details available in {batches_folder}/\n"
+            f"Processing logs saved to {object_folder}/\n"
+            f"Processing method: {'Parallel' if parallel_batches > 1 else 'Sequential'}"
         )
     else:
+        parallel_info = f"({parallel_batches} parallel batches)" if parallel_batches > 1 else "(sequential)"
         tkinter.messagebox.showinfo(
             "Load Completed Successfully",
-            f"All {len(df_mapped)} records {operation}ed successfully into Salesforce {selected_object} object.\n\n"
-            f"Processed in {len(batch_results)} batch(es).\n"
-            f"Results saved to {object_folder}/"
+            f"All {len(df_mapped):,} records {operation}ed successfully into Salesforce {selected_object} object.\n\n"
+            f"Processed in {len(batch_results)} batch(es) {parallel_info}.\n"
+            f"Results and logs saved to {object_folder}/"
         )
 except Exception as e:
     tkinter.messagebox.showerror(
