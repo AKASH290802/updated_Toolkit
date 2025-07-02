@@ -8,6 +8,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import dataset.Org_selection as Org_selection
 import tkinter as tk
 from tkinter import filedialog
+import simple_salesforce as sf
+import json
 
 # --- Org selection as picklist ---
 def select_org(orgs):
@@ -42,10 +44,88 @@ selected_org = select_org(orgs)
 if not selected_org or selected_org not in creds:
     raise ValueError(f"Org '{selected_org}' not found in credentials file.")
 
-# --- Object name input ---
-object_name = input("Enter object name:   ")
+# --- Establish Salesforce connection ---
+sf_conn = sf.Salesforce(
+    username=creds[selected_org]['username'],
+    password=creds[selected_org]['password'],
+    security_token=creds[selected_org]['security_token'],
+    domain=creds[selected_org]['domain']
+)
+
+# --- Select Salesforce Object from dropdown ---
+def select_salesforce_object(sf_conn):
+    """Display a dropdown to select a Salesforce object from the org."""
+    import tkinter as tk
+    
+    # Get all Salesforce objects
+    try:
+        object_list = list(sf_conn.describe()['sobjects'])
+        object_names = [obj['name'] for obj in object_list]
+        object_names.sort()
+        
+        if not object_names:
+            raise ValueError("No Salesforce objects found in the org.")
+    except Exception as e:
+        raise ValueError(f"Error fetching Salesforce objects: {e}")
+    
+    selected = {'value': None}
+    def on_select(event=None):
+        sel = listbox.curselection()
+        if sel:
+            selected['value'] = listbox.get(sel[0])
+            win.destroy()
+    
+    def on_filter(*args):
+        filter_text = filter_var.get().lower()
+        listbox.delete(0, tk.END)
+        for obj in object_names:
+            if filter_text in obj.lower():
+                listbox.insert(tk.END, obj)
+    
+    root = tk.Tk()
+    root.withdraw()
+    win = tk.Toplevel()
+    win.title("Salesforce Object Selection")
+    win.geometry("800x600")
+    win.grab_set()
+    
+    tk.Label(win, text="Type to filter, then select Salesforce object for validation:").pack(pady=10)
+    
+    # Filter entry
+    filter_var = tk.StringVar()
+    filter_var.trace_add('write', on_filter)
+    filter_entry = tk.Entry(win, textvariable=filter_var, width=80)
+    filter_entry.pack(padx=20, pady=10)
+    filter_entry.focus_set()
+    
+    # Object listbox
+    listbox = tk.Listbox(win, selectmode=tk.SINGLE, width=100, height=30)
+    for obj in object_names:
+        listbox.insert(tk.END, obj)
+    listbox.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
+    
+    # Bind events
+    listbox.bind('<Double-1>', on_select)
+    listbox.bind('<Return>', on_select)
+    
+    # Select button
+    btn = tk.Button(win, text="Select", command=on_select)
+    btn.pack(pady=20)
+    
+    win.wait_window()
+    root.destroy()
+    return selected['value']
+
+object_name = select_salesforce_object(sf_conn)
+if not object_name:
+    raise ValueError("No Salesforce object selected.")
+
+print(f"Selected Salesforce object: {object_name}")
 
 object_folder = os.path.join("DataFiles", selected_org, object_name)
+# Ensure the object folder exists
+os.makedirs(object_folder, exist_ok=True)
+
 details_path=tk.filedialog.askopenfilename(
     title="Select details file",  
         filetypes=[("CSV files", "*.csv"), ("All files", "*")]
@@ -176,3 +256,36 @@ else:
 # Display the first few rows of the output (for verification)
 if output_df is not None:
     print(output_df.head())
+
+# --- Cleanup and completion ---
+import atexit
+def cleanup_tkinter():
+    try:
+        for widget in tk._default_root.winfo_children():
+            widget.destroy()
+        tk._default_root.quit()
+        tk._default_root.destroy()
+    except:
+        pass
+
+atexit.register(cleanup_tkinter)
+
+print("Validation completed successfully!")
+print(f"Object: {object_name}")
+print(f"Org: {selected_org}")
+print(f"Output folder: {object_folder}")
+
+# Show completion message
+try:
+    import tkinter.messagebox
+    root = tk.Tk()
+    root.withdraw()
+    tkinter.messagebox.showinfo("Validation Complete", 
+                               f"Validation completed successfully!\n\n"
+                               f"Object: {object_name}\n"
+                               f"Org: {selected_org}\n"
+                               f"Rows with issues: {issues_count}\n"
+                               f"Output saved to: {object_folder}")
+    root.destroy()
+except:
+    pass

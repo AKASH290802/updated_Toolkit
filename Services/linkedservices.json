@@ -45,5 +45,11 @@
 	"password": "",
 	"driver": "{ODBC Driver 17 for SQL Server}",
 	"Trusted_Connection":"yes"
-}
+},
+  "HeraQA":{
+	"username":"heardmdev01@tavant.com.dtaupqa",
+	"password":"Hera@1234",
+	"security_token":"",
+	"domain":"test"
+  }
 }

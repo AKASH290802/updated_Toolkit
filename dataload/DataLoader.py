@@ -102,7 +102,41 @@ elif data_source == "file":
         filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
     )
     if not file:
-        raise ValueError("No data file selected.")
+        print("No file selected. Operation cancelled.")
+        tkinter.messagebox.showinfo("No File Selected", "No data file was selected. Operation cancelled.")
+        exit()
+    
+    # Check if file exists
+    if not os.path.exists(file):
+        print(f"Selected file does not exist: {file}")
+        tkinter.messagebox.showerror(
+            "File Not Found",
+            f"The selected file could not be found:\n\n{file}\n\n"
+            f"Please ensure the file exists and try again."
+        )
+        exit()
+    
+    # Check file size
+    try:
+        file_size = os.path.getsize(file)
+        if file_size == 0:
+            print(f"Selected file is empty (0 bytes): {file}")
+            tkinter.messagebox.showerror(
+                "Empty File Error",
+                f"The selected file is empty (0 bytes):\n\n{file}\n\n"
+                f"Please select a file that contains data."
+            )
+            exit()
+        print(f"Reading file: {file} ({file_size:,} bytes)")
+    except OSError as e:
+        print(f"Cannot access file: {file} - {e}")
+        tkinter.messagebox.showerror(
+            "File Access Error",
+            f"Cannot access the selected file:\n\n{file}\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please ensure the file is not locked by another application."
+        )
+        exit()
     try:
         if file.endswith(('.xls', '.xlsx')):
             df = pd.read_excel(file)
@@ -113,11 +147,60 @@ elif data_source == "file":
         
         # Validate that we have data
         if df.empty:
-            raise ValueError("The selected file is empty.")
+            print(f"Selected file: {file}")
+            print("Error: The selected file appears to be empty (no data rows found).")
+            print("Please check:")
+            print("- The file contains data beyond just headers")
+            print("- The file is not corrupted")
+            print("- The file format is correct (CSV or Excel)")
+            tkinter.messagebox.showerror(
+                "Empty File Error",
+                f"The selected file is empty or contains no data rows.\n\n"
+                f"File: {file}\n\n"
+                f"Please select a file that contains data."
+            )
+            exit()
         
-        print(f"Loaded {len(df)} rows and {len(df.columns)} columns from data file.")
+        # Validate that we have columns
+        if len(df.columns) == 0:
+            print(f"Selected file: {file}")
+            print("Error: The selected file has no columns.")
+            tkinter.messagebox.showerror(
+                "Invalid File Error",
+                f"The selected file has no columns.\n\n"
+                f"File: {file}\n\n"
+                f"Please select a valid CSV or Excel file with column headers."
+            )
+            exit()
+        
+        print(f"Successfully loaded {len(df)} rows and {len(df.columns)} columns from: {file}")
+        print(f"Columns found: {', '.join(df.columns[:10])}" + ("..." if len(df.columns) > 10 else ""))
+        
+    except pd.errors.EmptyDataError:
+        print(f"Selected file: {file}")
+        print("Error: The file is completely empty (no data or headers).")
+        tkinter.messagebox.showerror(
+            "Empty File Error",
+            f"The selected file is completely empty.\n\n"
+            f"File: {file}\n\n"
+            f"Please select a file that contains data with headers."
+        )
+        exit()
     except Exception as e:
-        raise ValueError(f"Error reading data file: {e}")
+        print(f"Selected file: {file}")
+        print(f"Error reading data file: {e}")
+        tkinter.messagebox.showerror(
+            "File Reading Error",
+            f"Failed to read the selected file.\n\n"
+            f"File: {file}\n"
+            f"Error: {str(e)}\n\n"
+            f"Please ensure the file is:\n"
+            f"- Not open in another application\n"
+            f"- A valid CSV or Excel file\n"
+            f"- Not corrupted\n"
+            f"- Contains data with proper formatting"
+        )
+        exit()
 else:
     raise ValueError("Invalid data source selected.")
 
@@ -270,239 +353,515 @@ def validate_json_compliance(df):
 if not validate_json_compliance(df_mapped):
     raise ValueError("Data contains values that are not JSON compliant. Please check your data for NaN, infinity, or other problematic values.")
 
-# --- Data Preview and Confirmation ---
-def show_data_preview(df, selected_object):
-    """Show data preview with Load/Cancel options and customizable preview settings"""
+# --- Salesforce Field Validation ---
+def validate_salesforce_fields(sf_conn, selected_object, df_columns):
+    """Validate Salesforce fields for permissions and compatibility"""
+    print("Validating Salesforce field permissions...")
+    
+    field_validation = {
+        'valid_fields': [],
+        'permission_issues': [],
+        'not_found': [],
+        'read_only': [],
+        'validation_errors': []
+    }
+    
+    try:
+        # Get object description
+        obj_describe = getattr(sf_conn, selected_object).describe()
+        sf_fields = {field['name'].lower(): field for field in obj_describe['fields']}
+        
+        for col in df_columns:
+            col_lower = col.lower()
+            
+            # Check if field exists in Salesforce
+            if col_lower not in sf_fields:
+                field_validation['not_found'].append(col)
+                continue
+            
+            field_info = sf_fields[col_lower]
+            
+            # Check field permissions and properties
+            if not field_info.get('createable', False) and not field_info.get('updateable', False):
+                if field_info.get('calculated', False) or field_info.get('autoNumber', False):
+                    field_validation['read_only'].append(col)
+                else:
+                    field_validation['permission_issues'].append(col)
+            elif field_info.get('calculated', False):
+                field_validation['read_only'].append(col)
+            elif field_info.get('autoNumber', False):
+                field_validation['read_only'].append(col)
+            else:
+                # Additional validation checks
+                field_type = field_info.get('type', '')
+                
+                # Check for restricted field types
+                if field_type in ['address', 'location']:
+                    field_validation['validation_errors'].append(f"{col} (Complex field type: {field_type})")
+                else:
+                    field_validation['valid_fields'].append(col)
+        
+        return field_validation
+        
+    except Exception as e:
+        print(f"Warning: Could not validate Salesforce fields: {e}")
+        # If validation fails, assume all fields are valid
+        field_validation['valid_fields'] = list(df_columns)
+        field_validation['validation_errors'].append(f"Field validation failed: {e}")
+        return field_validation
+
+# --- Column Skip Selection ---
+def show_column_skip_selection(df, sf_conn, selected_object):
+    """Allow user to select which columns to skip before loading using dual-list interface with Salesforce validation"""
     import tkinter as tk
     from tkinter import ttk
     
-    user_choice = {'value': None}
-    preview_rows = {'value': 100}  # Default 100 rows
-    selected_fields = {'value': list(df.columns)}  # Default all fields
+    user_choice = {'value': None, 'skip_columns': set()}
     
-    def show_settings():
-        """Show settings dialog for preview customization"""
-        settings_choice = {'rows': 100, 'fields': list(df.columns)}
-        
-        def on_settings_ok():
-            try:
-                # Get number of rows
-                rows = int(rows_entry.get())
-                if rows <= 0:
-                    tkinter.messagebox.showerror("Invalid Input", "Number of rows must be greater than 0")
-                    return
-                if rows > len(df):
-                    rows = len(df)
-                    tkinter.messagebox.showinfo("Info", f"Adjusted to maximum available rows: {len(df)}")
-                
-                settings_choice['rows'] = rows
-                
-                # Get selected fields
-                selected_indices = fields_listbox.curselection()
-                if not selected_indices:
-                    tkinter.messagebox.showerror("Invalid Selection", "Please select at least one field")
-                    return
-                
-                selected_fields_list = [fields_listbox.get(i) for i in selected_indices]
-                settings_choice['fields'] = selected_fields_list
-                
-                settings_win.destroy()
-                
-            except ValueError:
-                tkinter.messagebox.showerror("Invalid Input", "Please enter a valid number for rows")
-        
-        def on_settings_cancel():
-            settings_win.destroy()
-        
-        def select_all_fields():
-            fields_listbox.select_set(0, tk.END)
-        
-        def clear_all_fields():
-            fields_listbox.selection_clear(0, tk.END)
-        
-        settings_win = tk.Toplevel()
-        settings_win.title("Preview Settings")
-        settings_win.geometry("500x600")
-        settings_win.grab_set()
-        
-        # Rows setting
-        rows_frame = tk.Frame(settings_win)
-        rows_frame.pack(pady=10, padx=20, fill=tk.X)
-        tk.Label(rows_frame, text="Number of rows to preview:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        rows_entry = tk.Entry(rows_frame, width=10)
-        rows_entry.insert(0, str(preview_rows['value']))
-        rows_entry.pack(anchor=tk.W, pady=5)
-        tk.Label(rows_frame, text=f"(Maximum available: {len(df)})", font=("Arial", 9), fg="gray").pack(anchor=tk.W)
-        
-        # Fields setting
-        fields_frame = tk.Frame(settings_win)
-        fields_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
-        tk.Label(fields_frame, text="Select fields to preview:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        
-        # Fields listbox with scrollbar
-        listbox_frame = tk.Frame(fields_frame)
-        listbox_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        fields_listbox = tk.Listbox(listbox_frame, selectmode=tk.EXTENDED, height=15)
-        fields_scrollbar = tk.Scrollbar(listbox_frame, orient=tk.VERTICAL, command=fields_listbox.yview)
-        fields_listbox.configure(yscrollcommand=fields_scrollbar.set)
-        
-        for field in df.columns:
-            fields_listbox.insert(tk.END, field)
-        
-        # Select all fields by default
-        fields_listbox.select_set(0, tk.END)
-        
-        fields_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        fields_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Selection buttons
-        selection_frame = tk.Frame(fields_frame)
-        selection_frame.pack(fill=tk.X, pady=5)
-        tk.Button(selection_frame, text="Select All", command=select_all_fields, width=12).pack(side=tk.LEFT, padx=5)
-        tk.Button(selection_frame, text="Clear All", command=clear_all_fields, width=12).pack(side=tk.LEFT, padx=5)
-        
-        # Control buttons
-        button_frame = tk.Frame(settings_win)
-        button_frame.pack(pady=20)
-        tk.Button(button_frame, text="OK", command=on_settings_ok, bg="#4CAF50", fg="white", 
-                 font=("Arial", 10, "bold"), width=12).pack(side=tk.LEFT, padx=10)
-        tk.Button(button_frame, text="Cancel", command=on_settings_cancel, bg="#f44336", fg="white", 
-                 font=("Arial", 10, "bold"), width=12).pack(side=tk.LEFT, padx=10)
-        
-        settings_win.wait_window()
-        return settings_choice
+    # Validate Salesforce fields first
+    field_validation = validate_salesforce_fields(sf_conn, selected_object, df.columns)
     
-    def refresh_preview():
-        """Refresh the preview with current settings"""
-        settings = show_settings()
-        if settings:
-            preview_rows['value'] = settings['rows']
-            selected_fields['value'] = settings['fields']
-            update_preview_display()
+    # Initialize column lists
+    all_columns = list(df.columns)
+    skip_columns = []
     
-    def update_preview_display():
-        """Update the preview display with current settings"""
-        # Clear existing items
-        for item in tree.get_children():
-            tree.delete(item)
-        
-        # Update tree columns
-        tree.configure(columns=selected_fields['value'])
-        
-        # Configure column headings and widths
-        for col in selected_fields['value']:
-            tree.heading(col, text=col)
-            tree.column(col, width=120, minwidth=80)
-        
-        # Add data to treeview
-        preview_df = df[selected_fields['value']].head(preview_rows['value'])
-        for idx, row in preview_df.iterrows():
-            # Convert row values to strings and handle None values
-            values = [str(val) if val is not None else '' for val in row.values]
-            tree.insert('', tk.END, values=values)
-        
-        # Update info labels
-        records_label.config(text=f"Total Records: {len(df)} | Showing: {len(preview_df)} rows | Columns: {len(selected_fields['value'])}")
-        preview_label.config(text=f"Showing first {preview_rows['value']} rows of {len(selected_fields['value'])} selected columns")
+    # Auto-add problematic fields to skip list
+    problematic_fields = (field_validation['permission_issues'] + 
+                         field_validation['not_found'] + 
+                         field_validation['read_only'] + 
+                         [field.split(' (')[0] for field in field_validation['validation_errors']])
     
-    def on_load():
-        user_choice['value'] = 'load'
-        preview_win.destroy()
+    for field in problematic_fields:
+        if field in all_columns:
+            all_columns.remove(field)
+            skip_columns.append(field)
+    
+    def get_field_display_text(field_name, location='skip'):
+        """Get display text for a field with validation indicators"""
+        if location == 'skip':
+            if field_name in field_validation['permission_issues']:
+                return f"🔒 {field_name} (Permission Issue)"
+            elif field_name in field_validation['not_found']:
+                return f"❌ {field_name} (Not Found in SF)"
+            elif field_name in field_validation['read_only']:
+                return f"📖 {field_name} (Read-Only)"
+            elif any(field_name in error for error in field_validation['validation_errors']):
+                error_detail = next((error.split(' (')[1].rstrip(')') for error in field_validation['validation_errors'] if field_name in error), "Validation Error")
+                return f"⚠️ {field_name} ({error_detail})"
+        return field_name
+    
+    def extract_field_name(display_text):
+        """Extract actual field name from display text with indicators"""
+        # Remove emoji and description
+        if any(emoji in display_text for emoji in ['🔒', '❌', '📖', '⚠️']):
+            # Extract field name between emoji and parentheses
+            parts = display_text.split(' ')
+            if len(parts) >= 2:
+                return parts[1].split(' (')[0]
+        return display_text
+    
+    def move_to_skip():
+        """Move selected columns from all_columns to skip_columns"""
+        selected_indices = list(all_columns_listbox.curselection())
+        selected_indices.reverse()  # Reverse to maintain indices while removing
+        
+        for index in selected_indices:
+            column = all_columns_listbox.get(index)
+            skip_columns.append(column)
+            all_columns.remove(column)
+            all_columns_listbox.delete(index)
+            display_text = get_field_display_text(column, 'skip')
+            skip_columns_listbox.insert(tk.END, display_text)
+        
+        update_counts()
+    
+    def move_to_all():
+        """Move selected columns from skip_columns to all_columns"""
+        selected_indices = list(skip_columns_listbox.curselection())
+        selected_indices.reverse()  # Reverse to maintain indices while removing
+        
+        for index in selected_indices:
+            display_text = skip_columns_listbox.get(index)
+            column = extract_field_name(display_text)
+            all_columns.append(column)
+            skip_columns.remove(column)
+            skip_columns_listbox.delete(index)
+            all_columns_listbox.insert(tk.END, column)
+        
+        update_counts()
+    
+    def move_all_to_skip():
+        """Move all columns to skip list"""
+        while all_columns_listbox.size() > 0:
+            column = all_columns_listbox.get(0)
+            skip_columns.append(column)
+            all_columns.remove(column)
+            all_columns_listbox.delete(0)
+            display_text = get_field_display_text(column, 'skip')
+            skip_columns_listbox.insert(tk.END, display_text)
+        
+        update_counts()
+    
+    def move_all_to_all():
+        """Move all columns back to all list"""
+        while skip_columns_listbox.size() > 0:
+            display_text = skip_columns_listbox.get(0)
+            column = extract_field_name(display_text)
+            all_columns.append(column)
+            skip_columns.remove(column)
+            skip_columns_listbox.delete(0)
+            all_columns_listbox.insert(tk.END, column)
+        
+        update_counts()
+    
+    def update_counts():
+        """Update the count labels"""
+        all_count_label.config(text=f"Available Columns ({len(all_columns)})")
+        skip_count_label.config(text=f"Skip Columns ({len(skip_columns)})")
+        
+        # Update status
+        if len(all_columns) == 0:
+            status_label.config(text="⚠️ All columns will be skipped - No data will be loaded!", fg="red")
+        elif len(skip_columns) == 0:
+            status_label.config(text="ℹ️ No columns will be skipped - All data will be loaded", fg="blue")
+        else:
+            status_label.config(text=f"✓ {len(skip_columns)} column(s) will be skipped, {len(all_columns)} will be loaded", fg="green")
+    
+    def search_all_columns():
+        """Filter all columns list based on search"""
+        search_term = search_all_entry.get().lower()
+        all_columns_listbox.delete(0, tk.END)
+        
+        for col in all_columns:
+            if search_term == "" or search_term in col.lower():
+                all_columns_listbox.insert(tk.END, col)
+    
+    def search_skip_columns():
+        """Filter skip columns list based on search"""
+        search_term = search_skip_entry.get().lower()
+        skip_columns_listbox.delete(0, tk.END)
+        
+        for col in skip_columns:
+            if search_term == "" or search_term in col.lower():
+                display_text = get_field_display_text(col, 'skip')
+                skip_columns_listbox.insert(tk.END, display_text)
+    
+    def clear_search_all():
+        """Clear search for all columns"""
+        search_all_entry.delete(0, tk.END)
+        search_all_columns()
+    
+    def clear_search_skip():
+        """Clear search for skip columns"""
+        search_skip_entry.delete(0, tk.END)
+        search_skip_columns()
+    
+    def preview_data():
+        """Preview data with current skip column selection"""
+        if len(all_columns) == 0:
+            tkinter.messagebox.showwarning("No Data", "All columns would be skipped. No data would remain for loading.")
+            return
+        
+        # Show preview of remaining data
+        preview_df = df[all_columns].head(10)
+        
+        preview_text = f"Preview of data after skipping {len(skip_columns)} column(s):\n"
+        preview_text += f"Remaining columns ({len(all_columns)}): {', '.join(all_columns)}\n\n"
+        if skip_columns:
+            preview_text += f"Skipped columns ({len(skip_columns)}): {', '.join(skip_columns)}\n\n"
+        preview_text += f"Sample data (first 10 rows):\n{preview_df.to_string()}"
+        
+        # Create preview window
+        preview_win = tk.Toplevel()
+        preview_win.title("Data Preview After Column Skip")
+        preview_win.geometry("1000x700")
+        preview_win.grab_set()
+        
+        # Header
+        tk.Label(preview_win, text="Data Preview After Column Skip", 
+                font=("Arial", 14, "bold")).pack(pady=10)
+        tk.Label(preview_win, text=f"Keeping {len(all_columns)} columns, skipping {len(skip_columns)} columns", 
+                font=("Arial", 12)).pack()
+        
+        # Text area with scrollbar
+        text_frame = tk.Frame(preview_win)
+        text_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        text_area = tk.Text(text_frame, wrap=tk.NONE, font=("Courier", 9))
+        v_scroll = tk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_area.yview)
+        h_scroll = tk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=text_area.xview)
+        text_area.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        
+        text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        text_area.insert(tk.END, preview_text)
+        text_area.config(state=tk.DISABLED)
+        
+        # Close button
+        tk.Button(preview_win, text="Close", command=preview_win.destroy, 
+                 bg="#2196F3", fg="white", font=("Arial", 10, "bold")).pack(pady=10)
+    
+    def on_save():
+        """Save the current column selection"""
+        if len(all_columns) == 0:
+            result = tkinter.messagebox.askyesno(
+                "No Columns Remaining", 
+                "All columns will be skipped. This means no data will be loaded to Salesforce.\n\nDo you want to continue anyway?"
+            )
+            if not result:
+                return
+            user_choice['value'] = 'skip_all'
+        else:
+            user_choice['value'] = 'proceed'
+        
+        user_choice['skip_columns'] = set(skip_columns)
+        skip_win.destroy()
     
     def on_cancel():
         user_choice['value'] = 'cancel'
-        preview_win.destroy()
+        skip_win.destroy()
     
+    def on_window_close():
+        """Handle window close event (X button) - cancel the entire operation"""
+        user_choice['value'] = 'cancel'
+        skip_win.destroy()
+    
+    # Create main window
     root = tk.Tk()
     root.withdraw()
     
-    preview_win = tk.Toplevel()
-    preview_win.title("Data Preview - Confirm Load")
-    preview_win.geometry("1200x800")
-    preview_win.grab_set()
+    skip_win = tk.Toplevel()
+    skip_win.title("Column Selection - Move Columns to Skip")
+    skip_win.geometry("1200x800")
+    skip_win.grab_set()
     
-    # Header info
-    header_frame = tk.Frame(preview_win)
+    # Handle window close event (X button)
+    skip_win.protocol("WM_DELETE_WINDOW", on_window_close)
+    
+    # Header
+    header_frame = tk.Frame(skip_win)
     header_frame.pack(pady=10, padx=20, fill=tk.X)
     
-    tk.Label(header_frame, text=f"Data Preview for Salesforce Object: {selected_object}", 
-             font=("Arial", 14, "bold")).pack()
+    tk.Label(header_frame, text="Column Selection Wizard", 
+             font=("Arial", 18, "bold"), fg="darkblue").pack()
+    tk.Label(header_frame, text="Move columns between lists to choose which columns to skip", 
+             font=("Arial", 12)).pack()
     
-    # Dynamic info labels
-    records_label = tk.Label(header_frame, text=f"Total Records: {len(df)} | Showing: {preview_rows['value']} rows | Columns: {len(df.columns)}", 
-                            font=("Arial", 10))
-    records_label.pack()
+    # Status frame
+    status_frame = tk.Frame(skip_win)
+    status_frame.pack(pady=5, padx=20, fill=tk.X)
     
-    preview_label = tk.Label(header_frame, text=f"Showing first {preview_rows['value']} rows of {len(selected_fields['value'])} selected columns", 
-                            font=("Arial", 10))
-    preview_label.pack(pady=(5,0))
+    status_label = tk.Label(status_frame, text="", font=("Arial", 11, "bold"))
+    status_label.pack()
     
-    # Settings button
-    settings_frame = tk.Frame(preview_win)
-    settings_frame.pack(pady=5)
-    tk.Button(settings_frame, text="Customize Preview (Rows/Fields)", command=refresh_preview, 
-             bg="#2196F3", fg="white", font=("Arial", 10, "bold")).pack()
+    # Main content frame with dual lists
+    main_frame = tk.Frame(skip_win)
+    main_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
     
-    # Data preview frame
-    data_frame = tk.Frame(preview_win)
-    data_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+    # Left side - Available columns
+    left_frame = tk.Frame(main_frame)
+    left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
     
-    # Create Treeview for data display
-    tree = ttk.Treeview(data_frame, columns=list(df.columns), show='headings', height=20)
+    # Available columns header and search
+    all_count_label = tk.Label(left_frame, text=f"Available Columns ({len(df.columns)})", 
+                              font=("Arial", 12, "bold"), fg="green")
+    all_count_label.pack(anchor=tk.W)
     
-    # Configure column headings and widths
-    for col in df.columns:
-        tree.heading(col, text=col)
-        tree.column(col, width=120, minwidth=80)
+    # Search for available columns
+    search_all_frame = tk.Frame(left_frame)
+    search_all_frame.pack(fill=tk.X, pady=5)
+    tk.Label(search_all_frame, text="Search:", font=("Arial", 9)).pack(side=tk.LEFT)
+    search_all_entry = tk.Entry(search_all_frame, width=20)
+    search_all_entry.pack(side=tk.LEFT, padx=5)
+    search_all_entry.bind('<KeyRelease>', lambda e: search_all_columns())
+    tk.Button(search_all_frame, text="Clear", command=clear_search_all, width=6).pack(side=tk.LEFT, padx=5)
     
-    # Add scrollbars
-    v_scrollbar = ttk.Scrollbar(data_frame, orient=tk.VERTICAL, command=tree.yview)
-    h_scrollbar = ttk.Scrollbar(data_frame, orient=tk.HORIZONTAL, command=tree.xview)
-    tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+    # Available columns listbox
+    all_listbox_frame = tk.Frame(left_frame)
+    all_listbox_frame.pack(fill=tk.BOTH, expand=True, pady=5)
     
-    # Pack scrollbars and treeview
-    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+    all_columns_listbox = tk.Listbox(all_listbox_frame, selectmode=tk.EXTENDED, font=("Arial", 10))
+    all_v_scroll = tk.Scrollbar(all_listbox_frame, orient=tk.VERTICAL, command=all_columns_listbox.yview)
+    all_columns_listbox.configure(yscrollcommand=all_v_scroll.set)
     
-    # Initial data load
-    update_preview_display()
+    # Load available columns (excluding problematic ones)
+    for col in all_columns:
+        all_columns_listbox.insert(tk.END, col)
     
-    # Button frame
-    button_frame = tk.Frame(preview_win)
-    button_frame.pack(pady=20)
+    all_columns_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    all_v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     
-    # Load button (green)
-    load_btn = tk.Button(button_frame, text="Load Data to Salesforce", 
-                        command=on_load, bg="#4CAF50", fg="white", 
-                        font=("Arial", 12, "bold"), width=20, height=2)
-    load_btn.pack(side=tk.LEFT, padx=20)
+    # Middle - Control buttons
+    middle_frame = tk.Frame(main_frame)
+    middle_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10)
     
-    # Cancel button (red)
-    cancel_btn = tk.Button(button_frame, text="Cancel", 
+    # Add some space at the top
+    tk.Label(middle_frame, text="").pack(pady=30)
+    
+    # Move buttons
+    tk.Button(middle_frame, text="Move →", command=move_to_skip, 
+             bg="#FF9800", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+    tk.Button(middle_frame, text="← Move Back", command=move_to_all, 
+             bg="#2196F3", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+    
+    tk.Label(middle_frame, text="", height=2).pack()  # Spacer
+    
+    tk.Button(middle_frame, text="Move All →", command=move_all_to_skip, 
+             bg="#f44336", fg="white", font=("Arial", 9, "bold"), width=12).pack(pady=5)
+    tk.Button(middle_frame, text="← Move All Back", command=move_all_to_all, 
+             bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=12).pack(pady=5)
+    
+    tk.Label(middle_frame, text="", height=2).pack()  # Spacer
+    
+    # Preview button
+    tk.Button(middle_frame, text="Preview Data", command=preview_data, 
+             bg="#9C27B0", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+    
+    # Right side - Skip columns
+    right_frame = tk.Frame(main_frame)
+    right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+    
+    # Skip columns header and search
+    skip_count_label = tk.Label(right_frame, text="Skip Columns (0)", 
+                               font=("Arial", 12, "bold"), fg="red")
+    skip_count_label.pack(anchor=tk.W)
+    
+    # Search for skip columns
+    search_skip_frame = tk.Frame(right_frame)
+    search_skip_frame.pack(fill=tk.X, pady=5)
+    tk.Label(search_skip_frame, text="Search:", font=("Arial", 9)).pack(side=tk.LEFT)
+    search_skip_entry = tk.Entry(search_skip_frame, width=20)
+    search_skip_entry.pack(side=tk.LEFT, padx=5)
+    search_skip_entry.bind('<KeyRelease>', lambda e: search_skip_columns())
+    tk.Button(search_skip_frame, text="Clear", command=clear_search_skip, width=6).pack(side=tk.LEFT, padx=5)
+    
+    # Skip columns listbox
+    skip_listbox_frame = tk.Frame(right_frame)
+    skip_listbox_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+    
+    skip_columns_listbox = tk.Listbox(skip_listbox_frame, selectmode=tk.EXTENDED, font=("Arial", 10))
+    skip_v_scroll = tk.Scrollbar(skip_listbox_frame, orient=tk.VERTICAL, command=skip_columns_listbox.yview)
+    skip_columns_listbox.configure(yscrollcommand=skip_v_scroll.set)
+    
+    # Load problematic fields to skip list with indicators
+    for col in skip_columns:
+        display_text = get_field_display_text(col, 'skip')
+        skip_columns_listbox.insert(tk.END, display_text)
+    
+    skip_columns_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    skip_v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    # Field Validation Summary
+    validation_frame = tk.Frame(skip_win)
+    validation_frame.pack(pady=10, padx=20, fill=tk.X)
+    
+    tk.Label(validation_frame, text="Salesforce Field Validation Summary:", font=("Arial", 11, "bold"), fg="darkblue").pack(anchor=tk.W)
+    
+    # Create summary text
+    summary_text = []
+    if field_validation['permission_issues']:
+        summary_text.append(f"🔒 {len(field_validation['permission_issues'])} field(s) with permission issues")
+    if field_validation['not_found']:
+        summary_text.append(f"❌ {len(field_validation['not_found'])} field(s) not found in Salesforce")
+    if field_validation['read_only']:
+        summary_text.append(f"📖 {len(field_validation['read_only'])} read-only field(s)")
+    if field_validation['validation_errors']:
+        summary_text.append(f"⚠️ {len(field_validation['validation_errors'])} field(s) with validation errors")
+    
+    if summary_text:
+        for text in summary_text:
+            tk.Label(validation_frame, text=f"• {text}", font=("Arial", 9), fg="red").pack(anchor=tk.W, padx=20)
+        tk.Label(validation_frame, text="These fields have been automatically moved to the Skip list.", 
+                font=("Arial", 9), fg="orange").pack(anchor=tk.W, padx=20)
+    else:
+        tk.Label(validation_frame, text="• ✅ All fields are compatible with Salesforce", 
+                font=("Arial", 9), fg="green").pack(anchor=tk.W, padx=20)
+    
+    # Instructions frame
+    instructions_frame = tk.Frame(skip_win)
+    instructions_frame.pack(pady=10, padx=20, fill=tk.X)
+    
+    tk.Label(instructions_frame, text="Instructions:", font=("Arial", 11, "bold")).pack(anchor=tk.W)
+    tk.Label(instructions_frame, text="• Select columns from left list and use 'Move →' to add them to skip list", 
+             font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Label(instructions_frame, text="• Select columns from right list and use '← Move Back' to remove them from skip list", 
+             font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Label(instructions_frame, text="• Use Ctrl+Click for multiple selection, Shift+Click for range selection", 
+             font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Label(instructions_frame, text="• Fields with icons indicate Salesforce compatibility issues:", 
+             font=("Arial", 9), fg="darkblue").pack(anchor=tk.W)
+    tk.Label(instructions_frame, text="  🔒 Permission issues | ❌ Not found | 📖 Read-only | ⚠️ Validation errors", 
+             font=("Arial", 8), fg="gray").pack(anchor=tk.W, padx=10)
+    tk.Label(instructions_frame, text="• Columns in the 'Skip Columns' list will be EXCLUDED from the Salesforce load", 
+             font=("Arial", 9), fg="red").pack(anchor=tk.W)
+    
+    # Action buttons frame - placed right after instructions for better space utilization
+    button_frame = tk.Frame(skip_win)
+    button_frame.pack(pady=15, padx=20, fill=tk.X)
+    
+    # Center the buttons
+    button_center_frame = tk.Frame(button_frame)
+    button_center_frame.pack(expand=True)
+    
+    # Save button (green) - Reasonably sized and prominent
+    save_btn = tk.Button(button_center_frame, text="💾 Save and Continue", 
+                        command=on_save, bg="#4CAF50", fg="white", 
+                        font=("Arial", 12, "bold"), width=20, height=2,
+                        relief="raised", bd=3, cursor="hand2")
+    save_btn.pack(side=tk.LEFT, padx=15)
+    
+    # Cancel button (red) - Reasonably sized and prominent
+    cancel_btn = tk.Button(button_center_frame, text="❌ Cancel", 
                           command=on_cancel, bg="#f44336", fg="white", 
-                          font=("Arial", 12, "bold"), width=20, height=2)
-    cancel_btn.pack(side=tk.LEFT, padx=20)
+                          font=("Arial", 12, "bold"), width=15, height=2,
+                          relief="raised", bd=3, cursor="hand2")
+    cancel_btn.pack(side=tk.LEFT, padx=15)
     
-    preview_win.wait_window()
+    # Initialize counts
+    update_counts()
+    
+    skip_win.wait_window()
     root.destroy()
     
-    return user_choice['value']
+    return user_choice
 
-# Show data preview and get user confirmation
-print(f"Preparing data preview for {len(df_mapped)} records...")
-user_decision = show_data_preview(df_mapped, selected_object)
+# Show column skip selection
+print("Showing column skip selection...")
+skip_decision = show_column_skip_selection(df_mapped, sf_conn, selected_object)
 
-if user_decision != 'load':
+if skip_decision['value'] == 'cancel':
     print("=" * 60)
-    print("✗ DATA LOADING CANCELLED BY USER")
-    print("✗ User cancelled the data loading operation.")
+    print("✗ OPERATION CANCELLED BY USER - HARD CLOSED")
+    print("✗ User cancelled the column skip selection by closing the window.")
+    print("✗ No data was loaded to Salesforce.")
+    print("=" * 60)
+    exit()
+elif skip_decision['value'] == 'skip_all':
+    print("=" * 60)
+    print("✗ ALL COLUMNS SKIPPED BY USER")
+    print("✗ User chose to skip all columns.")
     print("✗ No data was loaded to Salesforce.")
     print("=" * 60)
     exit()
 
-print("✓ User confirmed data loading. Proceeding...")
+# Remove skipped columns from the dataframe
+skip_columns = skip_decision['skip_columns']
+if skip_columns:
+    print(f"User selected to skip {len(skip_columns)} columns: {sorted(list(skip_columns))}")
+    remaining_columns = [col for col in df_mapped.columns if col not in skip_columns]
+    if not remaining_columns:
+        print("=" * 60)
+        print("✗ NO COLUMNS REMAINING")
+        print("✗ All columns were skipped. No data to load.")
+        print("✗ Operation aborted.")
+        print("=" * 60)
+        exit()
+    df_mapped = df_mapped[remaining_columns]
+    print(f"Remaining columns for loading: {len(remaining_columns)} ({', '.join(remaining_columns)})")
+else:
+    print("User chose to load all columns (no columns skipped)")
 
 # --- Batch Size and Parallel Processing Selection ---
 batch_size = 10000  # Default batch size
@@ -581,12 +940,18 @@ data_load_folder = os.path.join(root_folder, 'DataLoad')
 org_folder = os.path.join(data_load_folder, f'DataLoad_{selected_org}')
 object_folder = os.path.join(org_folder, selected_object)
 batches_folder = os.path.join(object_folder, 'Batches')
+logs_folder = os.path.join(object_folder, 'Logs')
+summary_folder = os.path.join(object_folder, 'Summary')
+
+# Create all necessary folders
 os.makedirs(object_folder, exist_ok=True)
 os.makedirs(batches_folder, exist_ok=True)
+os.makedirs(logs_folder, exist_ok=True)
+os.makedirs(summary_folder, exist_ok=True)
 
 # Function to create detailed log file
 def create_processing_log(start_time, end_time, total_records, success_count, error_count, 
-                         batch_results, operation, selected_object, selected_org, object_folder):
+                         batch_results, operation, selected_object, selected_org, logs_folder):
     """Create a comprehensive CSV log file with processing details"""
     
     # Calculate processing metrics
@@ -595,8 +960,8 @@ def create_processing_log(start_time, end_time, total_records, success_count, er
     success_rate = (success_count / total_records * 100) if total_records > 0 else 0
     error_rate = (error_count / total_records * 100) if total_records > 0 else 0
     
-    # Create summary log file
-    summary_log_file = os.path.join(object_folder, "processing_summary.csv")
+    # Create summary log file in Logs folder
+    summary_log_file = os.path.join(logs_folder, "processing_summary.csv")
     
     with open(summary_log_file, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
@@ -626,8 +991,8 @@ def create_processing_log(start_time, end_time, total_records, success_count, er
             selected_org, len(batch_results), parallel_used, log_generated_at
         ])
     
-    # Create detailed batch log file
-    batch_log_file = os.path.join(object_folder, "batch_processing_details.csv")
+    # Create detailed batch log file in Logs folder
+    batch_log_file = os.path.join(logs_folder, "batch_processing_details.csv")
     
     with open(batch_log_file, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
@@ -852,6 +1217,16 @@ try:
     operation_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"Operation started at: {operation_start_timestamp}")
     
+    # Validate Salesforce fields before processing
+    field_validation = validate_salesforce_fields(sf_conn, selected_object, df_mapped.columns)
+    
+    # Check for any validation errors
+    if field_validation['validation_errors']:
+        error_message = "Field validation errors:\n- " + "\n- ".join(field_validation['validation_errors'])
+        print(f"Validation failed: {error_message}")
+        tkinter.messagebox.showerror("Field Validation Error", error_message)
+        exit()
+    
     # Process data in batches with optional parallel processing
     success_rows, error_rows, batch_results = process_in_batches(
         df_mapped, batch_size, operation, parallel_batches, external_id_name
@@ -880,25 +1255,26 @@ try:
     print(f"Total operation time: {operation_end_time - operation_start_time:.2f} seconds")
     if parallel_batches > 1:
         print(f"Parallel processing used: {parallel_batches} simultaneous batches")
-    # Save consolidated files
-    df.to_csv(os.path.join(object_folder, "raw.csv"), index=False)
-    df_mapped.to_csv(os.path.join(object_folder, "transformed_file.csv"), index=False)
-    df_mapped.to_csv(os.path.join(object_folder, "source.csv"), index=False)
+    
+    # Save consolidated files in Summary folder
+    df.to_csv(os.path.join(summary_folder, "raw.csv"), index=False)
+    df_mapped.to_csv(os.path.join(summary_folder, "transformed_file.csv"), index=False)
+    df_mapped.to_csv(os.path.join(summary_folder, "source.csv"), index=False)
     
     if success_rows:
-        pd.DataFrame(success_rows).to_csv(os.path.join(object_folder, "success.csv"), index=False)
+        pd.DataFrame(success_rows).to_csv(os.path.join(summary_folder, "success.csv"), index=False)
     else:
         # Create empty success file
-        pd.DataFrame(columns=df_mapped.columns).to_csv(os.path.join(object_folder, "success.csv"), index=False)
+        pd.DataFrame(columns=df_mapped.columns).to_csv(os.path.join(summary_folder, "success.csv"), index=False)
     
     if error_rows:
-        pd.DataFrame(error_rows).to_csv(os.path.join(object_folder, "error.csv"), index=False)
+        pd.DataFrame(error_rows).to_csv(os.path.join(summary_folder, "error.csv"), index=False)
     else:
         # Create empty error file
         error_columns = list(df_mapped.columns) + ['errors']
-        pd.DataFrame(columns=error_columns).to_csv(os.path.join(object_folder, "error.csv"), index=False)
+        pd.DataFrame(columns=error_columns).to_csv(os.path.join(summary_folder, "error.csv"), index=False)
     
-    print(f"Results saved to {object_folder}/")
+    print(f"Summary files saved to {summary_folder}/")
     print(f"Batch details saved to {batches_folder}/")
     
     # Generate comprehensive log files
@@ -907,7 +1283,7 @@ try:
         summary_log_file, batch_log_file = create_processing_log(
             operation_start_time, operation_end_time, len(df_mapped), 
             total_success, total_errors, batch_results, operation, 
-            selected_object, selected_org, object_folder
+            selected_object, selected_org, logs_folder
         )
         print(f"Processing summary log saved to: {summary_log_file}")
         print(f"Batch details log saved to: {batch_log_file}")
@@ -932,9 +1308,9 @@ try:
         tkinter.messagebox.showwarning(
             "Load Completed with Errors",
             f"{len(error_rows):,} out of {len(df_mapped):,} records failed to load.\n\n"
-            f"Check {object_folder}/error.csv for details.\n"
+            f"Check {summary_folder}/error.csv for details.\n"
             f"Batch details available in {batches_folder}/\n"
-            f"Processing logs saved to {object_folder}/\n"
+            f"Processing logs saved to {logs_folder}/\n"
             f"Processing method: {'Parallel' if parallel_batches > 1 else 'Sequential'}"
         )
     else:
@@ -943,7 +1319,8 @@ try:
             "Load Completed Successfully",
             f"All {len(df_mapped):,} records {operation}ed successfully into Salesforce {selected_object} object.\n\n"
             f"Processed in {len(batch_results)} batch(es) {parallel_info}.\n"
-            f"Results and logs saved to {object_folder}/"
+            f"Summary files saved to {summary_folder}/\n"
+            f"Processing logs saved to {logs_folder}/"
         )
 except Exception as e:
     tkinter.messagebox.showerror(
