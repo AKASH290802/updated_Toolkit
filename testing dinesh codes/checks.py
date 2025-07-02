@@ -1,12 +1,12 @@
 import pandas as pd
 
 # Total rows
-rows = 84601
+rows = 21000
 
 # Generate data
 data = {
-    'name': [f'dummy{i}' for i in range(1, rows + 1)],
-    'accountnumber': [f'test{i}' for i in range(1, rows + 1)]
+    'Name': [f'dummy{i}' for i in range(1, rows + 1)],
+    'AccountNumber': [f'test{i}' for i in range(1, rows + 1)]
 }
 
 # Create DataFrame
