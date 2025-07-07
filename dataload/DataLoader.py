@@ -633,31 +633,111 @@ def show_column_skip_selection(df, sf_conn, selected_object):
     root.withdraw()
     
     skip_win = tk.Toplevel()
-    skip_win.title("Column Selection - Move Columns to Skip")
-    skip_win.geometry("1200x800")
+    
+    # Detect DPI scaling to adjust layout (moved before window title)
+    try:
+        # Get DPI scaling factor
+        dpi = skip_win.winfo_fpixels('1i')
+        scaling_factor = dpi / 96.0  # 96 DPI is 100% scaling
+        is_high_dpi = scaling_factor > 1.2  # 120% or higher scaling
+        print(f"Detected screen DPI: {dpi:.1f}, scaling factor: {scaling_factor:.2f}")
+    except Exception as e:
+        print(f"Could not detect DPI: {e}")
+        is_high_dpi = False
+        scaling_factor = 1.0
+    
+    # Add DPI mode indicator to window title
+    title_suffix = " (Scrollable Mode)" if scaling_factor > 1.2 else " (Standard Mode)"
+    skip_win.title(f"Column Selection - Move Columns to Skip{title_suffix}")
+    
+    print(f"DPI Mode: {'High DPI (150%+)' if is_high_dpi else 'Normal DPI (100-120%)'} - Scaling: {scaling_factor:.2f}x")
+    
+    # Adjust window size based on DPI scaling
+    screen_width = skip_win.winfo_screenwidth()
+    screen_height = skip_win.winfo_screenheight()
+    
+    if is_high_dpi:
+        # For high DPI, use larger window and enable scrolling
+        window_width = min(1400, int(screen_width * 0.9))
+        window_height = min(900, int(screen_height * 0.9))
+    else:
+        # For normal DPI, use standard sizing
+        window_width = min(1200, int(screen_width * 0.8))
+        window_height = min(800, int(screen_height * 0.8))
+    
+    x = (screen_width // 2) - (window_width // 2)
+    y = (screen_height // 2) - (window_height // 2)
+    skip_win.geometry(f"{window_width}x{window_height}+{x}+{y}")
     skip_win.grab_set()
     
     # Handle window close event (X button)
     skip_win.protocol("WM_DELETE_WINDOW", on_window_close)
     
+    # Use skip_win as the parent for all content (simplified - no scrolling needed with buttons at top)
+    content_parent = skip_win
+    
     # Header
-    header_frame = tk.Frame(skip_win)
+    header_frame = tk.Frame(content_parent)
     header_frame.pack(pady=10, padx=20, fill=tk.X)
     
     tk.Label(header_frame, text="Column Selection Wizard", 
              font=("Arial", 18, "bold"), fg="darkblue").pack()
-    tk.Label(header_frame, text="Move columns between lists to choose which columns to skip", 
-             font=("Arial", 12)).pack()
+    
+    # Add DPI-specific instructions
+    if is_high_dpi:
+        tk.Label(header_frame, text="Move columns between lists to choose which columns to skip", 
+                 font=("Arial", 12), fg="blue").pack()
+    else:
+        tk.Label(header_frame, text="Move columns between lists to choose which columns to skip", 
+                 font=("Arial", 12)).pack()
+    
+    # Action buttons frame - MOVED TO TOP for universal visibility
+    button_frame = tk.Frame(content_parent, bg="#f0f0f0", relief="solid", bd=2)
+    button_frame.pack(pady=15, padx=20, fill=tk.X)
+    
+    # Inner frame for better padding control
+    button_inner_frame = tk.Frame(button_frame, bg="#f0f0f0")
+    button_inner_frame.pack(pady=15, padx=20)
+    
+    # Center the buttons
+    button_center_frame = tk.Frame(button_inner_frame, bg="#f0f0f0")
+    button_center_frame.pack()
+    
+    # Adjust button sizing based on DPI
+    if is_high_dpi:
+        btn_font_size = 14
+        btn_padx = 30
+        btn_pady = 15
+    else:
+        btn_font_size = 12
+        btn_padx = 25
+        btn_pady = 12
+    
+    # Save button (green) - Always visible at top
+    save_btn = tk.Button(button_center_frame, text="[Save] Save and Continue", 
+                        command=on_save, bg="#4CAF50", fg="white", 
+                        font=("Arial", btn_font_size, "bold"), 
+                        relief="raised", bd=3, cursor="hand2",
+                        padx=btn_padx, pady=btn_pady)
+    save_btn.pack(side=tk.LEFT, padx=15)
+    
+    # Cancel button (red) - Always visible at top
+    cancel_btn = tk.Button(button_center_frame, text="[X] Cancel", 
+                          command=on_cancel, bg="#f44336", fg="white", 
+                          font=("Arial", btn_font_size, "bold"), 
+                          relief="raised", bd=3, cursor="hand2",
+                          padx=btn_padx, pady=btn_pady)
+    cancel_btn.pack(side=tk.LEFT, padx=15)
     
     # Status frame
-    status_frame = tk.Frame(skip_win)
+    status_frame = tk.Frame(content_parent)
     status_frame.pack(pady=5, padx=20, fill=tk.X)
     
     status_label = tk.Label(status_frame, text="", font=("Arial", 11, "bold"))
     status_label.pack()
     
     # Main content frame with dual lists
-    main_frame = tk.Frame(skip_win)
+    main_frame = tk.Frame(content_parent)
     main_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
     
     # Left side - Available columns
@@ -676,7 +756,8 @@ def show_column_skip_selection(df, sf_conn, selected_object):
     search_all_entry = tk.Entry(search_all_frame, width=20)
     search_all_entry.pack(side=tk.LEFT, padx=5)
     search_all_entry.bind('<KeyRelease>', lambda e: search_all_columns())
-    tk.Button(search_all_frame, text="Clear", command=clear_search_all, width=6).pack(side=tk.LEFT, padx=5)
+    tk.Button(search_all_frame, text="Clear", command=clear_search_all, 
+             padx=10, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=5)
     
     # Available columns listbox
     all_listbox_frame = tk.Frame(left_frame)
@@ -700,24 +781,29 @@ def show_column_skip_selection(df, sf_conn, selected_object):
     # Add some space at the top
     tk.Label(middle_frame, text="").pack(pady=30)
     
-    # Move buttons
+    # Move buttons - DPI-aware sizing
     tk.Button(middle_frame, text="Move →", command=move_to_skip, 
-             bg="#FF9800", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+             bg="#FF9800", fg="white", font=("Arial", 10, "bold"), 
+             padx=15, pady=8, cursor="hand2").pack(pady=5)
     tk.Button(middle_frame, text="← Move Back", command=move_to_all, 
-             bg="#2196F3", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+             bg="#2196F3", fg="white", font=("Arial", 10, "bold"), 
+             padx=15, pady=8, cursor="hand2").pack(pady=5)
     
     tk.Label(middle_frame, text="", height=2).pack()  # Spacer
     
     tk.Button(middle_frame, text="Move All →", command=move_all_to_skip, 
-             bg="#f44336", fg="white", font=("Arial", 9, "bold"), width=12).pack(pady=5)
+             bg="#f44336", fg="white", font=("Arial", 9, "bold"), 
+             padx=15, pady=8, cursor="hand2").pack(pady=5)
     tk.Button(middle_frame, text="← Move All Back", command=move_all_to_all, 
-             bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=12).pack(pady=5)
+             bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), 
+             padx=15, pady=8, cursor="hand2").pack(pady=5)
     
     tk.Label(middle_frame, text="", height=2).pack()  # Spacer
     
-    # Preview button
+    # Preview button - DPI-aware sizing
     tk.Button(middle_frame, text="Preview Data", command=preview_data, 
-             bg="#9C27B0", fg="white", font=("Arial", 10, "bold"), width=12).pack(pady=5)
+             bg="#9C27B0", fg="white", font=("Arial", 10, "bold"), 
+             padx=15, pady=8, cursor="hand2").pack(pady=5)
     
     # Right side - Skip columns
     right_frame = tk.Frame(main_frame)
@@ -735,7 +821,8 @@ def show_column_skip_selection(df, sf_conn, selected_object):
     search_skip_entry = tk.Entry(search_skip_frame, width=20)
     search_skip_entry.pack(side=tk.LEFT, padx=5)
     search_skip_entry.bind('<KeyRelease>', lambda e: search_skip_columns())
-    tk.Button(search_skip_frame, text="Clear", command=clear_search_skip, width=6).pack(side=tk.LEFT, padx=5)
+    tk.Button(search_skip_frame, text="Clear", command=clear_search_skip, 
+             padx=10, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=5)
     
     # Skip columns listbox
     skip_listbox_frame = tk.Frame(right_frame)
@@ -754,7 +841,7 @@ def show_column_skip_selection(df, sf_conn, selected_object):
     skip_v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     
     # Field Validation Summary
-    validation_frame = tk.Frame(skip_win)
+    validation_frame = tk.Frame(content_parent)
     validation_frame.pack(pady=10, padx=20, fill=tk.X)
     
     tk.Label(validation_frame, text="Salesforce Field Validation Summary:", font=("Arial", 11, "bold"), fg="darkblue").pack(anchor=tk.W)
@@ -780,7 +867,7 @@ def show_column_skip_selection(df, sf_conn, selected_object):
                 font=("Arial", 9), fg="green").pack(anchor=tk.W, padx=20)
     
     # Instructions frame
-    instructions_frame = tk.Frame(skip_win)
+    instructions_frame = tk.Frame(content_parent)
     instructions_frame.pack(pady=10, padx=20, fill=tk.X)
     
     tk.Label(instructions_frame, text="Instructions:", font=("Arial", 11, "bold")).pack(anchor=tk.W)
@@ -796,28 +883,6 @@ def show_column_skip_selection(df, sf_conn, selected_object):
              font=("Arial", 8), fg="gray").pack(anchor=tk.W, padx=10)
     tk.Label(instructions_frame, text="• Columns in the 'Skip Columns' list will be EXCLUDED from the Salesforce load", 
              font=("Arial", 9), fg="red").pack(anchor=tk.W)
-    
-    # Action buttons frame - placed right after instructions for better space utilization
-    button_frame = tk.Frame(skip_win)
-    button_frame.pack(pady=15, padx=20, fill=tk.X)
-    
-    # Center the buttons
-    button_center_frame = tk.Frame(button_frame)
-    button_center_frame.pack(expand=True)
-    
-    # Save button (green) - Reasonably sized and prominent
-    save_btn = tk.Button(button_center_frame, text="💾 Save and Continue", 
-                        command=on_save, bg="#4CAF50", fg="white", 
-                        font=("Arial", 12, "bold"), width=20, height=2,
-                        relief="raised", bd=3, cursor="hand2")
-    save_btn.pack(side=tk.LEFT, padx=15)
-    
-    # Cancel button (red) - Reasonably sized and prominent
-    cancel_btn = tk.Button(button_center_frame, text="❌ Cancel", 
-                          command=on_cancel, bg="#f44336", fg="white", 
-                          font=("Arial", 12, "bold"), width=15, height=2,
-                          relief="raised", bd=3, cursor="hand2")
-    cancel_btn.pack(side=tk.LEFT, padx=15)
     
     # Initialize counts
     update_counts()

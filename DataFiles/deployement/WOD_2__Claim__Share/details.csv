@@ -1,9 +1,0 @@
-Field Name,Label,Type,Required,Unique,Picklist Values
-Id,Custom Object Share ID,id,True,False,
-ParentId,Parent ID,reference,True,False,
-UserOrGroupId,User/Group ID,reference,True,False,
-AccessLevel,Custom Object Access,picklist,True,False,"Read, Edit, All"
-RowCause,Row Cause,picklist,False,False,"Owner, Manual, Rule, ImplicitChild, ImplicitParent, ImplicitPerson, Team, Territory, TerritoryManual, Territory2AssociationManual, TerritoryRule, Territory2Forecast, Territory2SplitsForecast, GuestRule, GuestParentImplicit, GuestPersonImplicit, SurveyShare, CompliantDataSharing, MfgTargetShare, SharingRecordCollection, ALMAssignmentSharing, LearningAssignment, LearningAssignmentImplicit, LearningItemAssignment, ObligationAssigneeShare"
-LastModifiedDate,Last Modified Date,datetime,True,False,
-LastModifiedById,Last Modified By ID,reference,True,False,
-IsDeleted,Deleted,boolean,True,False,

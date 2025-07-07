@@ -122,13 +122,18 @@ if not object_name:
 
 print(f"Selected Salesforce object: {object_name}")
 
-object_folder = os.path.join("DataFiles", selected_org, object_name)
-# Ensure the object folder exists
-os.makedirs(object_folder, exist_ok=True)
+# Create folder structure: C:\DM_toolkit\Validation\OrgName\ObjectName\SchemaValidation\
+object_folder = os.path.join("Validation", selected_org, object_name)
+schema_validation_folder = os.path.join(object_folder, "SchemaValidation")
+# Ensure the schema validation folder exists
+os.makedirs(schema_validation_folder, exist_ok=True)
 
-details_path=tk.filedialog.askopenfilename(
-    title="Select details file",  
-        filetypes=[("CSV files", "*.csv"), ("All files", "*")]
+# Set default location for details.csv file selection
+default_details_folder = os.path.join(r"C:\DM_toolkit\DataFiles", selected_org, object_name)
+details_path = tk.filedialog.askopenfilename(
+    title="Select details file",
+    initialdir=default_details_folder if os.path.exists(default_details_folder) else r"C:\DM_toolkit\DataFiles",
+    filetypes=[("CSV files", "*.csv"), ("All files", "*")]
 )
 # details_path = os.path.join(object_folder, "details.csv")
 
@@ -215,17 +220,17 @@ print(f"Number of rows with issues: {issues_count}")
 
 # Save the validated data
 if issues_count <= 900000:
-    # Save to single validated CSV
-    validated_path = os.path.join(object_folder, f'{object_name}_Validated.csv')
+    # Save to single SchemaValidation_SelectedObject.csv in SchemaValidation folder
+    validated_path = os.path.join(schema_validation_folder, f'SchemaValidation_{object_name}.csv')
     data_df.to_csv(validated_path, index=False)
     print(f"Validation complete. Output saved to '{validated_path}'")
 else:
-    # Create new folder named object_name
-    split_folder = os.path.join(object_folder, object_name)
+    # Create new folder for split files within SchemaValidation
+    split_folder = os.path.join(schema_validation_folder, 'SplitFiles')
     os.makedirs(split_folder, exist_ok=True)
     
-    # Save main file (complete dataset)
-    main_file_path = os.path.join(split_folder, f'{object_name}_Validated.csv')
+    # Save main file (complete dataset) as SchemaValidation_SelectedObject.csv
+    main_file_path = os.path.join(schema_validation_folder, f'SchemaValidation_{object_name}.csv')
     data_df.to_csv(main_file_path, index=False)
     print(f"Main file saved to '{main_file_path}'")
     
@@ -234,12 +239,12 @@ else:
     file_count = records // 500000 + (1 if records % 500000 else 0)
     print(f"Splitting {records} records into {file_count} files")
     
-    # Split and save files
+    # Split and save files in SplitFiles subfolder
     for i in range(file_count):
         start_idx = i * 500000
         end_idx = min((i + 1) * 500000, records)
         split_df = data_df.iloc[start_idx:end_idx]
-        split_file_path = os.path.join(split_folder, f'{object_name}{i + 1}.csv')
+        split_file_path = os.path.join(split_folder, f'validated_part_{i + 1}.csv')
         split_df.to_csv(split_file_path, index=False)
         print(f"Saved file {i + 1} with {len(split_df)} records to '{split_file_path}'")
 
@@ -273,7 +278,7 @@ atexit.register(cleanup_tkinter)
 print("Validation completed successfully!")
 print(f"Object: {object_name}")
 print(f"Org: {selected_org}")
-print(f"Output folder: {object_folder}")
+print(f"Output folder: {schema_validation_folder}")
 
 # Show completion message
 try:
@@ -285,7 +290,7 @@ try:
                                f"Object: {object_name}\n"
                                f"Org: {selected_org}\n"
                                f"Rows with issues: {issues_count}\n"
-                               f"Output saved to: {object_folder}")
+                               f"Output saved to: {schema_validation_folder}")
     root.destroy()
 except:
     pass

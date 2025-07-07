@@ -1,3 +1,0 @@
-Rule Name,Error Field,Error Message,Active,Description
-Units_of_Measure_Validation,Top of Page,Invalid picklist value for Units of Measure Field,True,
-Name_Protection,Top of Page,"You cannot modify the Name of the Warranty Product  , Please contact the system administrator",False,"You cannot modify the Name of the Warranty Product  , Please contact the system administrator"
