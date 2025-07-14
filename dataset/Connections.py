@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-salesforce_org = ['fcs2', 'dinesh', 'deployement']
+salesforce_org = ['fcs2', 'dinesh', 'deployement','TestQA','TestDev']
 sql_org = ['sql', 'sql2']
 
 def select_salesforce_org(org_name):

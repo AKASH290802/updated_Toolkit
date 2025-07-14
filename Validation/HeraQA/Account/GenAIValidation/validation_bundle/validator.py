@@ -112,7 +112,6 @@ def validate_all(data_csv):
         fail_df = df[~df['is_valid']]
         suc_df.to_csv(os.path.join(root_folder, 'success.csv'), index=False)
         fail_df.to_csv(os.path.join(root_folder, 'failure.csv'), index=False)
-        gf.to_csv(os.path.join(root_folder, 'SchemaValidatedData.csv'), index=False)
         
         print(f"\n📊 Validation Results:")
         print(f"✅ Valid records: {len(suc_df)} ({len(suc_df)/len(df)*100:.1f}%)")

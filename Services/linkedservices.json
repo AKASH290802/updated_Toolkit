@@ -51,5 +51,20 @@
 	"password":"Hera@1234",
 	"security_token":"",
 	"domain":"test"
+  },
+  
+  "TestQA":{
+	"username":"karnasaikishore.r@tavant.com.qacopy",
+	"password":"Kishore@#437",
+	"security_token":"DqYc962UfalHjBKM4BiQ8jk4R",
+	"domain":"test"
+  }
+  ,
+  
+  "TestDev":{
+	"username":"karnasaikishore.r@tavant.com.smsdev1.dev3",
+	"password":"Kishore@#437",
+	"security_token":"CsMS8ko3ziwNE3cFKYFg9lrVA",
+	"domain":"test"
   }
 }

@@ -288,44 +288,127 @@ if not selected_object or selected_object not in filtered_objects:
 print(f"Selected Salesforce object: {selected_object}")
 
 # --- Step 5: Prepare Data and Perform Load ---
+
 df_mapped.columns = df_mapped.columns.str.strip()
 
-# Clean the data to handle NaN, infinity, and other problematic values
+import numpy as np
+
+def clean_value_for_json(val):
+    """Recursively clean a value for JSON compliance (no NaN, inf, -inf, or non-serializable types)"""
+    import math
+    import numpy as np
+    import pandas as pd
+    import math
+    # Aggressively treat anything that is None, NaN, pd.NA, or string 'nan' as None
+    import pandas as pd
+    import numpy as np
+    import math
+    if val is None:
+        return None
+    # Catch pandas NA, numpy nan, math nan, string 'nan'
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    elif isinstance(val, (np.floating, np.integer)):
+        if np.isnan(val) or np.isinf(val):
+            return None
+        return val.item() if hasattr(val, 'item') else float(val)
+    elif isinstance(val, str):
+        if val.strip().lower() == 'nan':
+            return None
+        return val
+    elif isinstance(val, (int, bool)):
+        return val
+    elif isinstance(val, dict):
+        return {k: clean_value_for_json(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [clean_value_for_json(v) for v in val]
+    else:
+        # Try to convert to string, else None
+        try:
+            sval = str(val)
+            if sval.strip().lower() == 'nan':
+                return None
+            return sval
+        except Exception:
+            return None
+
 def clean_dataframe_for_salesforce(df):
     """Clean DataFrame to make it JSON compliant for Salesforce"""
     df_clean = df.copy()
-    
-    # Replace NaN, inf, -inf with None
-    df_clean = df_clean.replace([float('inf'), float('-inf')], None)
-    df_clean = df_clean.where(pd.notnull(df_clean), None)
-    
-    # Convert numpy data types to Python native types
+    # Replace all np.nan, inf, -inf with None at the DataFrame level first
+    df_clean.replace({np.nan: None, np.inf: None, -np.inf: None}, inplace=True)
     for col in df_clean.columns:
-        if df_clean[col].dtype == 'object':
-            # Handle string columns - convert NaN to None and strip whitespace
-            df_clean[col] = df_clean[col].apply(
-                lambda x: str(x).strip() if pd.notnull(x) and str(x).strip() != 'nan' and str(x).strip() != '' else None
-            )
-        elif pd.api.types.is_numeric_dtype(df_clean[col]):
-            # Handle numeric columns - ensure they're JSON compliant
-            if pd.api.types.is_integer_dtype(df_clean[col]):
-                # Convert to nullable integer, then to regular int where possible
-                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-                df_clean[col] = df_clean[col].apply(lambda x: int(x) if pd.notnull(x) and x == x else None)
-            else:
-                # Convert to float, handling NaN
-                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-                df_clean[col] = df_clean[col].apply(lambda x: float(x) if pd.notnull(x) and x == x and abs(x) != float('inf') else None)
-        elif pd.api.types.is_datetime64_any_dtype(df_clean[col]):
-            # Handle datetime columns
-            df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ').where(pd.notnull(df_clean[col]), None)
-        elif pd.api.types.is_bool_dtype(df_clean[col]):
-            # Handle boolean columns
-            df_clean[col] = df_clean[col].apply(lambda x: bool(x) if pd.notnull(x) else None)
-    
+        df_clean[col] = df_clean[col].apply(clean_value_for_json)
+    # Final pass: applymap to catch any remaining NaN/NA or string 'nan' in the DataFrame
+    import pandas as pd
+    def final_clean(x):
+        try:
+            if pd.isna(x):
+                return None
+            if isinstance(x, str) and x.strip().lower() == 'nan':
+                return None
+        except Exception:
+            pass
+        return x
+    df_clean = df_clean.applymap(final_clean)
+    # Debug: print any columns/rows that still have NaN
+    if df_clean.isnull().values.any():
+        print("[DEBUG] DataFrame still contains nulls after cleaning. Null counts per column:")
+        print(df_clean.isnull().sum())
+        print(df_clean[df_clean.isnull().any(axis=1)])
     return df_clean
 
-df_mapped = clean_dataframe_for_salesforce(df_mapped)
+# --- Salesforce Boolean Field Coercion ---
+def get_salesforce_boolean_fields(sf_conn, selected_object):
+    """Return a set of field names that are boolean type for the given Salesforce object."""
+    try:
+        obj_describe = getattr(sf_conn, selected_object).describe()
+        return set(f['name'] for f in obj_describe['fields'] if f['type'] == 'boolean')
+    except Exception as e:
+        print(f"[WARN] Could not fetch boolean fields for {selected_object}: {e}")
+        return set()
+
+def coerce_to_bool(val):
+    """Convert various representations to True/False/None for Salesforce boolean fields."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        if val == 1 or val == 1.0:
+            return True
+        if val == 0 or val == 0.0:
+            return False
+        return None
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("1", "true", "yes", "y", "t"): return True
+        if v in ("0", "false", "no", "n", "f"): return False
+        if v == "": return None
+        return None
+    return None
+
+    df_mapped = clean_dataframe_for_salesforce(df_mapped)
+
+# --- Coerce boolean fields to True/False/None ---
+    boolean_fields = get_salesforce_boolean_fields(sf_conn, selected_object)
+    for col in df_mapped.columns:
+        if col in boolean_fields:
+            print(f"[INFO] Coercing column '{col}' to boolean for Salesforce upload.")
+            df_mapped[col] = df_mapped[col].apply(coerce_to_bool)
+
+# Check for any remaining NaN after cleaning
+if df_mapped.isnull().values.any():
+    print("Warning: DataFrame still contains NaN/null values after cleaning. These will be converted to None for JSON.")
+    # Optionally, force replace again
+    df_mapped = df_mapped.where(pd.notnull(df_mapped), None)
 
 # Additional validation - check for any remaining problematic values
 def validate_json_compliance(df):
@@ -1095,28 +1178,86 @@ def create_sf_connection(org_creds):
         domain=org_creds['domain']
     )
 
+def clean_record_for_json(record):
+    # Recursively replace all float('nan')/np.nan with None in a dict/list
+    import math
+    import numpy as np
+    if isinstance(record, dict):
+        return {k: clean_record_for_json(v) for k, v in record.items()}
+    elif isinstance(record, list):
+        return [clean_record_for_json(v) for v in record]
+    elif isinstance(record, float):
+        if math.isnan(record) or math.isinf(record):
+            return None
+        return record
+    elif isinstance(record, (np.floating, np.integer)):
+        if np.isnan(record) or np.isinf(record):
+            return None
+        return record.item() if hasattr(record, 'item') else float(record)
+    else:
+        return record
+
 def process_single_batch(batch_data, batch_num, operation, external_id_name, selected_object, org_creds, batches_folder):
     """Process a single batch - designed to be thread-safe"""
     try:
         # Create new SF connection for this thread
         thread_sf_conn = create_sf_connection(org_creds)
-        
         batch_df, start_time = batch_data
         print(f"[Batch {batch_num}] Starting processing of {len(batch_df)} records...")
-        
-        # Convert batch to records
-        batch_records = batch_df.to_dict('records')
-        
+
+        # --- Boolean field coercion logic ---
+        def get_salesforce_boolean_fields(sf_conn, object_name):
+            """Return a set of field names that are booleans for the given Salesforce object."""
+            try:
+                obj_desc = getattr(sf_conn, object_name).describe()
+                return set(f['name'] for f in obj_desc['fields'] if f['type'] == 'boolean')
+            except Exception as e:
+                print(f"[Batch {batch_num}] Warning: Could not fetch boolean fields: {e}")
+                return set()
+
+        def coerce_to_bool(val):
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                if val == 1 or val == 1.0:
+                    return True
+                if val == 0 or val == 0.0:
+                    return False
+            if isinstance(val, str):
+                if val.strip().lower() in ['true', '1', 'yes', 'y']:
+                    return True
+                if val.strip().lower() in ['false', '0', 'no', 'n']:
+                    return False
+            return None
+
+        # Get boolean fields for this object
+        boolean_fields = get_salesforce_boolean_fields(thread_sf_conn, selected_object)
+        if boolean_fields:
+            print(f"[Batch {batch_num}] Coercing boolean fields: {sorted(boolean_fields)}")
+        else:
+            print(f"[Batch {batch_num}] No boolean fields detected for coercion.")
+
+        # Convert batch to records, clean for JSON, and coerce booleans
+        batch_records = []
+        for rec in batch_df.to_dict('records'):
+            rec_clean = clean_record_for_json(rec)
+            for field in boolean_fields:
+                if field in rec_clean:
+                    rec_clean[field] = coerce_to_bool(rec_clean[field])
+            batch_records.append(rec_clean)
+
         # Perform bulk operation for this batch
         if operation == 'upsert':
             results = getattr(thread_sf_conn.bulk, selected_object).upsert(batch_records, external_id_field=external_id_name)
         else:
             results = getattr(thread_sf_conn.bulk, selected_object).insert(batch_records)
-        
+
         # Process results for this batch
         batch_success_rows = []
         batch_error_rows = []
-        
+
         for i, res in enumerate(results):
             row = batch_df.iloc[i].copy()
             if res.get('success'):
@@ -1124,23 +1265,23 @@ def process_single_batch(batch_data, batch_num, operation, external_id_name, sel
             else:
                 row['errors'] = str(res.get('errors'))
                 batch_error_rows.append(row)
-        
+
         # Save batch-specific files
         batch_file_prefix = f"{selected_object}_Batch{batch_num}"
-        
+
         # Save batch source data
         batch_df.to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_source.csv"), index=False)
-        
+
         # Save batch results
         if batch_success_rows:
             pd.DataFrame(batch_success_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_success.csv"), index=False)
-        
+
         if batch_error_rows:
             pd.DataFrame(batch_error_rows).to_csv(os.path.join(batches_folder, f"{batch_file_prefix}_error.csv"), index=False)
-        
+
         processing_time = time.time() - start_time
         print(f"[Batch {batch_num}] Completed in {processing_time:.2f}s: {len(batch_success_rows)} success, {len(batch_error_rows)} errors")
-        
+
         return {
             'batch_num': batch_num,
             'total_records': len(batch_df),
@@ -1150,18 +1291,18 @@ def process_single_batch(batch_data, batch_num, operation, external_id_name, sel
             'error_rows': batch_error_rows,
             'processing_time': processing_time
         }
-        
+
     except Exception as e:
         processing_time = time.time() - start_time if 'start_time' in locals() else 0
         print(f"[Batch {batch_num}] Failed in {processing_time:.2f}s: {e}")
-        
+
         # Mark all records in this batch as errors
         error_rows = []
         for i in range(len(batch_df)):
             row = batch_df.iloc[i].copy()
             row['errors'] = f"Batch processing failed: {str(e)}"
             error_rows.append(row)
-        
+
         return {
             'batch_num': batch_num,
             'total_records': len(batch_df),

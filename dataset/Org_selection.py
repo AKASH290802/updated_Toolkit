@@ -1,6 +1,6 @@
 import tkinter as tk
 
-org = ['fcs2', 'dinesh', 'deployement', 'jayashree']
+org = ['fcs2', 'dinesh', 'deployement', 'jayashree','TestQA', 'TestDev']
 
 def org_select():
     selected = {'value': None}
