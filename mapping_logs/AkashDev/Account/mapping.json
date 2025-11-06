@@ -1,0 +1,17 @@
+{
+  "object_name": "Account",
+  "fields": {
+    "FirstName": "Name",
+    "Phone No.": "Phone",
+    "Billing Street": "BillingStreet"
+  },
+  "metadata": {
+    "created_date": "2025-10-14T09:34:01.635753",
+    "mapping_type": "Auto-detect from Data",
+    "include_readonly": false,
+    "include_system": false,
+    "field_filter": "",
+    "total_fields": 3,
+    "org_name": "AkashDev"
+  }
+}
