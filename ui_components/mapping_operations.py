@@ -9,9 +9,7 @@ from .utils import (
     get_object_description,
     show_processing_status,
     load_mapping_file,
-    save_mapping_file,
-    validate_file_upload,
-    load_data_file
+    save_mapping_file
 )
 
 def show_mapping_operations(credentials: Dict):
@@ -32,8 +30,8 @@ def show_mapping_operations(credentials: Dict):
     
     # Main tabs
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🔧 View Field Mapping",
-        "📋 Picklist Mappings",
+        "🔧 Create New Mapping",
+        "� Check Existing Mappings", 
         "✏️ Modify Mapping",
         "📊 Mapping Insights"
     ])
@@ -42,8 +40,7 @@ def show_mapping_operations(credentials: Dict):
         show_generate_mapping(sf_conn)
     
     with tab2:
-        from .picklist_mapping import show_picklist_mapping_manager
-        show_picklist_mapping_manager(credentials)
+        show_view_mappings()
     
     with tab3:
         show_edit_mapping(sf_conn)
@@ -52,9 +49,9 @@ def show_mapping_operations(credentials: Dict):
         show_mapping_analytics()
 
 def show_generate_mapping(sf_conn):
-    """View and generate field mapping for Salesforce objects"""
-    st.subheader("🔧 View Field Mapping")
-    st.markdown("View field mappings for Salesforce objects")
+    """Generate new mapping for Salesforce object"""
+    st.subheader("🔧 Generate Field Mapping")
+    st.markdown("Automatically generate field mapping for Salesforce objects")
     
     # Object selection
     col1, col2 = st.columns([3, 1])
@@ -128,13 +125,17 @@ def show_generate_mapping(sf_conn):
             if data_source == "Upload File":
                 uploaded_file = st.file_uploader(
                     "Upload source data file",
-                    type=['csv', 'xlsx', 'xls', 'psv'],
-                    help="Upload CSV, Excel, or PSV (Pipe-separated) files to auto-detect field mappings"
+                    type=['csv', 'xlsx', 'xls'],
+                    help="Upload file to auto-detect field mappings"
                 )
                 
-                if uploaded_file and validate_file_upload(uploaded_file):
+                if uploaded_file:
                     try:
-                        source_df = load_data_file(uploaded_file)
+                        file_ext = os.path.splitext(uploaded_file.name)[1]
+                        if file_ext.lower() == '.csv':
+                            source_df = pd.read_csv(uploaded_file)
+                        else:
+                            source_df = pd.read_excel(uploaded_file)
                         
                         st.success(f"✅ Loaded {len(source_df)} rows with {len(source_df.columns)} columns")
                         
@@ -163,10 +164,10 @@ def show_generate_mapping(sf_conn):
                 else:
                     st.info("No existing data files found")
         
-        # View mapping button
+        # Generate mapping button
         st.divider()
         
-        if st.button("🚀 View Mapping", type="primary", use_container_width=True):
+        if st.button("🚀 Generate Mapping", type="primary", use_container_width=True):
             generate_field_mapping(
                 sf_conn, 
                 selected_object, 
@@ -178,9 +179,8 @@ def show_generate_mapping(sf_conn):
             )
 
 def show_view_mappings():
-    """View existing mappings - Primary tab for browsing saved field mappings"""
-    st.subheader("👁 View Existing Mappings")
-    st.markdown("Browse and review saved field mappings for your organization")
+    """View existing mappings"""
+    st.subheader("📋 View Existing Mappings")
     
     if not st.session_state.current_org:
         st.warning("⚠️ Please select an organization first")
@@ -237,7 +237,7 @@ def show_edit_mapping(sf_conn):
     
     if mappings:
         selected_mapping = st.selectbox(
-            "Select the object for which you would like to edit the field mapping",
+            "Select Mapping to Edit",
             options=[""] + list(mappings.keys()),
             key="edit_mapping_select"
         )
@@ -253,7 +253,7 @@ def show_edit_mapping(sf_conn):
             col1, col2 = st.columns([1, 1])
             
             with col1:
-                st.write("**Field Name**")
+                st.write("**Source Field**")
             with col2:
                 st.write("**Target Field (Salesforce)**")
             
@@ -316,7 +316,7 @@ def show_edit_mapping(sf_conn):
             col_new1, col_new2, col_new3 = st.columns([2, 2, 1])
             
             with col_new1:
-                new_source_field = st.text_input("New Field Name", key="new_source")
+                new_source_field = st.text_input("New Source Field", key="new_source")
             
             with col_new2:
                 if sf_fields:
@@ -414,7 +414,7 @@ def show_mapping_analytics():
         col_source, col_target = st.columns(2)
         
         with col_source:
-            st.write("**Most Common Field Names**")
+            st.write("**Most Common Source Fields**")
             source_counts = pd.Series(all_source_fields).value_counts().head(10)
             
             if not source_counts.empty:
@@ -616,7 +616,7 @@ def show_mapping_preview(mapping_data: Dict):
         if fields_mapping:
             # Convert to DataFrame for better display
             mapping_df = pd.DataFrame([
-                {"Field Name": source, "Target Field (Salesforce)": target}
+                {"Source Field": source, "Target Field (Salesforce)": target}
                 for source, target in fields_mapping.items()
             ])
             
@@ -661,7 +661,7 @@ def show_mapping_details(mapping_data: Dict, object_name: str):
         
         if fields:
             mapping_df = pd.DataFrame([
-                {"Field Name": source, "Target Field": target}
+                {"Source Field": source, "Target Field": target}
                 for source, target in fields.items()
             ])
             
@@ -733,8 +733,6 @@ def load_existing_file(file_path: str) -> Optional[pd.DataFrame]:
         
         if file_path.endswith('.csv'):
             return pd.read_csv(full_path)
-        elif file_path.endswith('.psv'):
-            return pd.read_csv(full_path, sep='|')
         else:
             return pd.read_excel(full_path)
     

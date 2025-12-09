@@ -7,26 +7,3 @@ openpyxl>=3.1.0
 xlsxwriter>=3.1.0
 requests>=2.28.0
 cryptography>=3.4.0
-
-# NEW LIBRARIES FOR ENHANCED ETL FUNCTIONALITY
-# Date/Time Processing
-python-dateutil>=2.8.0
-
-# Advanced Data Processing
-numpy>=1.21.0
-
-# Configuration Management & Validation
-PyYAML>=6.0
-jsonschema>=4.17.0
-
-# Enhanced Progress Tracking & User Experience
-tqdm>=4.64.0
-colorama>=0.4.6
-
-# Data Quality Visualization
-plotly>=5.15.0
-seaborn>=0.12.0
-matplotlib>=3.6.0
-
-# Memory Optimization for Large Files
-memory-profiler>=0.60.0

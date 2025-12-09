@@ -1,32 +1,8 @@
 {
-  "AkashDev": {
-    "username": "akashgcompany622@agentforce.com",
-    "password": "Akrish@123",
-    "security_token": "tup6RzptgMIEjWNA6yQULeVOw",
-    "domain": "login"
-  },
   "DEv": {
     "username": "Gary",
     "password": "123",
     "security_token": "688",
     "domain": "login"
-  },
-  "FCS": {
-    "username": "karnasaikishore.r@tavant.com.kbtjpuat",
-    "password": "KBT@2025",
-    "security_token": "f31dabo6Lynci46fzzHYd4xB",
-    "domain": "test"
-  },
-  "ValmontDev": {
-    "username": "epparlanarayana.chowdhary@valmont.com.tavantdev",
-    "password": "Tavant@12345",
-    "security_token": "KsV2YSHj0Q3BaTSdePK7VskO",
-    "domain": "test"
-  },
-  "ValmontUAT": {
-    "username": "epparlanarayana.chowdhary@valmont.com.tavantfull",
-    "password": "Tavant@12345",
-    "security_token": "nUHynabsg1wfKFNsBPOpcalF0",
-    "domain": "test"
   }
 }
