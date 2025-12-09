@@ -97,21 +97,22 @@ def show_dashboard(credentials: Dict):
     st.markdown("### 🚀 Quick Actions")
     
     # Only show actions if org is selected
+    # Note: Page names must match exactly with navigation menu in streamlit_app.py
     if st.session_state.current_org:
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            if st.button("✅ Validation", use_container_width=True, key="dash_validation"):
+            if st.button("1️⃣ Validation", use_container_width=True, key="dash_validation"):
                 st.session_state.active_page = "1️⃣ Validation"
                 st.rerun()
         
         with col2:
-            if st.button("📥 Data Operations", use_container_width=True, key="dash_data_ops"):
+            if st.button("2️⃣ Data Operations", use_container_width=True, key="dash_data_ops"):
                 st.session_state.active_page = "2️⃣ Data Operations"
                 st.rerun()
         
         with col3:
-            if st.button("🧪 Unit Testing", use_container_width=True, key="dash_testing"):
+            if st.button("3️⃣ Unit Testing", use_container_width=True, key="dash_testing"):
                 st.session_state.active_page = "3️⃣ Unit Testing"
                 st.rerun()
         
@@ -173,13 +174,13 @@ def count_processed_files() -> int:
         datafiles_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'DataFiles')
         if os.path.exists(datafiles_path):
             for root, dirs, files in os.walk(datafiles_path):
-                count += len([f for f in files if f.endswith(('.csv', '.xlsx', '.xls', '.psv'))])
+                count += len([f for f in files if f.endswith(('.csv', '.xlsx', '.xls'))])
         
         # Count files in DataLoader_Logs
         logs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'DataLoader_Logs')
         if os.path.exists(logs_path):
             for root, dirs, files in os.walk(logs_path):
-                count += len([f for f in files if f.endswith(('.csv', '.xlsx', '.xls', '.psv'))])
+                count += len([f for f in files if f.endswith(('.csv', '.xlsx', '.xls'))])
     except:
         pass
     

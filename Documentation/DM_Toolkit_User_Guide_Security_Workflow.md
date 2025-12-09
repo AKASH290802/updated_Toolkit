@@ -36,8 +36,8 @@ SECURE WORKFLOW CONTROL:
                                                         ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Unit Testing  │◀───│   Data Loading │◀───│   Validation    │
-│   (Quality      │    │   (Only After   │    │   PASSED ✅     │ 
-│   Assurance)    │    │   Validation)   │    │                 │
+│   ( Quality     │    │   (Locked Until │    │   PASSED ✅     │ 
+│   Assurance )   │    │   Validation)   │    │                 │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 Note: If any data fails the Validation Rules, then check with the Client or the user who provided the CSV/Excel data file and ask to provide valid data.

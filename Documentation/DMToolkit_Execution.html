@@ -37,7 +37,7 @@
         }
         return gk_fileData[filename] || "";
         }
-        </script>
+        </script>```html
     <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -90,8 +90,10 @@
                     <p class="highlight mb-2">Action:</p> Open Command Prompt and navigate to the C: drive.
                     <p class="mt-2"><span class="highlight">Command:</span></p>
                     <div class="code-block">
-                        git clone -b dm_tools --single-branch https://gitlab.tavant.com/g.akash/dmtoolkit.git
+                        git clone -b dm_tools --single-branch https://gitlab.tavant.com/kartik.kumar1/DMToolkitExecutor.git C:\DM_toolkit
                     </div>
+                    <p class="mt-2"><span class="highlight">Configuration:</span></p>
+                    Update <code>linkedservice.json</code> in the <code>Services</code> folder with required credentials or project-specific modifications.
                 </div>
             </section>
 
@@ -99,7 +101,7 @@
             <section>
                 <h2 class="text-3xl mb-4">Step 2: Install Dependencies</h2>
                 <div class="text-content">
-                    <p class="highlight mb-2">Action:</p> Navigate to the <code>DM_toolkit</code> directory in Command Prompt Or In Terminal of the code Editor where you have the application, You can type
+                    <p class="highlight mb-2">Action:</p> Navigate to the <code>DM_toolkit</code> directory in Command Prompt.
                     <p class="mt-2"><span class="highlight">Command:</span></p>
                     <div class="code-block">
                         pip install -r requirements.txt
@@ -109,75 +111,100 @@
                 </div>
             </section>
 
-            <!-- Slide 4: Step 3 - Get Application in Browser -->
+            <!-- Slide 4: Step 3 - Data Migration -->
             <section>
-                <h2 class="text-3xl mb-4">Step 3: Get application in your browser</h2>
+                <h2 class="text-3xl mb-4">Step 3: Data Migration (Dataload Folder)</h2>
                 <div class="text-content">
-                    <p class="highlight mb-2">Commands:</p>
-                    First open the saved Folder in any of the code Editor present in your laptop, then Type <code>"streamlit run streamlit_app.py"</code> in the Terminal of the code Editor, then the application gets opened in your browser
-                </div>
-            </section>
-
-            <!-- Slide 5: Step 4 - Add your Org -->
-            <section>
-                <h2 class="text-3xl mb-4">Step 4: Add your Org</h2>
-                <div class="text-content">
-                    <p class="highlight mb-2">Commands:</p>
-                    In the application go to Configuration tab and add your salesforce org by giving the credentials.
-                    <p class="mt-2"><span class="highlight">Credentials needed:</span></p>
+                    <p class="highlight mb-2">Scripts:</p>
                     <ul class="list-disc ml-6">
-                        <li>Username</li>
-                        <li>Password</li>
-                        <li>Security Token</li>
+                        <li><code>data_load2sql.py</code>: Migrates data from Salesforce, Excel, or CSV to SQL Server.</li>
+                        <li><code>dataframe.py</code>: Migrates data from Salesforce or SQL to the local system.</li>
+                        <li><code>dataloader.py</code>: Migrates data from Excel, CSV, or SQL to Salesforce.</li>
                     </ul>
+                    <p class="mt-2"><span class="highlight">Pre-requisite:</span></p>
+                    Run <code>mapping.py</code> to generate <code>mapping.json</code> for the specific Salesforce object.
+                    <p class="mt-2"><span class="highlight">Output:</span></p>
+                    Source, error, success, and transformed files saved in the <code>dataloader_logs</code> folder.
                 </div>
             </section>
 
-            <!-- Slide 6: Step 5 - Perform Action -->
+            <!-- Slide 5: Step 4 - Mapping -->
             <section>
-                <h2 class="text-3xl mb-4">Step 5: Perform Action</h2>
+                <h2 class="text-3xl mb-4">Step 4: Mapping (Mapping Folder)</h2>
                 <div class="text-content">
-                    <p class="highlight mb-2">Commands:</p>
-                    Mandatory to do Data Validation
-                    <p class="mt-2"><span class="highlight">Validation Types:</span></p>
+                    <p class="highlight mb-2">Action:</p>
+                    Run <code>mapping.py</code> to generate mapping for the selected Salesforce object.
+                    <p class="mt-2"><span class="highlight">Output:</span></p>
+                    Mapping saved in the <code>mapping_logs</code> folder.
+                </div>
+            </section>
+
+            <!-- Slide 6: Step 5 - Unit Testing -->
+            <section>
+                <h2 class="text-3xl mb-4">Step 5: Unit Testing (Unit Testing Folder)</h2>
+                <div class="text-content">
+                    <p class="highlight mb-2">Status:</p>
+                    Module is in development but functional.
+                    <p class="mt-2"><span class="highlight">Action:</span></p>
+                    Run <code>checks.py</code> to generate a unit test case report based on Salesforce and object selection.
+                    <p class="mt-2"><span class="highlight">Output:</span></p>
+                    Report saved in the <code>Unit Testing Generate</code> folder.
+                </div>
+            </section>
+
+            <!-- Slide 7: Step 6 - Data Validation -->
+            <section>
+                <h2 class="text-3xl mb-4">Step 6: Data Validation (Data Validation Folder)</h2>
+                <div class="text-content">
+                    <p class="highlight mb-2">Validation Types:</p>
                     <ul class="list-disc ml-6">
-                        <li><strong>Schema-level</strong>: Validates required fields, data types, date formats, etc.</li>
+                        <li><strong>Schema-level</strong>: Validates required fields, data types, date formats, email, phone, etc.</li>
                         <li><strong>Custom-level</strong>: Uses custom error formulas to prevent invalid data entry in Salesforce.</li>
-                        <li><strong>GenAI Validation</strong>: Converts the apex code of the Validation formulas to Python functions and will validates the data uploaded.</li>
                     </ul>
-                </div>
-            </section>
-
-            <!-- Slide 7: Step 6 - Further Actions -->
-            <section>
-                <h2 class="text-3xl mb-4">Step 6: Further Actions</h2>
-                <div class="text-content">
-                    <p class="highlight mb-2">Commands:</p>
+                    <p class="mt-2"><span class="highlight">Steps:</span></p>
+                    <ol class="list-decimal ml-6">
+                        <li>Run <code>Salesforce_details.py</code> to generate a Salesforce object description locally.</li>
+                        <li>Run <code>schema_validation.py</code> to generate a CSV file for schema-level validation.</li>
+                        <li>Run <code>Summary.py</code> to generate a comprehensive data summary CSV, including duplicates and issues.</li>
+                    </ol>
+                    <p class="mt-2"><span class="highlight">Custom Validation:</span></p>
                     <ul class="list-disc ml-6">
-                        <li>The data for a Object could be extracted(inserted few days back, all records or even can write a SOQL query).</li>
-                        <li>The Valid Data only to be inserted(can be either inserted, updated or upserted).</li>
-                        <li>The Unit Test Cases can be Generated for the selected Object.</li>
-                        <li>Explore !!!</li>
+                        <li>Run <code>GenAI_Validation.py</code> to create a <code>Bundle</code> folder with Python functions for custom validations.</li>
+                        <li>Use Copilot to convert Salesforce error formulas into Python-based formulas in <code>bundle.py</code>.</li>
+                        <li>Run <code>validator.py</code> to execute <code>bundle.py</code> and generate the custom-validated data file.</li>
                     </ul>
                 </div>
             </section>
 
-            <!-- Slide 8: Summary -->
+            <!-- Slide 8: Step 7 - Documentation -->
+            <section>
+                <h2 class="text-3xl mb-4">Step 7: Refer to Documentation</h2>
+                <div class="text-content">
+                    <p class="highlight mb-2">Resource:</p>
+                    Consult the <code>Documentation</code> folder for detailed PDFs, text files, and requirements.
+                    <p class="mt-2"><span class="highlight">Purpose:</span></p>
+                    Provides guidance on toolkit functionality, usage, troubleshooting, and additional configuration details.
+                    <p class="mt-2"><span class="highlight">Action:</span></p>
+                    Ensure all steps align with the documentation for smooth execution.
+                </div>
+            </section>
+
+            <!-- Slide 9: Summary -->
             <section class="flex items-center justify-center bg-blue-100">
                 <div class="text-center">
                     <h2 class="text-3xl mb-4">Summary</h2>
                     <div class="text-content">
                         <p class="highlight mb-2">Key Steps:</p>
                         <ol class="list-decimal ml-6 text-left">
-                            <li>Clone the repository from GitLab.</li>
+                            <li>Clone the repository and configure credentials.</li>
                             <li>Install dependencies using <code>requirements.txt</code>.</li>
-                            <li>Run the application in your browser using Streamlit.</li>
-                            <li>Add your Salesforce org credentials in Configuration.</li>
-                            <li>Perform mandatory Data Validation (Schema, Custom, GenAI).</li>
-                            <li>Execute further actions: data extraction, insertion, unit testing.</li>
+                            <li>Perform data migration with provided scripts.</li>
+                            <li>Generate mappings for Salesforce objects.</li>
+                            <li>Conduct unit testing and validate data.</li>
+                            <li>Refer to documentation for troubleshooting.</li>
                         </ol>
                         <p class="mt-4"><span class="highlight">Next Steps:</span></p>
-                        Explore the application and start your data validation journey!
+                        Follow the documentation for any issues or advanced configurations.
                     </div>
                 </div>
             </section>

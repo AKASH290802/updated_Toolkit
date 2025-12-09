@@ -111,28 +111,14 @@ instance_url = SalesForce.sf_instance
 fields_info = []
 schema = getattr(SalesForce, object_name).describe()
 for field in schema['fields']:
-    # Extract picklist API names (valueName) for validation - these should match file values
-    picklist_api_names = []
-    picklist_labels = []
-    
-    for p in field.get('picklistValues', []):
-        if not p.get('inactive', False):
-            # API name for validation (what should be in uploaded files)
-            api_name = p.get('valueName', p.get('value', ''))
-            # Label for UI display (what users see in Salesforce)
-            label = p.get('label', p.get('value', ''))
-            
-            picklist_api_names.append(api_name)
-            picklist_labels.append(label)
-    
+    picklist_values = [p['value'] for p in field.get('picklistValues', []) if not p.get('inactive', False)]
     fields_info.append({
         'Field Name': field['name'],
         'Label': field['label'],
         'Type': field['type'],
         'Required': not field['nillable'],
         'Unique': field.get('unique', False),
-        'Picklist Values': ", ".join(picklist_api_names),  # Store API names for validation
-        'Picklist Labels': ", ".join(picklist_labels)     # Store labels for reference
+        'Picklist Values': ", ".join(picklist_values)
     })
 
 fields_df = pd.DataFrame(fields_info)
