@@ -2,22 +2,451 @@ import streamlit as st
 import pandas as pd
 import os
 import sys
+import time
 from typing import Dict, Optional
 import json
+from datetime import datetime
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(project_root)
 
-from .utils import (
-    establish_sf_connection, 
-    get_salesforce_objects, 
-    display_dataframe_with_download,
-    show_processing_status,
-    validate_file_upload,
-    save_uploaded_file,
-    create_progress_tracker
-)
+try:
+    from .utils import (
+        establish_sf_connection, 
+        get_salesforce_objects,
+        get_object_description,
+        display_dataframe_with_download,
+        show_processing_status,
+        validate_file_upload,
+        save_uploaded_file,
+        create_progress_tracker,
+        load_data_file
+    )
+    from .etl_engine import ETLEngine
+    from .business_rules import BusinessRulesManager
+    from .etl_ui_enhancements import ETLUIEnhancements
+except ImportError:
+    from utils import (
+        establish_sf_connection, 
+        get_salesforce_objects,
+        get_object_description,
+        display_dataframe_with_download,
+        show_processing_status,
+        validate_file_upload,
+        save_uploaded_file,
+        create_progress_tracker,
+        load_data_file
+    )
+    from etl_engine import ETLEngine
+    from business_rules import BusinessRulesManager
+    from etl_ui_enhancements import ETLUIEnhancements
+
+def get_external_id_fields(sf_conn, object_name: str):
+    """
+    Get all external ID fields for a Salesforce object
+    """
+    try:
+        obj_desc = getattr(sf_conn, object_name).describe()
+        external_id_fields = []
+        
+        for field in obj_desc.get('fields', []):
+            if field.get('externalId', False) and field.get('updateable', False):
+                external_id_fields.append({
+                    'name': field['name'],
+                    'label': field.get('label', field['name']),
+                    'type': field.get('type', 'string')
+                })
+        
+        return external_id_fields
+    except Exception as e:
+        st.error(f"Error retrieving external ID fields: {str(e)}")
+        return []
+
+def get_all_updateable_fields(sf_conn, object_name: str):
+    """
+    Get all updateable fields for a Salesforce object
+    """
+    try:
+        obj_desc = getattr(sf_conn, object_name).describe()
+        updateable_fields = []
+        
+        for field in obj_desc.get('fields', []):
+            if field.get('updateable', False):
+                updateable_fields.append({
+                    'name': field['name'],
+                    'label': field.get('label', field['name']),
+                    'type': field.get('type', 'string'),
+                    'unique': field.get('unique', False),
+                    'externalId': field.get('externalId', False)
+                })
+        
+        return updateable_fields
+    except Exception as e:
+        st.error(f"Error retrieving updateable fields: {str(e)}")
+        return []
+
+def check_field_uniqueness_in_salesforce(sf_conn, object_name: str, field_name: str, sample_values: list):
+    """
+    Check if a field has unique values in Salesforce by sampling some records
+    """
+    try:
+        if not sample_values or len(sample_values) == 0:
+            return True, "No sample values provided"
+        
+        # Take a sample of unique values to check
+        unique_sample = list(set([str(val) for val in sample_values if pd.notna(val) and str(val).strip() != '']))[:10]
+        
+        if len(unique_sample) == 0:
+            return True, "No valid values to check"
+        
+        # Query Salesforce to check for duplicates
+        query_values = "', '".join(unique_sample)
+        soql_query = f"SELECT {field_name}, COUNT(Id) cnt FROM {object_name} WHERE {field_name} IN ('{query_values}') GROUP BY {field_name} HAVING COUNT(Id) > 1"
+        
+        result = sf_conn.query(soql_query)
+        duplicates = result.get('records', [])
+        
+        if len(duplicates) > 0:
+            duplicate_values = [rec[field_name] for rec in duplicates]
+            return False, f"Found duplicate values in Salesforce: {', '.join(map(str, duplicate_values))}"
+        
+        return True, "Field values appear to be unique in Salesforce"
+        
+    except Exception as e:
+        # If there's an error (like field doesn't exist), assume it's not suitable for matching
+        return False, f"Error checking field uniqueness: {str(e)}"
+
+def handle_single_field_external_id(sf_conn, target_object, df_to_load, external_id_fields, all_updateable_fields, available_data_fields):
+    """Handle traditional single field external ID selection"""
+    
+    # All Salesforce fields for dropdown selection
+    sf_field_names = [field['name'] for field in all_updateable_fields]
+    
+    # Analyze fields for matching suitability (only for fields in data)
+    field_analysis = {}
+    for field in available_data_fields:
+        if field in sf_field_names:  # Only analyze if field exists in Salesforce
+            non_null_count = df_to_load[field].count()
+            total_count = len(df_to_load)
+            unique_count = df_to_load[field].nunique()
+            
+            field_analysis[field] = {
+                'completeness': (non_null_count / total_count) * 100,
+                'uniqueness': (unique_count / non_null_count) * 100 if non_null_count > 0 else 0,
+                'non_null_count': non_null_count,
+                'unique_count': unique_count
+            }
+    
+    # Show external ID information with clear notifications
+    if external_id_fields:
+        ext_field_names = [field['name'] for field in external_id_fields]
+        if len(external_id_fields) == 1:
+            st.success(f"🔑 **External ID Found**: {target_object} has **{ext_field_names[0]}** as External ID field")
+            st.info(f"🎯 **Auto-Selected**: **{ext_field_names[0]}** has been automatically selected for upsert operation")
+        else:
+            st.success(f"🔑 **Multiple External IDs Found**: {target_object} has {len(external_id_fields)} external ID fields: {', '.join(ext_field_names)}")
+            st.info(f"🎯 **Auto-Selected**: **{ext_field_names[0]}** (first external ID) has been automatically selected for upsert operation")
+        st.info("💡 External ID fields are perfect for upsert operations and don't require validation")
+    else:
+        st.warning(f"⚠️ **No External ID Found**: {target_object} does not have any External ID fields")
+        st.info("📝 **What this means**: You'll need to select a field that can uniquely identify records")
+        st.info("🔍 **We'll help**: Any field you select will be checked for uniqueness in Salesforce")
+        st.info("🎯 **Recommendation**: Choose a field with unique values like Name, Email, or custom unique identifier")
+    
+    # Show field analysis for matching (only for fields in uploaded data)
+    if field_analysis:
+        with st.expander("📊 Field Analysis for Record Matching (Data Fields)", expanded=False):
+            st.markdown("**Analysis for fields present in your uploaded data:**")
+            st.markdown("- ✅ High completeness (few null/empty values)")
+            st.markdown("- ✅ High uniqueness (minimal duplicates)")
+            st.markdown("- ✅ Values that uniquely identify records")
+            
+            analysis_df = pd.DataFrame(field_analysis).T
+            analysis_df.index.name = 'Field'
+            analysis_df = analysis_df.round(1)
+            st.dataframe(analysis_df, use_container_width=True)
+    
+    # Prepare field options with clear organization
+    field_options = [""]
+    default_field = None
+    default_index = 0
+    
+    if external_id_fields:
+        # Object HAS external ID fields
+        field_options.extend([field['name'] for field in external_id_fields])
+        default_field = external_id_fields[0]['name']
+        default_index = 1
+        field_options.append("--- Other Salesforce Fields ---")
+        
+        # Add other Salesforce fields
+        external_id_names = [field['name'] for field in external_id_fields]
+        other_sf_fields = [field for field in sf_field_names if field not in external_id_names]
+        field_options.extend(other_sf_fields)
+        
+        help_text = "External ID field is pre-selected. You can choose other fields, but they'll be validated for uniqueness."
+    else:
+        # Object has NO external ID fields
+        field_options.extend(sf_field_names)
+        help_text = "No External ID fields exist for this object. Please select a field that can uniquely identify records. We'll validate its uniqueness in Salesforce."
+    
+    # Select matching field with context-appropriate help
+    match_field = st.selectbox(
+        "Field to Match Records",
+        options=field_options,
+        index=default_index,
+        help=help_text
+    )
+    
+    # Skip separator
+    if match_field == "--- Other Salesforce Fields ---":
+        match_field = ""
+    
+    if match_field and match_field != "--- Other Salesforce Fields ---":
+        # Check if selected field is external ID
+        external_id_names = [field['name'] for field in external_id_fields]
+        is_external_id = match_field in external_id_names
+        
+        # Get field info from Salesforce
+        field_info = next((f for f in all_updateable_fields if f['name'] == match_field), None)
+        
+        if is_external_id:
+            # External ID selected - no validation needed
+            st.success(f"🔑 **Perfect Choice**: **{match_field}** is an External ID field!")
+            st.success(f"✅ **Ready for Upsert**: This field is specifically designed for upsert operations")
+            st.info(f"💡 **How it works**: Salesforce will use **{match_field}** to automatically match existing records and insert new ones")
+            
+            # Show field type
+            if field_info:
+                st.info(f"📋 Field type: {field_info['type']}")
+            
+            # Store the match field
+            st.session_state.upsert_match_field = match_field
+        
+        else:
+            # Non-external ID field selected - validate uniqueness
+            if external_id_fields:
+                st.warning(f"⚠️ **Alternative Field Selected**: **{match_field}** is not an External ID field")
+                st.info(f"🔍 **Validating**: Checking if **{match_field}** has unique values in Salesforce...")
+            else:
+                st.info(f"🔍 **Validating Field**: **{match_field}** selected for matching (no External ID available for this object)")
+                st.info(f"🔍 **Checking**: Verifying if **{match_field}** has unique values in Salesforce...")
+            
+            # Check if field exists in uploaded data for sampling
+            if match_field in df_to_load.columns:
+                # Field exists in data - can check uniqueness with sample values
+                with st.spinner(f"Checking if {match_field} values are unique in Salesforce..."):
+                    sample_values = df_to_load[match_field].dropna().unique()[:20].tolist()
+                    sf_unique, sf_uniqueness_message = check_field_uniqueness_in_salesforce(
+                        sf_conn, target_object, match_field, sample_values
+                    )
+                
+                if sf_unique:
+                    st.success(f"✅ **Validation Passed**: **{match_field}** appears to be unique in Salesforce!")
+                    st.success(f"✅ **Result**: {sf_uniqueness_message}")
+                    
+                    if not external_id_fields:
+                        st.success(f"🎉 **Perfect**: Since {target_object} has no External ID, **{match_field}** will work great for upsert!")
+                    
+                    # Show data analysis for this field
+                    field_stats = field_analysis.get(match_field, {})
+                    if field_stats:
+                        completeness = field_stats.get('completeness', 0)
+                        uniqueness = field_stats.get('uniqueness', 0)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.info(f"📊 Data Completeness: {completeness:.1f}%")
+                        with col2:
+                            st.info(f"📊 Data Uniqueness: {uniqueness:.1f}%")
+                else:
+                    st.error(f"❌ **Validation Failed**: **{match_field}** has duplicate values in Salesforce")
+                    st.error(f"❌ **Issue**: {sf_uniqueness_message}")
+                    st.warning("⚠️ **Recommendation**: Choose a different field or clean up duplicate data in Salesforce first")
+                    return None
+            else:
+                # Field not in data - can't validate but proceed with warning
+                st.warning(f"⚠️ **Field Not in Data**: **{match_field}** is not present in your uploaded data")
+                st.info("🔍 **Note**: We can't validate uniqueness without sample data, but the field will be used for matching")
+    
+    return match_field
+
+def handle_composite_external_id(sf_conn, target_object, df_to_load, available_data_fields):
+    """Handle composite external ID (combination of fields) configuration"""
+    
+    # Exclude system fields and very long text fields for composite keys
+    suitable_fields = []
+    for field in available_data_fields:
+        # Basic filtering - exclude obvious non-key fields
+        if not any(exclude_term in field.lower() for exclude_term in ['description', 'comment', 'notes', 'body']):
+            suitable_fields.append(field)
+    
+    st.info("💡 **Composite External ID**: Combines multiple fields to create a unique identifier")
+    st.markdown("""
+    **Examples:**
+    - `FirstName + LastName + Email` for Contact records
+    - `AccountName + ProductCode + Date` for Opportunity records
+    - `EmployeeID + Department + StartDate` for custom objects
+    """)
+    
+    if len(suitable_fields) < 2:
+        st.error("❌ **Insufficient Fields**: Need at least 2 fields for composite external ID")
+        return None, None
+    
+    # Multi-select for composite fields
+    selected_fields = st.multiselect(
+        "🔗 Select Fields for Composite External ID",
+        options=suitable_fields,
+        help="Choose 2-4 fields that together uniquely identify records"
+    )
+    
+    if not selected_fields:
+        st.info("📝 **Select Fields**: Choose fields to create your composite external ID")
+        return None, None
+    
+    if len(selected_fields) < 2:
+        st.warning("⚠️ **Minimum Fields**: Please select at least 2 fields for composite key")
+        return None, None
+    
+    if len(selected_fields) > 4:
+        st.warning("⚠️ **Maximum Fields**: Recommend using maximum 4 fields for optimal performance")
+    
+    # Separator configuration
+    st.write("#### ⚙️ Composite Key Configuration")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        separator = st.selectbox(
+            "🔗 Field Separator",
+            options=["|", "-", "_", "#", "~"],
+            index=0,
+            help="Character to separate field values in the composite key"
+        )
+    
+    with col2:
+        handle_nulls = st.selectbox(
+            "🔧 Handle Null Values",
+            options=["Skip", "Replace with 'NULL'", "Replace with 'EMPTY'"],
+            help="How to handle null/empty values in composite key"
+        )
+    
+    # Preview composite key
+    st.write("#### 👀 Composite Key Preview")
+    
+    try:
+        # Create sample composite keys
+        preview_df = df_to_load[selected_fields].head(5).copy()
+        
+        # Handle nulls based on selection
+        if handle_nulls == "Replace with 'NULL'":
+            preview_df = preview_df.fillna('NULL')
+        elif handle_nulls == "Replace with 'EMPTY'":
+            preview_df = preview_df.fillna('EMPTY')
+        
+        # Create composite key column
+        if handle_nulls == "Skip":
+            # Only include non-null values
+            preview_df['Composite_External_ID'] = preview_df.apply(
+                lambda row: separator.join([str(val) for val in row if pd.notna(val) and str(val).strip()]), 
+                axis=1
+            )
+        else:
+            # Include all values (nulls replaced)
+            preview_df['Composite_External_ID'] = preview_df.apply(
+                lambda row: separator.join([str(val) for val in row]), 
+                axis=1
+            )
+        
+        st.dataframe(preview_df, use_container_width=True)
+        
+        # Analyze composite key quality
+        full_composite_keys = create_composite_key_column(df_to_load, selected_fields, separator, handle_nulls)
+        
+        # Quality metrics
+        total_records = len(df_to_load)
+        non_empty_keys = (full_composite_keys != '').sum()
+        unique_keys = full_composite_keys.nunique()
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            completeness = (non_empty_keys / total_records) * 100
+            st.metric("🎯 Completeness", f"{completeness:.1f}%", help="Percentage of non-empty composite keys")
+        
+        with col2:
+            uniqueness = (unique_keys / non_empty_keys) * 100 if non_empty_keys > 0 else 0
+            st.metric("🔑 Uniqueness", f"{uniqueness:.1f}%", help="Percentage of unique composite keys")
+        
+        with col3:
+            st.metric("📊 Total Unique Keys", unique_keys, help="Total number of unique composite keys")
+        
+        # Quality assessment
+        if completeness >= 95 and uniqueness >= 95:
+            st.success("✅ **Excellent Quality**: Composite key has high completeness and uniqueness")
+        elif completeness >= 80 and uniqueness >= 80:
+            st.warning("⚠️ **Good Quality**: Composite key is suitable but consider improving data quality")
+        else:
+            st.error("❌ **Poor Quality**: Composite key may not be suitable for reliable matching")
+        
+        # Generate composite external ID field name
+        composite_field_name = f"CompositeExtID_{separator.join(selected_fields)}"
+        composite_field_name = composite_field_name.replace(" ", "").replace(separator, "_")[:40]  # Limit length
+        
+        # Configuration summary
+        with st.expander("⚙️ Configuration Summary", expanded=True):
+            st.markdown(f"""
+            **🔗 Selected Fields**: {', '.join(selected_fields)}  
+            **🔧 Separator**: `{separator}`  
+            **🛠️ Null Handling**: {handle_nulls}  
+            **🎯 Generated Field Name**: `{composite_field_name}`  
+            **📊 Expected Unique Records**: {unique_keys} out of {total_records}
+            """)
+        
+        # Store configuration
+        composite_config = {
+            'fields': selected_fields,
+            'separator': separator,
+            'null_handling': handle_nulls,
+            'field_name': composite_field_name,
+            'quality_metrics': {
+                'completeness': completeness,
+                'uniqueness': uniqueness,
+                'total_records': total_records,
+                'unique_keys': unique_keys
+            }
+        }
+        
+        return composite_field_name, composite_config
+        
+    except Exception as e:
+        st.error(f"❌ Error creating composite key preview: {str(e)}")
+        return None, None
+
+def create_composite_key_column(df, selected_fields, separator, handle_nulls):
+    """Create composite key column for the dataframe"""
+    df_subset = df[selected_fields].copy()
+    
+    # Handle nulls based on selection
+    if handle_nulls == "Replace with 'NULL'":
+        df_subset = df_subset.fillna('NULL')
+    elif handle_nulls == "Replace with 'EMPTY'":
+        df_subset = df_subset.fillna('EMPTY')
+    
+    # Create composite key column
+    if handle_nulls == "Skip":
+        # Only include non-null values
+        composite_keys = df_subset.apply(
+            lambda row: separator.join([str(val) for val in row if pd.notna(val) and str(val).strip()]), 
+            axis=1
+        )
+    else:
+        # Include all values (nulls replaced)
+        composite_keys = df_subset.apply(
+            lambda row: separator.join([str(val) for val in row]), 
+            axis=1
+        )
+    
+    return composite_keys
 
 def show_data_operations(credentials: Dict):
     """Display data operations interface"""
@@ -118,6 +547,10 @@ def show_data_extraction(sf_conn, credentials: Dict):
     st.subheader("📤 Data Extraction")
     st.markdown("Extract data from Salesforce, SQL, or upload local files")
     
+    # Initialize session state for extraction if needed
+    if 'sf_extraction_object' not in st.session_state:
+        st.session_state.sf_extraction_object = "Select an object..."
+    
     # Source selection
     col1, col2 = st.columns([2, 1])
     
@@ -174,11 +607,23 @@ def extract_from_salesforce(sf_conn):
         col1, col2 = st.columns([2, 1])
         
         with col1:
+            # Define callback function for extraction object selection
+            def on_extraction_object_change():
+                selected = st.session_state.sf_extraction_object
+                if selected and selected != "Select an object...":
+                    st.session_state.current_object = selected
+                    st.session_state.current_object_source = 'data_extraction'
+                else:
+                    if hasattr(st.session_state, 'current_object_source') and st.session_state.current_object_source == 'data_extraction':
+                        st.session_state.current_object = None
+                        st.session_state.current_object_source = None
+            
             selected_object = st.selectbox(
                 "Choose an object:",
                 options=["Select an object..."] + sorted(objects),
                 key="sf_extraction_object",
-                help="Choose the Salesforce object to extract data from"
+                help="Choose the Salesforce object to extract data from",
+                on_change=on_extraction_object_change
             )
         
         with col2:
@@ -190,8 +635,7 @@ def extract_from_salesforce(sf_conn):
             st.info("👆 Please select an object to continue")
             return
         
-        # Update session state
-        st.session_state.current_object = selected_object
+        # Show success message for valid selection  
         st.success(f"✅ Selected: **{selected_object}**")
         
         # Query options
@@ -349,8 +793,8 @@ def extract_from_file():
     
     uploaded_file = st.file_uploader(
         "Choose a file",
-        type=['csv', 'xlsx', 'xls'],
-        help="Upload a CSV or Excel file to extract data"
+        type=['csv', 'xlsx', 'xls', 'psv'],
+        help="Upload CSV, Excel, or PSV (Pipe-separated) files"
     )
     
     if uploaded_file:
@@ -368,22 +812,19 @@ def extract_from_file():
             
             # Preview data
             try:
-                if file_ext.lower() == '.csv':
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-                
-                st.write("#### Data Preview")
-                display_dataframe_with_download(df, uploaded_file.name, "File Data Preview")
-                
-                # Save file option
-                if st.button("💾 Save to DataFiles", use_container_width=True):
-                    save_path = os.path.join(project_root, 'DataFiles', 
-                                           st.session_state.current_org or 'uploads')
-                    saved_path = save_uploaded_file(uploaded_file, save_path)
-                    if saved_path:
-                        st.success(f"✅ File saved to: {saved_path}")
-                        show_processing_status("file_upload", f"File {uploaded_file.name} uploaded successfully", "success")
+                df = load_data_file(uploaded_file)
+                if df is not None:
+                    st.write("#### Data Preview")
+                    display_dataframe_with_download(df, uploaded_file.name, "File Data Preview")
+                    
+                    # Save file option
+                    if st.button("💾 Save to DataFiles", use_container_width=True):
+                        save_path = os.path.join(project_root, 'DataFiles', 
+                                               st.session_state.current_org or 'uploads')
+                        saved_path = save_uploaded_file(uploaded_file, save_path)
+                        if saved_path:
+                            st.success(f"✅ File saved to: {saved_path}")
+                            show_processing_status("file_upload", f"File {uploaded_file.name} uploaded successfully", "success")
                 
             except Exception as e:
                 st.error(f"❌ Error reading file: {str(e)}")
@@ -392,6 +833,11 @@ def show_data_loading(sf_conn, credentials: Dict):
     """Data loading to various destinations"""
     st.subheader("📥 Data Loading")
     st.markdown("Load data to Salesforce or SQL Server with batch processing")
+    
+    # Initialize current object state if needed
+    if 'current_object' not in st.session_state:
+        st.session_state.current_object = None
+        st.session_state.current_object_source = None
     
     # Load destination
     col1, col2 = st.columns([2, 1])
@@ -405,10 +851,21 @@ def show_data_loading(sf_conn, credentials: Dict):
     
     with col2:
         st.write("**Current Object:**")
-        if st.session_state.current_object:
-            st.info(st.session_state.current_object)
+        # Show object only if it was selected in data loading tab
+        if (load_destination == "Salesforce" and 
+            st.session_state.get('current_object_source') == 'data_loading' and 
+            st.session_state.current_object):
+            st.info(f"🎯 {st.session_state.current_object}")
+        elif load_destination == "Salesforce":
+            # Show the actual selectbox value if it exists
+            load_object = st.session_state.get('sf_load_object', 'Select an object...')
+            if load_object and load_object != "Select an object...":
+                st.info(f"🎯 {load_object}")
+            else:
+                st.warning("No object selected")
+                st.caption("👇 Select target object below")
         else:
-            st.warning("No object selected")
+            st.info("📋 SQL Server (table will be created)")
     
     st.divider()
     
@@ -470,20 +927,16 @@ def load_to_sql(credentials: Dict):
     if source_option == "Upload New File":
         uploaded_file = st.file_uploader(
             "Choose a file to load",
-            type=['csv', 'xlsx', 'xls'],
-            key="sql_load_upload"
+            type=['csv', 'xlsx', 'xls', 'psv'],
+            key="sql_load_upload",
+            help="Upload CSV, Excel, or PSV (Pipe-separated) files"
         )
         
         if uploaded_file and validate_file_upload(uploaded_file):
             try:
-                file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-                
-                if file_ext == '.csv':
-                    df_to_load = pd.read_csv(uploaded_file)
-                else:
-                    df_to_load = pd.read_excel(uploaded_file)
-                
-                st.success(f"✅ File loaded: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
+                df_to_load = load_data_file(uploaded_file)
+                if df_to_load is not None:
+                    st.success(f"✅ File loaded: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
                 
             except Exception as e:
                 st.error(f"❌ Error reading file: {str(e)}")
@@ -511,6 +964,8 @@ def load_to_sql(credentials: Dict):
                     
                     if file_ext == '.csv':
                         df_to_load = pd.read_csv(file_path)
+                    elif file_ext == '.psv':
+                        df_to_load = pd.read_csv(file_path, sep='|')
                     else:
                         df_to_load = pd.read_excel(file_path)
                     
@@ -628,20 +1083,45 @@ def load_to_salesforce(sf_conn):
     """Load data to Salesforce"""
     st.write("### 🌩️ Load to Salesforce")
     
+    # Initialize session state for data loading if not exists
+    if 'sf_load_object' not in st.session_state:
+        st.session_state.sf_load_object = "Select an object..."
+    
     # Object selection for loading
     objects = get_salesforce_objects(sf_conn, filter_custom=True)
     
     if objects:
+        # Define callback function for object selection
+        def on_load_object_change():
+            selected = st.session_state.sf_load_object
+            if selected and selected != "Select an object...":
+                st.session_state.current_object = selected
+                st.session_state.current_object_source = 'data_loading'
+            else:
+                if hasattr(st.session_state, 'current_object_source') and st.session_state.current_object_source == 'data_loading':
+                    st.session_state.current_object = None
+                    st.session_state.current_object_source = None
+        
         target_object = st.selectbox(
             "Select Target Object",
-            options=[""] + objects,
-            key="sf_load_object"
+            options=["Select an object..."] + objects,
+            key="sf_load_object",
+            on_change=on_load_object_change
         )
+        
+        # Handle initial state - if placeholder is selected and this tab previously had an object
+        if target_object == "Select an object..." and st.session_state.get('current_object_source') == 'data_loading':
+            st.session_state.current_object = None
+            st.session_state.current_object_source = None
+        
+        # Show success message for valid selection
+        if target_object and target_object != "Select an object...":
+            st.success(f"✅ Target Object: **{target_object}**")
     else:
         st.error("❌ No Salesforce objects found")
         return
     
-    if target_object:
+    if target_object and target_object != "Select an object...":
         # File selection for loading
         st.write("#### Source Data")
         
@@ -657,17 +1137,14 @@ def load_to_salesforce(sf_conn):
         if source_option == "Upload New File":
             uploaded_file = st.file_uploader(
                 "Choose file to load",
-                type=['csv', 'xlsx', 'xls'],
-                key="sf_load_file"
+                type=['csv', 'xlsx', 'xls', 'psv'],
+                key="sf_load_file",
+                help="Upload CSV, Excel, or PSV (Pipe-separated) files"
             )
             
             if uploaded_file and validate_file_upload(uploaded_file):
                 try:
-                    file_ext = os.path.splitext(uploaded_file.name)[1]
-                    if file_ext.lower() == '.csv':
-                        df_to_load = pd.read_csv(uploaded_file)
-                    else:
-                        df_to_load = pd.read_excel(uploaded_file)
+                    df_to_load = load_data_file(uploaded_file)
                 except Exception as e:
                     st.error(f"❌ Error reading file: {str(e)}")
         
@@ -688,6 +1165,8 @@ def load_to_salesforce(sf_conn):
                         file_path = os.path.join(data_files_path, selected_file)
                         if selected_file.endswith('.csv'):
                             df_to_load = pd.read_csv(file_path)
+                        elif selected_file.endswith('.psv'):
+                            df_to_load = pd.read_csv(file_path, sep='|')
                         else:
                             df_to_load = pd.read_excel(file_path)
                     except Exception as e:
@@ -793,7 +1272,7 @@ def load_to_salesforce(sf_conn):
                     
                     # Allow user to review and modify
                     if st.checkbox("📝 Review and modify auto-detected mappings"):
-                        field_mappings = create_custom_mapping_interface(df_to_load.columns.tolist(), sf_fields, sf_field_info, field_mappings)
+                        field_mappings = create_custom_mapping_interface(df_to_load.columns.tolist(), sf_fields, sf_field_info, field_mappings, df_to_load)
                 
                 elif mapping_strategy == "📋 Standard Mapping":
                     # Standard mapping with common field recognition
@@ -801,7 +1280,7 @@ def load_to_salesforce(sf_conn):
                 
                 else:  # Custom Mapping
                     # Full custom mapping interface
-                    field_mappings = create_custom_mapping_interface(df_to_load.columns.tolist(), sf_fields, sf_field_info)
+                    field_mappings = create_custom_mapping_interface(df_to_load.columns.tolist(), sf_fields, sf_field_info, None, df_to_load)
                 
                 # Show mapping summary
                 if field_mappings:
@@ -824,7 +1303,35 @@ def load_to_salesforce(sf_conn):
             
             # Batch configuration
             st.write("#### ⚙️ Loading Configuration")
-            col_batch1, col_batch2, col_batch3 = st.columns(3)
+            
+            # Operation explanation
+            with st.expander("📖 Operation Types Explained", expanded=False):
+                st.markdown("""
+                **🆕 Insert**: Creates new records in Salesforce
+                - Use when all records are new
+                - Do NOT include 'Id' field in your data
+                - All records must pass validation rules
+                
+                **✏️ Update**: Modifies existing records in Salesforce  
+                - Use when you want to modify existing records
+                - REQUIRES 'Id' field to identify records to update
+                - Only updates the fields you provide (partial update)
+                
+                **🔄 Upsert**: Insert new records OR update existing ones
+                - Use when your data contains both new and existing records
+                - Requires an External ID field to match records
+                - If External ID exists: updates the record
+                - If External ID is new: creates a new record
+                """)
+            
+            # Data Status Information
+            if df_to_load is not None and not df_to_load.empty:
+                with st.expander("📊 Current Data Status", expanded=False):
+                    st.write(f"**Records:** {len(df_to_load)}")
+                    st.write(f"**Columns:** {', '.join(df_to_load.columns.tolist())}")
+                    st.write(f"**Has 'Id' field:** {'✅ Yes' if 'Id' in df_to_load.columns else '❌ No'}")
+                    
+            col_batch1, col_batch2, col_batch3, col_batch4 = st.columns(4)
             
             with col_batch1:
                 batch_size = st.number_input(
@@ -851,10 +1358,1333 @@ def load_to_salesforce(sf_conn):
                     help="Number of parallel batches"
                 )
             
-            # Load button
+            # Additional configuration based on operation type
+            match_field = None
+            if operation_type == "Upsert":
+                st.write("**🔄 Upsert Configuration:**")
+                
+                if df_to_load is not None and not df_to_load.empty:
+                    st.info("📝 **How Upsert Works:** Matches records using your selected strategy. Updates existing records, inserts new records that don't match.")
+                    
+                    # Step 1: Select matching strategy
+                    st.write("#### 🔑 Step 1: Select Matching Strategy")
+                    
+                    upsert_matching_strategy_display = st.radio(
+                        "How do you want to match records for upsert?",
+                        options=[
+                            "🔑 Single Field Matching",
+                            "🔗 Field Combination (Multiple fields together)",
+                            "➕ Field Concatenation (Join fields with separator)"
+                        ],
+                        help="Choose how to uniquely identify existing records in Salesforce",
+                        key="upsert_matching_strategy_radio"
+                    )
+                    
+                    st.markdown("---")
+                    
+                    if upsert_matching_strategy_display == "🔑 Single Field Matching":
+                        # Single field matching - can be ANY field
+                        st.write("#### 🔑 Select Field for Matching")
+                        st.info("💡 Select any unique field to match records. Records with matching values will be updated, others will be inserted.")
+                        
+                        # Get ALL fields from Salesforce object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Also get external ID fields to highlight them
+                            external_id_fields = get_external_id_fields(sf_conn, target_object)
+                            
+                            # Show info about external ID fields if they exist
+                            if external_id_fields:
+                                with st.expander("📋 External ID Fields (Recommended for matching)"):
+                                    st.write("These fields are marked as External IDs in Salesforce:")
+                                    for field in external_id_fields:
+                                        st.write(f"• **{field}** ⭐")
+                            
+                            # Select ANY field for matching
+                            match_field = st.selectbox(
+                                "Select Field for Matching Records",
+                                options=[""] + all_sf_fields,
+                                help="Select any field with unique values. Records with matching values will be updated, others inserted.",
+                                key="upsert_match_field_select"
+                            )
+                            
+                            if match_field:
+                                # Check if this field exists in uploaded data
+                                if match_field in df_to_load.columns:
+                                    st.success(f"✅ Field '{match_field}' found in your uploaded data")
+                                    
+                                    # Show data quality for this field
+                                    null_count = df_to_load[match_field].isnull().sum()
+                                    empty_count = (df_to_load[match_field].astype(str).str.strip() == '').sum()
+                                    duplicate_count = df_to_load[match_field].duplicated().sum()
+                                    unique_count = df_to_load[match_field].nunique()
+                                    records_with_values = len(df_to_load) - null_count - empty_count
+                                    
+                                    col_up1, col_up2, col_up3, col_up4 = st.columns(4)
+                                    with col_up1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_up2:
+                                        st.metric("With Match Value", records_with_values)
+                                    with col_up3:
+                                        st.metric("Empty (Will Insert)", null_count + empty_count)
+                                    with col_up4:
+                                        st.metric("Duplicates", duplicate_count)
+                                    
+                                    st.info(f"ℹ️ Records with empty '{match_field}' will be inserted as new records")
+                                    
+                                    # Show sample values
+                                    with st.expander("👀 Sample Values from Your Data"):
+                                        sample_values = df_to_load[match_field].dropna().head(10)
+                                        st.write(sample_values.tolist())
+                                    
+                                    # Store match configuration
+                                    st.session_state.upsert_match_field = match_field
+                                    st.session_state.upsert_matching_strategy = "external_id"
+                                    st.session_state.upsert_match_fields = [match_field]
+                                    
+                                else:
+                                    st.error(f"❌ Field '{match_field}' not found in your uploaded data")
+                                    st.info(f"💡 Your data must contain the '{match_field}' column for upsert operation.")
+                                    st.warning("⚠️ Add this column to your file or select a different field.")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                    
+                    elif upsert_matching_strategy_display == "🔗 Field Combination (Multiple fields together)":
+                        st.write("#### 🔗 Select Fields for Combination Matching")
+                        st.info("💡 Select multiple fields that together uniquely identify records. Matching combinations will be updated, others inserted.")
+                        st.markdown("**Example:** `First Name` + `Last Name` + `Email` = Unique record")
+                        
+                        # Get all Salesforce fields for this object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Select multiple fields
+                            selected_fields = st.multiselect(
+                                "Select Fields for Matching (select 2 or more)",
+                                options=all_sf_fields,
+                                help="These fields together must uniquely identify records",
+                                key="upsert_combination_fields"
+                            )
+                            
+                            if len(selected_fields) >= 2:
+                                # Check if all fields exist in uploaded data
+                                missing_fields = [f for f in selected_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                    st.info("💡 Your uploaded file must contain all selected fields")
+                                else:
+                                    st.success(f"✅ All {len(selected_fields)} fields found in uploaded data")
+                                    
+                                    # Show combination preview
+                                    st.write("**Preview of Field Combination:**")
+                                    preview_df = df_to_load[selected_fields].head(5).copy()
+                                    preview_df['Combined Match Key'] = preview_df.apply(
+                                        lambda row: ' | '.join([str(row[f]) for f in selected_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Check for duplicates in combination
+                                    duplicate_count = df_to_load[selected_fields].duplicated().sum()
+                                    unique_count = df_to_load[selected_fields].drop_duplicates().shape[0]
+                                    
+                                    col_c1, col_c2, col_c3 = st.columns(3)
+                                    with col_c1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_c2:
+                                        st.metric("Unique Combinations", unique_count)
+                                    with col_c3:
+                                        st.metric("Duplicate Combinations", duplicate_count)
+                                    
+                                    st.info("ℹ️ Matching combinations will be updated, non-matching will be inserted as new records")
+                                    
+                                    # Store match configuration
+                                    st.session_state.upsert_match_field = None
+                                    st.session_state.upsert_matching_strategy = "field_combination"
+                                    st.session_state.upsert_match_fields = selected_fields
+                            
+                            elif len(selected_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for combination matching")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                    
+                    elif upsert_matching_strategy_display == "➕ Field Concatenation (Join fields with separator)":
+                        st.write("#### ➕ Configure Field Concatenation")
+                        st.info("💡 Concatenate multiple fields to create a unique match key. Matching values will be updated, others inserted.")
+                        st.markdown("**Example:** `FirstName` + `_` + `LastName` = `John_Doe`")
+                        
+                        # Get all Salesforce fields for this object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Select fields to concatenate
+                            concat_fields = st.multiselect(
+                                "Select Fields to Concatenate (select 2 or more)",
+                                options=all_sf_fields,
+                                help="These fields will be joined with a separator",
+                                key="upsert_concat_fields"
+                            )
+                            
+                            # Select separator
+                            separator_option = st.selectbox(
+                                "Select Separator",
+                                options=["Underscore (_)", "Hyphen (-)", "Pipe (|)", "Custom"],
+                                key="upsert_separator_option"
+                            )
+                            
+                            if separator_option == "Custom":
+                                separator = st.text_input(
+                                    "Enter Custom Separator",
+                                    value="_",
+                                    key="upsert_custom_separator"
+                                )
+                            else:
+                                separator_map = {
+                                    "Underscore (_)": "_",
+                                    "Hyphen (-)": "-",
+                                    "Pipe (|)": "|"
+                                }
+                                separator = separator_map[separator_option]
+                            
+                            if len(concat_fields) >= 2:
+                                # Check if all fields exist in uploaded data
+                                missing_fields = [f for f in concat_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                    st.info("💡 Your uploaded file must contain all selected fields")
+                                else:
+                                    st.success(f"✅ All {len(concat_fields)} fields found in uploaded data")
+                                    
+                                    # Show concatenation preview
+                                    st.write(f"**Preview of Concatenation (Separator: '{separator}'):**")
+                                    preview_df = df_to_load[concat_fields].head(5).copy()
+                                    preview_df['Concatenated Match Key'] = preview_df.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Create temporary concatenated column for analysis
+                                    df_concat_check = df_to_load.copy()
+                                    df_concat_check['_temp_concat'] = df_concat_check.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    
+                                    duplicate_count = df_concat_check['_temp_concat'].duplicated().sum()
+                                    unique_count = df_concat_check['_temp_concat'].nunique()
+                                    
+                                    col_ct1, col_ct2, col_ct3 = st.columns(3)
+                                    with col_ct1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_ct2:
+                                        st.metric("Unique Concatenations", unique_count)
+                                    with col_ct3:
+                                        st.metric("Duplicate Concatenations", duplicate_count)
+                                    
+                                    st.info("ℹ️ Matching concatenations will be updated, non-matching will be inserted as new records")
+                                    
+                                    # Store match configuration
+                                    st.session_state.upsert_match_field = None
+                                    st.session_state.upsert_matching_strategy = "field_concatenation"
+                                    st.session_state.upsert_match_fields = concat_fields
+                                    st.session_state.upsert_concat_separator = separator
+                            
+                            elif len(concat_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for concatenation")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                else:
+                    st.warning("⚠️ No data available for configuration. Please load data first.")
+            
+            elif operation_type == "Update":
+                st.write("**✏️ Update Operation Configuration:**")
+                
+                if df_to_load is not None and not df_to_load.empty:
+                    st.info("📝 **How Update Works:** Updates existing Salesforce records by matching them using External ID, field combination, or field concatenation.")
+                    
+                    # Step 1: Select matching strategy
+                    st.write("#### 🔑 Step 1: Select Matching Strategy")
+                    
+                    matching_strategy_display = st.radio(
+                        "How do you want to match records for update?",
+                        options=[
+                            "🔑 Single External ID Field",
+                            "🔗 Field Combination (Multiple fields together)",
+                            "➕ Field Concatenation (Join fields with separator)"
+                        ],
+                        help="Choose how to uniquely identify records in Salesforce",
+                        key="update_matching_strategy_radio"
+                    )
+                    
+                    st.markdown("---")
+                    
+                    if matching_strategy_display == "🔑 Single External ID Field":
+                        # Single field matching - can be ANY field, not just External IDs
+                        st.write("#### 🔑 Select Field for Matching")
+                        st.info("💡 Select any unique field to match records. This can be an External ID field or any other unique identifier.")
+                        
+                        # Get ALL fields from Salesforce object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Also get external ID fields to highlight them
+                            external_id_fields = get_external_id_fields(sf_conn, target_object)
+                            
+                            # Show info about external ID fields if they exist
+                            if external_id_fields:
+                                with st.expander("📋 External ID Fields (Recommended for matching)"):
+                                    st.write("These fields are marked as External IDs in Salesforce:")
+                                    for field in external_id_fields:
+                                        st.write(f"• **{field}** ⭐")
+                            
+                            # Select ANY field for matching
+                            match_field = st.selectbox(
+                                "Select Field for Matching Records",
+                                options=[""] + all_sf_fields,
+                                help="Select any field with unique values to match records. External ID fields are recommended but any unique field works.",
+                                key="update_match_field_select"
+                            )
+                            
+                            if match_field:
+                                # Check if this field exists in uploaded data
+                                if match_field in df_to_load.columns:
+                                    st.success(f"✅ Field '{match_field}' found in your uploaded data")
+                                    
+                                    # Show data quality for this field
+                                    null_count = df_to_load[match_field].isnull().sum()
+                                    empty_count = (df_to_load[match_field].astype(str).str.strip() == '').sum()
+                                    duplicate_count = df_to_load[match_field].duplicated().sum()
+                                    unique_count = df_to_load[match_field].nunique()
+                                    
+                                    col_u1, col_u2, col_u3, col_u4 = st.columns(4)
+                                    with col_u1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_u2:
+                                        st.metric("Unique Values", unique_count)
+                                    with col_u3:
+                                        st.metric("Empty Values", null_count + empty_count)
+                                    with col_u4:
+                                        st.metric("Duplicates", duplicate_count)
+                                    
+                                    # Show sample values
+                                    with st.expander("👀 Sample External ID Values from Your Data"):
+                                        sample_values = df_to_load[match_field].dropna().head(10)
+                                        st.write(sample_values.tolist())
+                                    
+                                    # Store match configuration
+                                    st.session_state.match_field = match_field
+                                    st.session_state.update_matching_strategy = "external_id"
+                                    st.session_state.update_match_fields = [match_field]
+                                    
+                                else:
+                                    st.error(f"❌ Field '{match_field}' not found in your uploaded data")
+                                    st.info(f"💡 Your data must contain the '{match_field}' column with values matching Salesforce records.")
+                                    st.warning("⚠️ Add this column to your file or select a different external ID field.")
+                    
+                    elif matching_strategy_display == "🔗 Field Combination (Multiple fields together)":
+                        st.write("#### 🔗 Select Fields for Combination Matching")
+                        st.info("💡 Select multiple fields that together uniquely identify records in Salesforce")
+                        st.markdown("**Example:** `First Name` + `Last Name` + `Email` = Unique record")
+                        
+                        # Get all Salesforce fields for this object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Select multiple fields
+                            selected_fields = st.multiselect(
+                                "Select Fields for Matching (select 2 or more)",
+                                options=all_sf_fields,
+                                help="These fields together must uniquely identify records",
+                                key="update_combination_fields"
+                            )
+                            
+                            if len(selected_fields) >= 2:
+                                # Check if all fields exist in uploaded data
+                                missing_fields = [f for f in selected_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                    st.info("💡 Your uploaded file must contain all selected fields")
+                                else:
+                                    st.success(f"✅ All {len(selected_fields)} fields found in uploaded data")
+                                    
+                                    # Show combination preview
+                                    st.write("**Preview of Field Combination:**")
+                                    preview_df = df_to_load[selected_fields].head(5).copy()
+                                    preview_df['Combined Match Key'] = preview_df.apply(
+                                        lambda row: ' | '.join([str(row[f]) for f in selected_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Check for duplicates in combination
+                                    duplicate_count = df_to_load[selected_fields].duplicated().sum()
+                                    unique_count = df_to_load[selected_fields].drop_duplicates().shape[0]
+                                    
+                                    col_c1, col_c2, col_c3 = st.columns(3)
+                                    with col_c1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_c2:
+                                        st.metric("Unique Combinations", unique_count)
+                                    with col_c3:
+                                        st.metric("Duplicate Combinations", duplicate_count)
+                                    
+                                    # Store match configuration
+                                    st.session_state.match_field = None  # Not using single field
+                                    st.session_state.update_matching_strategy = "field_combination"
+                                    st.session_state.update_match_fields = selected_fields
+                            
+                            elif len(selected_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for combination matching")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                    
+                    elif matching_strategy_display == "➕ Field Concatenation (Join fields with separator)":
+                        st.write("#### ➕ Configure Field Concatenation")
+                        st.info("💡 Concatenate multiple fields with a separator to create a unique match key")
+                        st.markdown("**Example:** `FirstName` + `_` + `LastName` = `John_Doe`")
+                        
+                        # Get all Salesforce fields for this object
+                        obj_desc = get_object_description(sf_conn, target_object)
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            
+                            # Select fields to concatenate
+                            concat_fields = st.multiselect(
+                                "Select Fields to Concatenate (select 2 or more)",
+                                options=all_sf_fields,
+                                help="These fields will be joined with a separator",
+                                key="update_concat_fields"
+                            )
+                            
+                            # Select separator
+                            separator_option = st.selectbox(
+                                "Select Separator",
+                                options=["Underscore (_)", "Hyphen (-)", "Pipe (|)", "Custom"],
+                                key="update_separator_option"
+                            )
+                            
+                            if separator_option == "Custom":
+                                separator = st.text_input(
+                                    "Enter Custom Separator",
+                                    value="_",
+                                    key="update_custom_separator"
+                                )
+                            else:
+                                separator_map = {
+                                    "Underscore (_)": "_",
+                                    "Hyphen (-)": "-",
+                                    "Pipe (|)": "|"
+                                }
+                                separator = separator_map[separator_option]
+                            
+                            if len(concat_fields) >= 2:
+                                # Check if all fields exist in uploaded data
+                                missing_fields = [f for f in concat_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                    st.info("💡 Your uploaded file must contain all selected fields")
+                                else:
+                                    st.success(f"✅ All {len(concat_fields)} fields found in uploaded data")
+                                    
+                                    # Show concatenation preview
+                                    st.write(f"**Preview of Concatenation (Separator: '{separator}'):**")
+                                    preview_df = df_to_load[concat_fields].head(5).copy()
+                                    preview_df['Concatenated Match Key'] = preview_df.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Create temporary concatenated column for analysis
+                                    df_concat_check = df_to_load.copy()
+                                    df_concat_check['_temp_concat'] = df_concat_check.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    
+                                    duplicate_count = df_concat_check['_temp_concat'].duplicated().sum()
+                                    unique_count = df_concat_check['_temp_concat'].nunique()
+                                    
+                                    col_ct1, col_ct2, col_ct3 = st.columns(3)
+                                    with col_ct1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_ct2:
+                                        st.metric("Unique Concatenations", unique_count)
+                                    with col_ct3:
+                                        st.metric("Duplicate Concatenations", duplicate_count)
+                                    
+                                    # Store match configuration
+                                    st.session_state.match_field = None  # Not using single field
+                                    st.session_state.update_matching_strategy = "field_concatenation"
+                                    st.session_state.update_match_fields = concat_fields
+                                    st.session_state.update_concat_separator = separator
+                            
+                            elif len(concat_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for concatenation")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                else:
+                    st.warning("⚠️ No data available for validation. Please load data first.")
+            
+            elif operation_type == "Insert":
+                st.write("**🆕 Insert Operation Configuration:**")
+                
+                if df_to_load is not None and not df_to_load.empty:
+                    st.info("📝 **How Insert Works:** Creates new records in Salesforce. Validates uniqueness based on your selected strategy to prevent duplicates.")
+                    
+                    # Step 1: Select uniqueness validation strategy
+                    st.write("#### 🎯 Step 1: Select Uniqueness Validation Strategy")
+                    
+                    insert_matching_strategy_display = st.radio(
+                        "How do you want to ensure uniqueness for insert?",
+                        options=[
+                            "🔑 Single Field as External ID",
+                            "🔗 Field Combination (Multiple fields together)",
+                            "➕ Field Concatenation (Join fields with separator)"
+                        ],
+                        help="Choose how to validate uniqueness and prevent duplicate records in Salesforce",
+                        key="insert_matching_strategy_radio"
+                    )
+                    
+                    st.markdown("---")
+                    
+                    # Get Salesforce metadata for insert
+                    obj_desc = get_object_description(sf_conn, target_object)
+                    external_id_fields = get_external_id_fields(sf_conn, target_object)
+                    
+                    if insert_matching_strategy_display == "🔑 Single Field as External ID":
+                        st.write("#### 🔑 Single Field Configuration")
+                        st.info("💡 Select a field to use as unique identifier. System will check this field doesn't already exist in Salesforce before insert.")
+                        
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            available_data_fields = list(df_to_load.columns)
+                            
+                            # Select source and target fields
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.write("**Source Field (from your data):**")
+                                source_field = st.selectbox(
+                                    "Select field from uploaded data",
+                                    options=[""] + available_data_fields,
+                                    help="This field contains the unique identifier values",
+                                    key="insert_source_field_single"
+                                )
+                            
+                            with col2:
+                                st.write("**Target External ID Field (in Salesforce):**")
+                                if external_id_fields:
+                                    st.info(f"✅ Found {len(external_id_fields)} External ID fields")
+                                    target_field = st.selectbox(
+                                        "Select Salesforce External ID field",
+                                        options=[""] + external_id_fields,
+                                        help="This Salesforce field will store the external ID",
+                                        key="insert_target_field_single"
+                                    )
+                                else:
+                                    st.warning("⚠️ No External ID fields found. Showing all fields.")
+                                    target_field = st.selectbox(
+                                        "Select Salesforce field to store external ID",
+                                        options=[""] + all_sf_fields,
+                                        help="This Salesforce field will store the external ID",
+                                        key="insert_target_field_single"
+                                    )
+                            
+                            if source_field and target_field:
+                                # Validate source field quality
+                                null_count = df_to_load[source_field].isnull().sum()
+                                empty_count = (df_to_load[source_field].astype(str).str.strip() == '').sum()
+                                duplicate_count = df_to_load[source_field].duplicated().sum()
+                                unique_count = df_to_load[source_field].nunique()
+                                
+                                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                                with col_m1:
+                                    st.metric("Total Records", len(df_to_load))
+                                with col_m2:
+                                    st.metric("Unique Values", unique_count)
+                                with col_m3:
+                                    st.metric("Empty Values", null_count + empty_count)
+                                with col_m4:
+                                    st.metric("Duplicates", duplicate_count)
+                                
+                                if duplicate_count == 0 and (null_count + empty_count) == 0:
+                                    st.success(f"✅ '{source_field}' → '{target_field}': Perfect external ID field!")
+                                elif duplicate_count > 0:
+                                    st.error(f"❌ '{source_field}' has {duplicate_count} duplicates - not suitable as external ID")
+                                elif null_count + empty_count > 0:
+                                    st.warning(f"⚠️ '{source_field}' has {null_count + empty_count} empty values")
+                                
+                                # Store configuration
+                                st.session_state.insert_source_field = source_field
+                                st.session_state.insert_target_field = target_field
+                                st.session_state.insert_match_field = target_field
+                                st.session_state.insert_matching_strategy = "external_id"
+                                st.session_state.insert_match_fields = [source_field]
+                                st.session_state.insert_is_composite = False
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                    
+                    elif insert_matching_strategy_display == "🔗 Field Combination (Multiple fields together)":
+                        st.write("#### 🔗 Field Combination Configuration")
+                        st.info("💡 Select multiple fields that together uniquely identify records. System will check combinations don't already exist in Salesforce.")
+                        st.markdown("**Example:** `FirstName` + `LastName` + `Email` = Unique record")
+                        
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            available_data_fields = list(df_to_load.columns)
+                            
+                            # Select multiple fields
+                            selected_fields = st.multiselect(
+                                "Select Fields for Uniqueness Check (select 2 or more)",
+                                options=available_data_fields,
+                                help="These fields together must uniquely identify records",
+                                key="insert_combination_fields"
+                            )
+                            
+                            if len(selected_fields) >= 2:
+                                # Check if all fields exist
+                                missing_fields = [f for f in selected_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                else:
+                                    st.success(f"✅ All {len(selected_fields)} fields found in uploaded data")
+                                    
+                                    # Show combination preview
+                                    st.write("**Preview of Field Combination:**")
+                                    preview_df = df_to_load[selected_fields].head(5).copy()
+                                    preview_df['Combined Match Key'] = preview_df.apply(
+                                        lambda row: ' | '.join([str(row[f]) for f in selected_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Check for duplicates in combination
+                                    duplicate_count = df_to_load[selected_fields].duplicated().sum()
+                                    unique_count = df_to_load[selected_fields].drop_duplicates().shape[0]
+                                    
+                                    col_c1, col_c2, col_c3 = st.columns(3)
+                                    with col_c1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_c2:
+                                        st.metric("Unique Combinations", unique_count)
+                                    with col_c3:
+                                        st.metric("Duplicate Combinations", duplicate_count)
+                                    
+                                    # Store configuration
+                                    st.session_state.insert_source_field = None
+                                    st.session_state.insert_target_field = None
+                                    st.session_state.insert_matching_strategy = "field_combination"
+                                    st.session_state.insert_match_fields = selected_fields
+                                    st.session_state.insert_is_composite = False
+                            
+                            elif len(selected_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for combination")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                    
+                    elif insert_matching_strategy_display == "➕ Field Concatenation (Join fields with separator)":
+                        st.write("#### ➕ Field Concatenation Configuration")
+                        st.info("💡 Concatenate multiple fields to create a unique identifier. System will check concatenations don't already exist in Salesforce.")
+                        st.markdown("**Example:** `FirstName` + `_` + `LastName` = `John_Doe`")
+                        
+                        if obj_desc:
+                            all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
+                            available_data_fields = list(df_to_load.columns)
+                            
+                            # Select fields to concatenate
+                            concat_fields = st.multiselect(
+                                "Select Fields to Concatenate (select 2 or more)",
+                                options=available_data_fields,
+                                help="These fields will be joined with a separator",
+                                key="insert_concat_fields"
+                            )
+                            
+                            # Select separator
+                            separator_option = st.selectbox(
+                                "Select Separator",
+                                options=["Underscore (_)", "Hyphen (-)", "Pipe (|)", "Custom"],
+                                key="insert_separator_option"
+                            )
+                            
+                            if separator_option == "Custom":
+                                separator = st.text_input(
+                                    "Enter Custom Separator",
+                                    value="_",
+                                    key="insert_custom_separator"
+                                )
+                            else:
+                                separator_map = {
+                                    "Underscore (_)": "_",
+                                    "Hyphen (-)": "-",
+                                    "Pipe (|)": "|"
+                                }
+                                separator = separator_map[separator_option]
+                            
+                            if len(concat_fields) >= 2:
+                                # Check if all fields exist
+                                missing_fields = [f for f in concat_fields if f not in df_to_load.columns]
+                                
+                                if missing_fields:
+                                    st.error(f"❌ Missing fields in uploaded data: {', '.join(missing_fields)}")
+                                else:
+                                    st.success(f"✅ All {len(concat_fields)} fields found in uploaded data")
+                                    
+                                    # Show concatenation preview
+                                    st.write(f"**Preview of Concatenation (Separator: '{separator}'):**")
+                                    preview_df = df_to_load[concat_fields].head(5).copy()
+                                    preview_df['Concatenated Match Key'] = preview_df.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    
+                                    # Create temporary concatenated column for analysis
+                                    df_concat_check = df_to_load.copy()
+                                    df_concat_check['_temp_concat'] = df_concat_check.apply(
+                                        lambda row: separator.join([str(row[f]) for f in concat_fields]), axis=1
+                                    )
+                                    
+                                    duplicate_count = df_concat_check['_temp_concat'].duplicated().sum()
+                                    unique_count = df_concat_check['_temp_concat'].nunique()
+                                    
+                                    col_ct1, col_ct2, col_ct3 = st.columns(3)
+                                    with col_ct1:
+                                        st.metric("Total Records", len(df_to_load))
+                                    with col_ct2:
+                                        st.metric("Unique Concatenations", unique_count)
+                                    with col_ct3:
+                                        st.metric("Duplicate Concatenations", duplicate_count)
+                                    
+                                    # Store configuration
+                                    st.session_state.insert_source_field = None
+                                    st.session_state.insert_target_field = None
+                                    st.session_state.insert_matching_strategy = "field_concatenation"
+                                    st.session_state.insert_match_fields = concat_fields
+                                    st.session_state.insert_concat_separator = separator
+                                    st.session_state.insert_is_composite = False
+                            
+                            elif len(concat_fields) == 1:
+                                st.warning("⚠️ Please select at least 2 fields for concatenation")
+                        else:
+                            st.error("❌ Could not retrieve Salesforce object fields")
+                else:
+                    st.warning("⚠️ No data available for configuration. Please load data first.")
+            
+            # Load button with validation
             if st.button("🚀 Start Loading", type="primary", use_container_width=True):
-                load_data_to_salesforce(sf_conn, df_to_load, target_object, 
-                                      operation_type, batch_size, parallel_batches)
+                # Validate operation requirements
+                validation_passed = True
+                
+                # First check if we have data
+                if df_to_load is None or df_to_load.empty:
+                    st.error("❌ Cannot proceed: No data available for loading. Please upload or select data first.")
+                    validation_passed = False
+                else:
+                    # Get the match field based on operation type
+                    if operation_type == "Insert":
+                        # Get matching strategy configuration
+                        insert_matching_strategy = st.session_state.get('insert_matching_strategy', None)
+                        insert_match_fields = st.session_state.get('insert_match_fields', None)
+                        
+                        if not insert_matching_strategy or not insert_match_fields:
+                            st.error("❌ Cannot proceed: Please configure uniqueness validation strategy in Configuration tab.")
+                            validation_passed = False
+                        else:
+                            validation_issues = []
+                            
+                            if insert_matching_strategy == "external_id":
+                                # Single field validation
+                                source_field = insert_match_fields[0]
+                                target_field = st.session_state.get('insert_target_field')
+                                
+                                if not target_field:
+                                    st.error("❌ Cannot proceed: Target field not configured.")
+                                    validation_passed = False
+                                else:
+                                    st.info(f"🔍 Validating uniqueness using field: '{source_field}'...")
+                                    
+                                    duplicate_count = df_to_load[source_field].duplicated().sum()
+                                    null_count = df_to_load[source_field].isnull().sum()
+                                    empty_count = (df_to_load[source_field].astype(str).str.strip() == '').sum()
+                                    
+                                    if duplicate_count > 0:
+                                        st.error(f"❌ Found {duplicate_count} duplicate values in '{source_field}'")
+                                        duplicates = df_to_load[df_to_load[source_field].duplicated(keep=False)][source_field].value_counts()
+                                        with st.expander("🔍 View Duplicate Values"):
+                                            st.write(duplicates)
+                                        validation_issues.append(f"{duplicate_count} duplicates")
+                                    
+                                    if null_count > 0 or empty_count > 0:
+                                        st.error(f"❌ Found {null_count + empty_count} empty values in '{source_field}'")
+                                        validation_issues.append(f"{null_count + empty_count} empty values")
+                                    
+                                    # Check if values already exist in Salesforce
+                                    if not validation_issues:
+                                        st.info(f"🔍 Checking if values already exist in Salesforce field '{target_field}'...")
+                                        try:
+                                            unique_vals = df_to_load[source_field].unique().tolist()
+                                            existing_records = []
+                                            batch_size = 200
+                                            
+                                            for i in range(0, len(unique_vals), batch_size):
+                                                batch_vals = unique_vals[i:i + batch_size]
+                                                formatted_vals = [f"'{str(v).replace(chr(39), chr(92)+chr(39))}' " for v in batch_vals]
+                                                vals_string = ','.join(formatted_vals)
+                                                
+                                                soql_query = f"SELECT {target_field} FROM {target_object} WHERE {target_field} IN ({vals_string})"
+                                                result = sf_conn.query(soql_query)
+                                                
+                                                if result['totalSize'] > 0:
+                                                    existing_records.extend([rec[target_field] for rec in result['records']])
+                                            
+                                            if existing_records:
+                                                st.error(f"❌ Found {len(existing_records)} records already existing in Salesforce with these external ID values")
+                                                with st.expander("🔍 View Existing Values"):
+                                                    st.write(pd.DataFrame(existing_records, columns=[target_field]))
+                                                st.error(f"❌ Cannot proceed: Use Update or Upsert instead.")
+                                                validation_passed = False
+                                            else:
+                                                st.success(f"✅ All {len(unique_vals)} values are unique and ready for insert")
+                                        except Exception as e:
+                                            st.warning(f"⚠️ Could not verify: {str(e)}")
+                                            st.info("💡 Proceeding with insert")
+                                
+                                if validation_issues:
+                                    validation_passed = False
+                            
+                            elif insert_matching_strategy == "field_combination":
+                                # Field Combination validation
+                                st.info(f"🔍 Validating Field Combination: {', '.join(insert_match_fields)}...")
+                                
+                                validation_issues = []
+                                
+                                # Check for duplicates in combination
+                                duplicate_count = df_to_load[insert_match_fields].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate field combinations in uploaded file")
+                                    duplicates = df_to_load[df_to_load[insert_match_fields].duplicated(keep=False)][insert_match_fields]
+                                    with st.expander("🔍 View Duplicate Combinations"):
+                                        st.dataframe(duplicates)
+                                    validation_issues.append(f"{duplicate_count} duplicate combinations")
+                                else:
+                                    st.success(f"✅ All field combinations are unique in uploaded file")
+                                
+                                # Check if combinations already exist in Salesforce
+                                if not validation_issues:
+                                    st.info(f"🔍 Checking if field combinations already exist in Salesforce...")
+                                    try:
+                                        # Get unique combinations from uploaded file
+                                        unique_combinations = df_to_load[insert_match_fields].drop_duplicates()
+                                        existing_records = []
+                                        
+                                        # Check each unique combination (limit to first 100 for performance)
+                                        check_count = min(len(unique_combinations), 100)
+                                        
+                                        for idx, row in unique_combinations.head(check_count).iterrows():
+                                            # Build WHERE clause for this combination
+                                            conditions = []
+                                            has_all_fields = True
+                                            
+                                            for field in insert_match_fields:
+                                                value = row[field]
+                                                if pd.isna(value) or (isinstance(value, str) and value.strip() == ''):
+                                                    has_all_fields = False
+                                                    break
+                                                escaped_value = str(value).replace("'", "\\'")
+                                                conditions.append(f"{field} = '{escaped_value}'")
+                                            
+                                            if not has_all_fields:
+                                                continue
+                                            
+                                            where_clause = ' AND '.join(conditions)
+                                            soql_query = f"SELECT Id, {', '.join(insert_match_fields)} FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                            result = sf_conn.query(soql_query)
+                                            
+                                            if result['totalSize'] > 0:
+                                                existing_records.append(row.to_dict())
+                                        
+                                        if existing_records:
+                                            st.error(f"❌ Found {len(existing_records)} combinations already existing in Salesforce")
+                                            with st.expander("🔍 View Existing Combinations"):
+                                                st.dataframe(pd.DataFrame(existing_records))
+                                            st.error(f"❌ Cannot proceed: Use Update or Upsert instead.")
+                                            validation_passed = False
+                                        else:
+                                            st.success(f"✅ All {check_count} field combinations are unique and ready for insert")
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with insert - duplicates will be checked during data loading")
+                                
+                                if validation_issues:
+                                    validation_passed = False
+                            
+                            elif insert_matching_strategy == "field_concatenation":
+                                # Field Concatenation validation
+                                separator = st.session_state.get('insert_concat_separator', '_')
+                                st.info(f"🔍 Validating Field Concatenation: {' {sep} '.join(insert_match_fields).replace('{sep}', separator)}...")
+                                
+                                validation_issues = []
+                                
+                                # Create concatenated column
+                                df_to_load['_match_key'] = df_to_load.apply(
+                                    lambda row: separator.join([str(row[f]) for f in insert_match_fields]), axis=1
+                                )
+                                
+                                # Check for duplicates
+                                duplicate_count = df_to_load['_match_key'].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate concatenated values")
+                                    duplicates = df_to_load[df_to_load['_match_key'].duplicated(keep=False)][insert_match_fields + ['_match_key']]
+                                    with st.expander("🔍 View Duplicates"):
+                                        st.dataframe(duplicates)
+                                    validation_issues.append(f"{duplicate_count} duplicate concatenations")
+                                else:
+                                    st.success(f"✅ All concatenated values are unique in uploaded file")
+                                
+                                # Check if concatenated combinations already exist in Salesforce
+                                if not validation_issues:
+                                    st.info(f"🔍 Checking if concatenated field combinations already exist in Salesforce...")
+                                    try:
+                                        # Get unique combinations from uploaded file
+                                        unique_combinations = df_to_load[insert_match_fields + ['_match_key']].drop_duplicates(subset=['_match_key'])
+                                        existing_records = []
+                                        
+                                        # Check each unique combination (limit to first 100 for performance)
+                                        check_count = min(len(unique_combinations), 100)
+                                        
+                                        for idx, row in unique_combinations.head(check_count).iterrows():
+                                            # Build WHERE clause checking all component fields
+                                            conditions = []
+                                            has_all_fields = True
+                                            
+                                            for field in insert_match_fields:
+                                                value = row[field]
+                                                if pd.isna(value) or (isinstance(value, str) and value.strip() == ''):
+                                                    has_all_fields = False
+                                                    break
+                                                escaped_value = str(value).replace("'", "\\'")
+                                                conditions.append(f"{field} = '{escaped_value}'")
+                                            
+                                            if not has_all_fields:
+                                                continue
+                                            
+                                            where_clause = ' AND '.join(conditions)
+                                            soql_query = f"SELECT Id, {', '.join(insert_match_fields)} FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                            result = sf_conn.query(soql_query)
+                                            
+                                            if result['totalSize'] > 0:
+                                                record_data = row[insert_match_fields].to_dict()
+                                                record_data['_match_key'] = row['_match_key']
+                                                existing_records.append(record_data)
+                                        
+                                        if existing_records:
+                                            st.error(f"❌ Found {len(existing_records)} concatenated combinations already existing in Salesforce")
+                                            with st.expander("🔍 View Existing Concatenations"):
+                                                st.dataframe(pd.DataFrame(existing_records))
+                                            st.error(f"❌ Cannot proceed: Use Update or Upsert instead.")
+                                            validation_passed = False
+                                        else:
+                                            st.success(f"✅ All {check_count} concatenated combinations are unique and ready for insert")
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with insert - duplicates will be checked during data loading")
+                                
+                                if validation_issues:
+                                    validation_passed = False
+                    
+                    elif operation_type == "Update":
+                        # Get matching strategy from session state
+                        matching_strategy = st.session_state.get('update_matching_strategy', None)
+                        match_fields = st.session_state.get('update_match_fields', None)
+                        
+                        if not matching_strategy or not match_fields:
+                            st.error("❌ Cannot proceed: Please configure matching strategy in Configuration tab.")
+                            validation_passed = False
+                        else:
+                            validation_issues = []
+                            
+                            if matching_strategy == "external_id":
+                                # Single External ID validation
+                                match_field = match_fields[0]
+                                st.info(f"🔍 Validating using External ID field: '{match_field}'...")
+                                
+                                duplicate_count = df_to_load[match_field].duplicated().sum()
+                                null_count = df_to_load[match_field].isnull().sum()
+                                empty_count = (df_to_load[match_field].astype(str).str.strip() == '').sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate values in '{match_field}'")
+                                    duplicates = df_to_load[df_to_load[match_field].duplicated(keep=False)][match_field].value_counts()
+                                    with st.expander("🔍 View Duplicates"):
+                                        st.write(duplicates)
+                                    validation_issues.append(f"{duplicate_count} duplicates")
+                                
+                                if null_count > 0 or empty_count > 0:
+                                    total_invalid = null_count + empty_count
+                                    st.error(f"❌ Found {total_invalid} records with empty '{match_field}' values")
+                                    validation_issues.append(f"{total_invalid} empty values")
+                                
+                                # Check existence in Salesforce
+                                if not validation_issues:
+                                    st.info("🔍 Verifying records exist in Salesforce...")
+                                    try:
+                                        unique_ids = df_to_load[match_field].dropna().unique().tolist()
+                                        existing_records = []
+                                        batch_size = 200
+                                        
+                                        for i in range(0, len(unique_ids), batch_size):
+                                            batch_ids = unique_ids[i:i + batch_size]
+                                            formatted_ids = [f"'{str(id).replace(chr(39), chr(92)+chr(39))}'" for id in batch_ids]
+                                            ids_string = ','.join(formatted_ids)
+                                            
+                                            soql_query = f"SELECT {match_field} FROM {target_object} WHERE {match_field} IN ({ids_string})"
+                                            result = sf_conn.query(soql_query)
+                                            
+                                            if result['totalSize'] > 0:
+                                                existing_records.extend([rec[match_field] for rec in result['records']])
+                                        
+                                        non_existing = set(unique_ids) - set(existing_records)
+                                        
+                                        if non_existing:
+                                            st.error(f"❌ {len(non_existing)} records DO NOT exist in Salesforce")
+                                            with st.expander("🔍 View Non-Existing Records"):
+                                                st.write(pd.DataFrame(list(non_existing), columns=[match_field]))
+                                            st.error("❌ Cannot update non-existing records.")
+                                            validation_passed = False
+                                        else:
+                                            st.success(f"✅ All {len(existing_records)} records found - ready for update")
+                                            
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with update")
+                            
+                            elif matching_strategy == "field_combination":
+                                # Field Combination validation
+                                st.info(f"🔍 Validating using Field Combination: {', '.join(match_fields)}...")
+                                
+                                # Check for duplicates in combination
+                                duplicate_count = df_to_load[match_fields].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate field combinations in uploaded file")
+                                    duplicates = df_to_load[df_to_load[match_fields].duplicated(keep=False)][match_fields]
+                                    with st.expander("🔍 View Duplicate Combinations"):
+                                        st.dataframe(duplicates)
+                                    validation_issues.append(f"{duplicate_count} duplicate combinations")
+                                
+                                # Check if combinations exist in Salesforce
+                                if not validation_issues:
+                                    st.info("🔍 Verifying field combinations exist in Salesforce...")
+                                    try:
+                                        # Build SOQL query with multiple field conditions
+                                        where_clauses = []
+                                        for _, row in df_to_load[match_fields].drop_duplicates().iterrows():
+                                            conditions = []
+                                            for field in match_fields:
+                                                value = row[field]
+                                                if pd.notna(value):
+                                                    escaped_value = str(value).replace("'", "\\'")
+                                                    conditions.append(f"{field} = '{escaped_value}'")
+                                            if conditions:
+                                                where_clauses.append(f"({' AND '.join(conditions)})")
+                                        
+                                        # Query in batches
+                                        batch_size = 20  # Smaller batches for complex queries
+                                        total_found = 0
+                                        total_to_check = len(where_clauses)
+                                        
+                                        for i in range(0, len(where_clauses), batch_size):
+                                            batch_clauses = where_clauses[i:i + batch_size]
+                                            where_statement = ' OR '.join(batch_clauses)
+                                            
+                                            soql_query = f"SELECT {', '.join(match_fields)} FROM {target_object} WHERE {where_statement}"
+                                            result = sf_conn.query(soql_query)
+                                            total_found += result['totalSize']
+                                        
+                                        if total_found < total_to_check:
+                                            st.error(f"❌ Only {total_found}/{total_to_check} field combinations exist in Salesforce")
+                                            st.error("❌ Some records cannot be matched. Cannot proceed with update.")
+                                            validation_passed = False
+                                        else:
+                                            st.success(f"✅ All {total_found} field combinations found - ready for update")
+                                            
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with update")
+                            
+                            elif matching_strategy == "field_concatenation":
+                                # Field Concatenation validation
+                                separator = st.session_state.get('update_concat_separator', '_')
+                                st.info(f"🔍 Validating using Field Concatenation: {' {sep} '.join(match_fields).replace('{sep}', separator)}...")
+                                
+                                # Create concatenated column
+                                df_to_load['_match_key'] = df_to_load.apply(
+                                    lambda row: separator.join([str(row[f]) for f in match_fields]), axis=1
+                                )
+                                
+                                # Check for duplicates
+                                duplicate_count = df_to_load['_match_key'].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate concatenated values")
+                                    duplicates = df_to_load[df_to_load['_match_key'].duplicated(keep=False)][match_fields + ['_match_key']]
+                                    with st.expander("🔍 View Duplicates"):
+                                        st.dataframe(duplicates)
+                                    validation_issues.append(f"{duplicate_count} duplicates")
+                                
+                                # Check if concatenated values exist in Salesforce
+                                if not validation_issues:
+                                    st.info("🔍 Verifying concatenated field combinations exist in Salesforce...")
+                                    try:
+                                        # Similar to field combination but checking concatenated values
+                                        where_clauses = []
+                                        for _, row in df_to_load[match_fields].drop_duplicates().iterrows():
+                                            conditions = []
+                                            for field in match_fields:
+                                                value = row[field]
+                                                if pd.notna(value):
+                                                    escaped_value = str(value).replace("'", "\\'")
+                                                    conditions.append(f"{field} = '{escaped_value}'")
+                                            if conditions:
+                                                where_clauses.append(f"({' AND '.join(conditions)})")
+                                        
+                                        batch_size = 20
+                                        total_found = 0
+                                        total_to_check = len(where_clauses)
+                                        
+                                        for i in range(0, len(where_clauses), batch_size):
+                                            batch_clauses = where_clauses[i:i + batch_size]
+                                            where_statement = ' OR '.join(batch_clauses)
+                                            
+                                            soql_query = f"SELECT {', '.join(match_fields)} FROM {target_object} WHERE {where_statement}"
+                                            result = sf_conn.query(soql_query)
+                                            total_found += result['totalSize']
+                                        
+                                        if total_found < total_to_check:
+                                            st.error(f"❌ Only {total_found}/{total_to_check} records exist in Salesforce")
+                                            st.error("❌ Some concatenated combinations cannot be matched. Cannot proceed.")
+                                            validation_passed = False
+                                        else:
+                                            st.success(f"✅ All {total_found} concatenated combinations found - ready for update")
+                                            
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with update")
+                            
+                            if validation_issues:
+                                st.error(f"❌ Fix these issues: {', '.join(validation_issues)}")
+                                validation_passed = False
+                    
+                    elif operation_type == "Upsert":
+                        # Get matching strategy from session state
+                        upsert_matching_strategy = st.session_state.get('upsert_matching_strategy', None)
+                        upsert_match_fields = st.session_state.get('upsert_match_fields', None)
+                        
+                        if not upsert_matching_strategy or not upsert_match_fields:
+                            st.error("❌ Cannot proceed: Please configure matching strategy in Configuration tab.")
+                            validation_passed = False
+                        else:
+                            validation_issues = []
+                            
+                            if upsert_matching_strategy == "external_id":
+                                # Single Field validation
+                                match_field = upsert_match_fields[0]
+                                st.info(f"🔍 Validating using field: '{match_field}'...")
+                                
+                                duplicate_count = df_to_load[match_field].duplicated().sum()
+                                null_count = df_to_load[match_field].isnull().sum()
+                                empty_count = (df_to_load[match_field].astype(str).str.strip() == '').sum()
+                                
+                                # Critical: Duplicates block upsert
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate values in '{match_field}'")
+                                    duplicates = df_to_load[df_to_load[match_field].duplicated(keep=False)][match_field].value_counts()
+                                    with st.expander("🔍 View Duplicates"):
+                                        st.write(duplicates)
+                                    st.error("❌ Cannot proceed: Each value must appear only once in your file.")
+                                    validation_passed = False
+                                else:
+                                    # Info: Empty values will be inserted
+                                    if null_count > 0 or empty_count > 0:
+                                        total_empty = null_count + empty_count
+                                        st.info(f"ℹ️ {total_empty} records have empty '{match_field}' (will be inserted as new)")
+                                    
+                                    # Query to show split
+                                    try:
+                                        st.info("🔍 Checking which records exist in Salesforce...")
+                                        unique_ids = df_to_load[match_field].dropna().unique().tolist()
+                                        existing_records = []
+                                        batch_size = 200
+                                        
+                                        for i in range(0, len(unique_ids), batch_size):
+                                            batch_ids = unique_ids[i:i + batch_size]
+                                            formatted_ids = [f"'{str(id).replace(chr(39), chr(92)+chr(39))}'" for id in batch_ids]
+                                            ids_string = ','.join(formatted_ids)
+                                            
+                                            soql_query = f"SELECT {match_field} FROM {target_object} WHERE {match_field} IN ({ids_string})"
+                                            result = sf_conn.query(soql_query)
+                                            
+                                            if result['totalSize'] > 0:
+                                                existing_records.extend([rec[match_field] for rec in result['records']])
+                                        
+                                        new_records_count = len(unique_ids) - len(existing_records) + (null_count + empty_count)
+                                        
+                                        col_u1, col_u2 = st.columns(2)
+                                        with col_u1:
+                                            st.info(f"🔄 **Will UPDATE**: {len(existing_records)} existing records")
+                                        with col_u2:
+                                            st.info(f"🆕 **Will INSERT**: {new_records_count} new records")
+                                        
+                                        st.success(f"✅ Ready for upsert: {len(existing_records)} updates + {new_records_count} inserts")
+                                        
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not query: {str(e)}")
+                                        st.info("💡 Proceeding with upsert")
+                            
+                            elif upsert_matching_strategy == "field_combination":
+                                # Field Combination validation
+                                st.info(f"🔍 Validating using Field Combination: {', '.join(upsert_match_fields)}...")
+                                
+                                # Check for duplicates in combination
+                                duplicate_count = df_to_load[upsert_match_fields].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate field combinations in uploaded file")
+                                    duplicates = df_to_load[df_to_load[upsert_match_fields].duplicated(keep=False)][upsert_match_fields]
+                                    with st.expander("🔍 View Duplicate Combinations"):
+                                        st.dataframe(duplicates)
+                                    st.error("❌ Cannot proceed: Each field combination must appear only once.")
+                                    validation_passed = False
+                                else:
+                                    # Query to show split
+                                    try:
+                                        st.info("🔍 Checking which field combinations exist in Salesforce...")
+                                        where_clauses = []
+                                        for _, row in df_to_load[upsert_match_fields].drop_duplicates().iterrows():
+                                            conditions = []
+                                            for field in upsert_match_fields:
+                                                value = row[field]
+                                                if pd.notna(value):
+                                                    escaped_value = str(value).replace("'", "\\'")
+                                                    conditions.append(f"{field} = '{escaped_value}'")
+                                            if conditions:
+                                                where_clauses.append(f"({' AND '.join(conditions)})")
+                                        
+                                        batch_size = 20
+                                        total_found = 0
+                                        
+                                        for i in range(0, len(where_clauses), batch_size):
+                                            batch_clauses = where_clauses[i:i + batch_size]
+                                            where_statement = ' OR '.join(batch_clauses)
+                                            
+                                            soql_query = f"SELECT {', '.join(upsert_match_fields)} FROM {target_object} WHERE {where_statement}"
+                                            result = sf_conn.query(soql_query)
+                                            total_found += result['totalSize']
+                                        
+                                        new_records_count = len(where_clauses) - total_found
+                                        
+                                        col_u1, col_u2 = st.columns(2)
+                                        with col_u1:
+                                            st.info(f"🔄 **Will UPDATE**: {total_found} existing combinations")
+                                        with col_u2:
+                                            st.info(f"🆕 **Will INSERT**: {new_records_count} new combinations")
+                                        
+                                        st.success(f"✅ Ready for upsert: {total_found} updates + {new_records_count} inserts")
+                                        
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with upsert")
+                            
+                            elif upsert_matching_strategy == "field_concatenation":
+                                # Field Concatenation validation
+                                separator = st.session_state.get('upsert_concat_separator', '_')
+                                st.info(f"🔍 Validating using Field Concatenation: {' {sep} '.join(upsert_match_fields).replace('{sep}', separator)}...")
+                                
+                                # Create concatenated column
+                                df_to_load['_match_key'] = df_to_load.apply(
+                                    lambda row: separator.join([str(row[f]) for f in upsert_match_fields]), axis=1
+                                )
+                                
+                                # Check for duplicates
+                                duplicate_count = df_to_load['_match_key'].duplicated().sum()
+                                
+                                if duplicate_count > 0:
+                                    st.error(f"❌ Found {duplicate_count} duplicate concatenated values")
+                                    duplicates = df_to_load[df_to_load['_match_key'].duplicated(keep=False)][upsert_match_fields + ['_match_key']]
+                                    with st.expander("🔍 View Duplicates"):
+                                        st.dataframe(duplicates)
+                                    st.error("❌ Cannot proceed: Each concatenated value must appear only once.")
+                                    validation_passed = False
+                                else:
+                                    # Query to show split
+                                    try:
+                                        st.info("🔍 Checking which concatenated combinations exist in Salesforce...")
+                                        where_clauses = []
+                                        for _, row in df_to_load[upsert_match_fields].drop_duplicates().iterrows():
+                                            conditions = []
+                                            for field in upsert_match_fields:
+                                                value = row[field]
+                                                if pd.notna(value):
+                                                    escaped_value = str(value).replace("'", "\\'")
+                                                    conditions.append(f"{field} = '{escaped_value}'")
+                                            if conditions:
+                                                where_clauses.append(f"({' AND '.join(conditions)})")
+                                        
+                                        batch_size = 20
+                                        total_found = 0
+                                        
+                                        for i in range(0, len(where_clauses), batch_size):
+                                            batch_clauses = where_clauses[i:i + batch_size]
+                                            where_statement = ' OR '.join(batch_clauses)
+                                            
+                                            soql_query = f"SELECT {', '.join(upsert_match_fields)} FROM {target_object} WHERE {where_statement}"
+                                            result = sf_conn.query(soql_query)
+                                            total_found += result['totalSize']
+                                        
+                                        new_records_count = len(where_clauses) - total_found
+                                        
+                                        col_u1, col_u2 = st.columns(2)
+                                        with col_u1:
+                                            st.info(f"🔄 **Will UPDATE**: {total_found} existing records")
+                                        with col_u2:
+                                            st.info(f"🆕 **Will INSERT**: {new_records_count} new records")
+                                        
+                                        st.success(f"✅ Ready for upsert: {total_found} updates + {new_records_count} inserts")
+                                        
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Could not verify: {str(e)}")
+                                        st.info("💡 Proceeding with upsert")
+                
+                if validation_passed:
+                    # Get additional parameters for different operations
+                    insert_match_field = st.session_state.get('insert_match_field', None) if operation_type == "Insert" else None
+                    update_match_field = st.session_state.get('match_field', None) if operation_type == "Update" else None
+                    upsert_match_field = st.session_state.get('upsert_match_field', None) if operation_type == "Upsert" else None
+                    
+                    # Get UPDATE matching strategy parameters
+                    update_matching_strategy = st.session_state.get('update_matching_strategy', None) if operation_type == "Update" else None
+                    update_match_fields = st.session_state.get('update_match_fields', None) if operation_type == "Update" else None
+                    update_concat_separator = st.session_state.get('update_concat_separator', None) if operation_type == "Update" else None
+                    
+                    # Get UPSERT matching strategy parameters
+                    upsert_matching_strategy = st.session_state.get('upsert_matching_strategy', None) if operation_type == "Upsert" else None
+                    upsert_match_fields = st.session_state.get('upsert_match_fields', None) if operation_type == "Upsert" else None
+                    upsert_concat_separator = st.session_state.get('upsert_concat_separator', None) if operation_type == "Upsert" else None
+                    
+                    load_data_to_salesforce(sf_conn, df_to_load, target_object, 
+                                          operation_type, batch_size, parallel_batches, 
+                                          upsert_match_field, update_match_field, insert_match_field,
+                                          update_matching_strategy, update_match_fields, update_concat_separator,
+                                          upsert_matching_strategy, upsert_match_fields, upsert_concat_separator)
 
 def show_sql_migration(credentials: Dict):
     """SQL migration operations"""
@@ -1006,7 +2836,7 @@ def get_existing_files(directory: str) -> list:
     try:
         for root, dirs, filenames in os.walk(directory):
             for filename in filenames:
-                if filename.endswith(('.csv', '.xlsx', '.xls')):
+                if filename.endswith(('.csv', '.xlsx', '.xls', '.psv')):
                     # Get relative path from DataFiles directory
                     rel_path = os.path.relpath(os.path.join(root, filename), directory)
                     files.append(rel_path)
@@ -1154,8 +2984,26 @@ def execute_sql_query(db_config: Dict, query: str):
         st.warning(f"**Error:** {str(e)}")
         show_processing_status("sql_query", f"SQL query failed: {str(e)}", "error")
 
-def load_data_to_salesforce(sf_conn, df: pd.DataFrame, target_object: str, operation: str, batch_size: int, parallel_batches: int):
-    """Load data to Salesforce with batch processing"""
+def load_data_to_salesforce(sf_conn, df: pd.DataFrame, target_object: str, operation: str, batch_size: int, parallel_batches: int, upsert_match_field: str = None, update_match_field: str = None, insert_match_field: str = None, update_matching_strategy: str = None, update_match_fields: list = None, update_concat_separator: str = None, upsert_matching_strategy: str = None, upsert_match_fields: list = None, upsert_concat_separator: str = None):
+    """Load data to Salesforce with batch processing and external ID-based duplicate detection
+    
+    Args:
+        sf_conn: Salesforce connection
+        df: DataFrame to load
+        target_object: Target Salesforce object
+        operation: insert/update/upsert
+        batch_size: Records per batch
+        parallel_batches: Number of parallel batches
+        upsert_match_field: Field for upsert matching (legacy single field)
+        update_match_field: Field for update matching (single external ID strategy)
+        insert_match_field: External ID field for insert tracking
+        update_matching_strategy: Strategy for UPDATE operation ('external_id', 'field_combination', 'field_concatenation')
+        update_match_fields: List of fields to use for UPDATE field combination/concatenation matching
+        update_concat_separator: Separator for UPDATE field concatenation strategy
+        upsert_matching_strategy: Strategy for UPSERT operation ('external_id', 'field_combination', 'field_concatenation')
+        upsert_match_fields: List of fields to use for UPSERT field combination/concatenation matching
+        upsert_concat_separator: Separator for UPSERT field concatenation strategy
+    """
     try:
         total_records = len(df)
         
@@ -1172,8 +3020,82 @@ def load_data_to_salesforce(sf_conn, df: pd.DataFrame, target_object: str, opera
         with progress_container:
             create_progress_tracker(progress_steps, 1)
         
+        # Resolve lookup fields before cleaning data (with enhanced statistics)
+        st.info("🔄 Resolving lookup fields...")
+        lookup_result = resolve_lookup_fields(sf_conn, df, target_object, return_stats=True)
+        
+        # Handle different return formats
+        if lookup_result is None:
+            df_with_lookups = None
+            lookup_fields = {}
+            lookup_count_summary = {}
+        elif isinstance(lookup_result, tuple):
+            df_with_lookups, lookup_fields, lookup_count_summary = lookup_result
+        else:
+            # Fallback for compatibility
+            df_with_lookups = lookup_result
+            lookup_fields = {}
+            lookup_count_summary = {}
+        
+        # Check if lookup resolution failed due to empty parent objects or pending selections
+        if df_with_lookups is None:
+            st.warning("⚠️ **Cannot proceed with data loading**")
+            
+            st.info("💡 **Possible reasons:**")
+            with st.expander("🔍 Troubleshooting Guide"):
+                st.write("**1. Empty Parent Object:**")
+                st.write("   • Parent object has no records at all")
+                st.write("   • Solution: Add data to parent object first")
+                st.write("")
+                st.write("**2. Pending User Selections:**") 
+                st.write("   • Multiple parent records found with same name")
+                st.write("   • Solution: Make selections above and try again")
+                st.write("")
+                st.write("**3. Core Logic Applied:**")
+                st.write("   • System checks if parent object has ANY data")
+                st.write("   • If parent object is empty → Block child uploads")
+                st.write("   • If parent object has data → Allow uploads (with warnings for missing specific records)")
+            
+            show_processing_status("data_load", "Data loading blocked: Parent object validation required", "error")
+            return
+        
+        # Generate composite keys or rename fields for INSERT operation only
+        if operation.lower() == "insert":
+            is_composite = st.session_state.get('insert_is_composite', False)
+            
+            if is_composite and st.session_state.get('composite_external_id_insert'):
+                # Generate composite key for INSERT
+                st.info("🔗 Generating composite external ID for insert operation...")
+                composite_config = st.session_state.composite_external_id_insert
+                
+                # Create composite key column
+                composite_keys = create_composite_key_column(
+                    df_with_lookups,
+                    composite_config['fields'],
+                    composite_config['separator'],
+                    composite_config['null_handling']
+                )
+                
+                # Add composite key column with Salesforce target field name
+                target_field = composite_config['target_field']
+                df_with_lookups[target_field] = composite_keys
+                st.success(f"✅ Generated composite external ID in field: {target_field}")
+                
+            elif not is_composite:
+                # Rename single source field to target field for INSERT
+                source_field = st.session_state.get('insert_source_field')
+                target_field = st.session_state.get('insert_target_field')
+                
+                if source_field and target_field and source_field in df_with_lookups.columns:
+                    if source_field != target_field:
+                        # Copy source field to target field name
+                        df_with_lookups[target_field] = df_with_lookups[source_field]
+                        st.success(f"✅ Mapped '{source_field}' → '{target_field}' for external ID")
+        
+        # For UPDATE and UPSERT, the external ID field should already exist in the data
+        
         # Clean data before conversion - FIX FOR NaN ERROR
-        df_cleaned = clean_dataframe_for_salesforce(df)
+        df_cleaned = clean_dataframe_for_salesforce(df_with_lookups)
         
         # Convert DataFrame to records
         records = df_cleaned.to_dict('records')
@@ -1200,11 +3122,525 @@ def load_data_to_salesforce(sf_conn, df: pd.DataFrame, target_object: str, opera
             
             try:
                 if operation.lower() == "insert":
-                    result = getattr(sf_conn.bulk, target_object).insert(batch)
+                    # Insert operation - validate uniqueness before inserting
+                    insert_matching_strategy = st.session_state.get('insert_matching_strategy', None)
+                    insert_match_fields = st.session_state.get('insert_match_fields', None)
+                    target_field = st.session_state.get('insert_target_field', insert_match_field)
+                    
+                    # Check for duplicates in Salesforce before inserting
+                    validated_insert_batch = []
+                    duplicate_inserts = []
+                    
+                    st.info(f"🔍 Batch {i + 1}: Validating {len(batch)} records for uniqueness in Salesforce...")
+                    
+                    if insert_matching_strategy == "field_combination" and insert_match_fields:
+                        # Field combination validation
+                        source_fields = insert_match_fields
+                        
+                        for record in batch:
+                                # Build WHERE clause for composite fields
+                                conditions = []
+                                has_all_fields = True
+                                
+                                for field in source_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        has_all_fields = False
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                if not has_all_fields:
+                                    # Cannot validate incomplete records - skip insert
+                                    combination_str = ' | '.join([f"{f}={record.get(f)}" for f in source_fields])
+                                    duplicate_inserts.append({
+                                        'record': record,
+                                        'reason': f"Incomplete combination: {combination_str}"
+                                    })
+                                    continue
+                                
+                                try:
+                                    # Check if combination already exists
+                                    where_clause = ' AND '.join(conditions)
+                                    check_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                    check_result = sf_conn.query(check_query)
+                                    
+                                    if check_result['totalSize'] > 0:
+                                        # Duplicate found
+                                        combination_str = ' | '.join([f"{f}={record.get(f)}" for f in source_fields])
+                                        duplicate_inserts.append({
+                                            'record': record,
+                                            'reason': f"Duplicate combination already exists: {combination_str}"
+                                        })
+                                    else:
+                                        # Safe to insert
+                                        validated_insert_batch.append(record)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify uniqueness: {str(e)}")
+                                    validated_insert_batch.append(record)  # Proceed with insert
+                    
+                    elif insert_matching_strategy == "field_concatenation" and insert_match_fields:
+                        # Field concatenation validation
+                        source_fields = insert_match_fields
+                        
+                        for record in batch:
+                            # Build WHERE clause for concatenated fields
+                            conditions = []
+                            has_all_fields = True
+                            
+                            for field in source_fields:
+                                value = record.get(field)
+                                if not value or (isinstance(value, str) and value.strip() == ''):
+                                    has_all_fields = False
+                                    break
+                                escaped_value = str(value).replace("'", "\\'")
+                                conditions.append(f"{field} = '{escaped_value}'")
+                            
+                            if not has_all_fields:
+                                # Cannot validate incomplete records - skip insert
+                                combination_str = ' | '.join([f"{f}={record.get(f)}" for f in source_fields])
+                                duplicate_inserts.append({
+                                    'record': record,
+                                    'reason': f"Incomplete concatenation: {combination_str}"
+                                })
+                                continue
+                            
+                            try:
+                                # Check if concatenation already exists
+                                where_clause = ' AND '.join(conditions)
+                                check_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                check_result = sf_conn.query(check_query)
+                                
+                                if check_result['totalSize'] > 0:
+                                    # Duplicate found
+                                    separator = st.session_state.get('insert_concat_separator', '_')
+                                    concat_value = separator.join([str(record.get(f)) for f in source_fields])
+                                    duplicate_inserts.append({
+                                        'record': record,
+                                        'reason': f"Duplicate concatenation already exists: {concat_value}"
+                                    })
+                                else:
+                                    # Safe to insert
+                                    validated_insert_batch.append(record)
+                            except Exception as e:
+                                st.warning(f"⚠️ Could not verify uniqueness: {str(e)}")
+                                validated_insert_batch.append(record)  # Proceed with insert
+                    
+                    elif insert_matching_strategy == "external_id" and insert_match_fields:
+                        # Single field validation
+                        source_field = insert_match_fields[0]
+                        
+                        if source_field and target_field:
+                            for record in batch:
+                                match_value = record.get(source_field)
+                                
+                                if not match_value or str(match_value).strip() == '':
+                                    # Empty value - cannot validate
+                                    duplicate_inserts.append({
+                                        'record': record,
+                                        'reason': f"Empty {source_field} value"
+                                    })
+                                    continue
+                                
+                                try:
+                                    # Check if value already exists in target field
+                                    escaped_value = str(match_value).replace("'", "\\'")
+                                    check_query = f"SELECT Id FROM {target_object} WHERE {target_field} = '{escaped_value}' LIMIT 1"
+                                    check_result = sf_conn.query(check_query)
+                                    
+                                    if check_result['totalSize'] > 0:
+                                        # Duplicate found
+                                        duplicate_inserts.append({
+                                            'record': record,
+                                            'reason': f"Duplicate {target_field} already exists: {match_value}"
+                                        })
+                                    else:
+                                        # Safe to insert
+                                        validated_insert_batch.append(record)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify uniqueness for {match_value}: {str(e)}")
+                                    validated_insert_batch.append(record)  # Proceed with insert
+                    else:
+                        # No matching strategy configured - insert all (should not happen with proper validation)
+                        st.warning("⚠️ No uniqueness validation strategy configured - proceeding without validation")
+                        validated_insert_batch = batch
+                    
+                    # Show duplicate warnings
+                    if duplicate_inserts:
+                        st.error(f"❌ Batch {i + 1}: Found {len(duplicate_inserts)} duplicate/invalid records - INSERT FAILED")
+                        with st.expander("🔍 View Duplicate/Invalid Records"):
+                            for dup in duplicate_inserts[:20]:  # Show first 20
+                                st.write(f"• {dup['reason']}")
+                            if len(duplicate_inserts) > 20:
+                                st.write(f"... and {len(duplicate_inserts) - 20} more")
+                        st.error("❌ Cannot proceed with INSERT - duplicates found in Salesforce. Use UPDATE or UPSERT instead.")
+                        
+                        # Stop processing this batch
+                        continue
+                    
+                    # Proceed with insert only if all records are unique
+                    if validated_insert_batch:
+                        st.info(f"🆕 Batch {i + 1}: Inserting {len(validated_insert_batch)} unique records (populating external ID: '{target_field}')")
+                        result = getattr(sf_conn.bulk, target_object).insert(validated_insert_batch)
+                    else:
+                        st.error(f"❌ Batch {i + 1}: No records to insert - all were duplicates")
+                        continue
                 elif operation.lower() == "update":
-                    result = getattr(sf_conn.bulk, target_object).update(batch)
+                    # Handle different matching strategies
+                    update_batch = []
+                    unmatched_records = []
+                    
+                    if update_matching_strategy == "external_id":
+                        # Original single external ID matching
+                        if not update_match_field:
+                            raise ValueError("Update operation requires a match field to be specified.")
+                        
+                        for record in batch:
+                            match_value = record.get(update_match_field)
+                            
+                            if not match_value or str(match_value).strip() == '':
+                                unmatched_records.append(record)
+                                continue
+                            
+                            try:
+                                escaped_value = str(match_value).replace("'", "\\'")
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {update_match_field} = '{escaped_value}' LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    unmatched_records.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for match value '{match_value}': {str(e)}")
+                                unmatched_records.append(record)
+                    
+                    elif update_matching_strategy == "field_combination":
+                        # Field combination matching
+                        if not update_match_fields:
+                            raise ValueError("Update operation with field combination requires match fields.")
+                        
+                        for record in batch:
+                            try:
+                                # Build WHERE clause with all match fields
+                                conditions = []
+                                skip_record = False
+                                
+                                for field in update_match_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        skip_record = True
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                if skip_record:
+                                    unmatched_records.append(record)
+                                    continue
+                                
+                                where_clause = ' AND '.join(conditions)
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    unmatched_records.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for field combination: {str(e)}")
+                                unmatched_records.append(record)
+                    
+                    elif update_matching_strategy == "field_concatenation":
+                        # Field concatenation matching
+                        if not update_match_fields or not update_concat_separator:
+                            raise ValueError("Update operation with concatenation requires match fields and separator.")
+                        
+                        for record in batch:
+                            try:
+                                # Build WHERE clause with all match fields (same as combination)
+                                conditions = []
+                                skip_record = False
+                                
+                                for field in update_match_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        skip_record = True
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                if skip_record:
+                                    unmatched_records.append(record)
+                                    continue
+                                
+                                where_clause = ' AND '.join(conditions)
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    unmatched_records.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for concatenated fields: {str(e)}")
+                                unmatched_records.append(record)
+                    
+                    if unmatched_records:
+                        st.warning(f"⚠️ Batch {i + 1}: {len(unmatched_records)} records could not be matched to existing Salesforce records")
+                    
+                    if update_batch:
+                        st.info(f"📝 Batch {i + 1}: Updating {len(update_batch)} matched records")
+                        result = getattr(sf_conn.bulk, target_object).update(update_batch)
+                    else:
+                        st.error(f"❌ Batch {i + 1}: No records could be matched for update")
+                        continue
                 else:  # upsert
-                    result = getattr(sf_conn.bulk, target_object).upsert(batch, 'Id')
+                    # Split records into update and insert batches based on whether they exist in Salesforce
+                    update_batch = []
+                    insert_batch = []
+                    unprocessable_records = []
+                    
+                    if upsert_matching_strategy == "external_id":
+                        # Original single field matching
+                        if not upsert_match_field:
+                            raise ValueError("Upsert operation requires a match field to be specified.")
+                        
+                        for record in batch:
+                            match_value = record.get(upsert_match_field)
+                            
+                            # Records with no match value go to insert
+                            if not match_value or str(match_value).strip() == '':
+                                insert_batch.append(record)
+                                continue
+                            
+                            try:
+                                # Query Salesforce to check if record exists
+                                escaped_value = str(match_value).replace("'", "\\'")
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {upsert_match_field} = '{escaped_value}' LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    # Record exists - add to update batch
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    # Record doesn't exist - add to insert batch
+                                    insert_batch.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for match value '{match_value}': {str(e)}")
+                                unprocessable_records.append(record)
+                    
+                    elif upsert_matching_strategy == "field_combination":
+                        # Field combination matching
+                        if not upsert_match_fields:
+                            raise ValueError("Upsert operation with field combination requires match fields.")
+                        
+                        for record in batch:
+                            try:
+                                # Build WHERE clause with all match fields
+                                conditions = []
+                                has_all_fields = True
+                                
+                                for field in upsert_match_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        has_all_fields = False
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                # Records with incomplete field combinations go to insert
+                                if not has_all_fields:
+                                    insert_batch.append(record)
+                                    continue
+                                
+                                where_clause = ' AND '.join(conditions)
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    # Record exists - add to update batch
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    # Record doesn't exist - add to insert batch
+                                    insert_batch.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for field combination: {str(e)}")
+                                unprocessable_records.append(record)
+                    
+                    elif upsert_matching_strategy == "field_concatenation":
+                        # Field concatenation matching
+                        if not upsert_match_fields or not upsert_concat_separator:
+                            raise ValueError("Upsert operation with concatenation requires match fields and separator.")
+                        
+                        for record in batch:
+                            try:
+                                # Build WHERE clause with all match fields
+                                conditions = []
+                                has_all_fields = True
+                                
+                                for field in upsert_match_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        has_all_fields = False
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                # Records with incomplete field combinations go to insert
+                                if not has_all_fields:
+                                    insert_batch.append(record)
+                                    continue
+                                
+                                where_clause = ' AND '.join(conditions)
+                                soql_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                
+                                query_result = sf_conn.query(soql_query)
+                                
+                                if query_result['totalSize'] > 0:
+                                    # Record exists - add to update batch
+                                    record['Id'] = query_result['records'][0]['Id']
+                                    update_batch.append(record)
+                                else:
+                                    # Record doesn't exist - add to insert batch
+                                    insert_batch.append(record)
+                                    
+                            except Exception as e:
+                                st.warning(f"⚠️ Error querying for concatenated fields: {str(e)}")
+                                unprocessable_records.append(record)
+                    
+                    # Process updates first
+                    update_results = []
+                    if update_batch:
+                        st.info(f"🔄 Batch {i + 1}: Updating {len(update_batch)} existing records")
+                        try:
+                            update_results = getattr(sf_conn.bulk, target_object).update(update_batch)
+                        except Exception as e:
+                            st.error(f"❌ Error updating records in batch {i + 1}: {str(e)}")
+                            update_results = []
+                    
+                    # Validate insert batch before inserting - check for duplicates in Salesforce
+                    validated_insert_batch = []
+                    duplicate_inserts = []
+                    
+                    if insert_batch:
+                        st.info(f"🔍 Batch {i + 1}: Validating {len(insert_batch)} records before insert...")
+                        
+                        if upsert_matching_strategy == "external_id" and upsert_match_fields:
+                            # Single field validation
+                            match_field = upsert_match_fields[0]
+                            
+                            for record in insert_batch:
+                                match_value = record.get(match_field)
+                                
+                                # Records with empty values can be inserted (no way to check uniqueness)
+                                if not match_value or str(match_value).strip() == '':
+                                    validated_insert_batch.append(record)
+                                    continue
+                                
+                                try:
+                                    # Check if this value already exists in Salesforce
+                                    escaped_value = str(match_value).replace("'", "\\'")
+                                    check_query = f"SELECT Id FROM {target_object} WHERE {match_field} = '{escaped_value}' LIMIT 1"
+                                    check_result = sf_conn.query(check_query)
+                                    
+                                    if check_result['totalSize'] > 0:
+                                        # Duplicate found - skip insert
+                                        duplicate_inserts.append({
+                                            'record': record,
+                                            'reason': f"Duplicate {match_field}: {match_value}"
+                                        })
+                                    else:
+                                        # Safe to insert
+                                        validated_insert_batch.append(record)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify uniqueness for {match_value}: {str(e)}")
+                                    validated_insert_batch.append(record)  # Proceed with insert
+                        
+                        elif upsert_matching_strategy in ["field_combination", "field_concatenation"] and upsert_match_fields:
+                            # Field combination/concatenation validation
+                            
+                            for record in insert_batch:
+                                # Build WHERE clause for this record
+                                conditions = []
+                                has_all_fields = True
+                                
+                                for field in upsert_match_fields:
+                                    value = record.get(field)
+                                    if not value or (isinstance(value, str) and value.strip() == ''):
+                                        has_all_fields = False
+                                        break
+                                    escaped_value = str(value).replace("'", "\\'")
+                                    conditions.append(f"{field} = '{escaped_value}'")
+                                
+                                # Records with incomplete combinations can be inserted
+                                if not has_all_fields:
+                                    validated_insert_batch.append(record)
+                                    continue
+                                
+                                try:
+                                    # Check if this combination already exists in Salesforce
+                                    where_clause = ' AND '.join(conditions)
+                                    check_query = f"SELECT Id FROM {target_object} WHERE {where_clause} LIMIT 1"
+                                    check_result = sf_conn.query(check_query)
+                                    
+                                    if check_result['totalSize'] > 0:
+                                        # Duplicate combination found - skip insert
+                                        combination_str = ' | '.join([f"{f}={record.get(f)}" for f in upsert_match_fields])
+                                        duplicate_inserts.append({
+                                            'record': record,
+                                            'reason': f"Duplicate combination: {combination_str}"
+                                        })
+                                    else:
+                                        # Safe to insert
+                                        validated_insert_batch.append(record)
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not verify uniqueness: {str(e)}")
+                                    validated_insert_batch.append(record)  # Proceed with insert
+                        else:
+                            # No validation strategy - insert all
+                            validated_insert_batch = insert_batch
+                        
+                        # Show duplicate warnings
+                        if duplicate_inserts:
+                            st.warning(f"⚠️ Batch {i + 1}: Skipping {len(duplicate_inserts)} records - already exist in Salesforce")
+                            with st.expander("🔍 View Duplicate Records"):
+                                for dup in duplicate_inserts[:10]:  # Show first 10
+                                    st.write(f"• {dup['reason']}")
+                                if len(duplicate_inserts) > 10:
+                                    st.write(f"... and {len(duplicate_inserts) - 10} more")
+                    
+                    # Process inserts with validated batch
+                    insert_results = []
+                    if validated_insert_batch:
+                        st.info(f"🆕 Batch {i + 1}: Inserting {len(validated_insert_batch)} new unique records")
+                        try:
+                            insert_results = getattr(sf_conn.bulk, target_object).insert(validated_insert_batch)
+                        except Exception as e:
+                            st.error(f"❌ Error inserting records in batch {i + 1}: {str(e)}")
+                            insert_results = []
+                    elif insert_batch:
+                        st.info(f"ℹ️ Batch {i + 1}: All {len(insert_batch)} insert records were duplicates - skipped")
+                    
+                    # Combine results for processing
+                    result = update_results + insert_results
+                    
+                    if unprocessable_records:
+                        st.warning(f"⚠️ Batch {i + 1}: {len(unprocessable_records)} records could not be processed due to query errors")
                 
                 # Process each record result with original data
                 for j, record_result in enumerate(result):
@@ -1571,6 +4007,371 @@ def load_data_to_sql_server(db_config: Dict, df: pd.DataFrame, table_name: str, 
 # NEW FUNCTIONS FOR ENHANCED DATA LOADING
 # ================================
 
+def resolve_lookup_fields(sf_conn, df: pd.DataFrame, target_object: str, return_stats: bool = False) -> pd.DataFrame:
+    """Resolve lookup field values to Salesforce record IDs and validate picklist API names
+    
+    Args:
+        sf_conn: Salesforce connection
+        df: DataFrame to process
+        target_object: Salesforce object name
+        return_stats: If True, returns (df, lookup_fields, lookup_counts) tuple
+        
+    Returns:
+        DataFrame or tuple based on return_stats parameter
+    """
+    df_resolved = df.copy()
+    lookup_count_summary = {}
+    
+    try:
+        # Get object metadata to identify lookup and picklist fields
+        object_desc = getattr(sf_conn, target_object).describe()
+        lookup_fields = {}
+        picklist_fields = {}
+        
+        # Find lookup and picklist fields in the data
+        for field in object_desc['fields']:
+            field_name = field['name']
+            
+            if field_name in df.columns:
+                if field['type'] == 'reference':
+                    # This is a lookup field in our data
+                    referenced_objects = field.get('referenceTo', [])
+                    if referenced_objects:
+                        lookup_fields[field_name] = {
+                            'referenced_object': referenced_objects[0],  # Take first referenced object
+                            'label': field.get('label', field_name)
+                        }
+                
+                elif field['type'] in ['picklist', 'multipicklist']:
+                    # This is a picklist field in our data
+                    picklist_values = field.get('picklistValues', [])
+                    if picklist_values:
+                        api_names = {}
+                        labels = {}
+                        for pv in picklist_values:
+                            if not pv.get('inactive', False):
+                                api_name = pv.get('valueName', pv.get('value', ''))
+                                label = pv.get('label', pv.get('value', ''))
+                                api_names[api_name] = label
+                                labels[label] = api_name
+                        
+                        picklist_fields[field_name] = {
+                            'api_names': api_names,  # API name -> Label mapping
+                            'labels': labels,        # Label -> API name mapping
+                            'type': field['type']
+                        }
+        
+        # Process picklist fields first - validate API names
+        if picklist_fields:
+            st.info(f"🎯 Found {len(picklist_fields)} picklist field(s) to validate: {', '.join(picklist_fields.keys())}")
+            
+            for field_name, field_info in picklist_fields.items():
+                st.info(f"🔍 Validating picklist API names for {field_name}")
+                
+                # Get unique values from the data (should be API names)
+                unique_values = df_resolved[field_name].dropna().unique()
+                valid_api_names = list(field_info['api_names'].keys())
+                
+                invalid_values = []
+                valid_count = 0
+                
+                for value in unique_values:
+                    if pd.isna(value) or str(value).strip() == '':
+                        continue
+                        
+                    str_value = str(value).strip()
+                    
+                    # Check if the value is a valid API name
+                    if str_value in valid_api_names:
+                        valid_count += 1
+                        # API name is valid - it will be sent as-is to Salesforce
+                        st.success(f"   ✅ '{str_value}' is valid API name")
+                    else:
+                        # Invalid API name
+                        invalid_values.append(str_value)
+                        st.error(f"   ❌ '{str_value}' is NOT a valid API name")
+                
+                if invalid_values:
+                    st.error(f"🚫 **INVALID PICKLIST API NAMES FOUND**")
+                    st.error(f"**Field:** {field_name}")
+                    st.error(f"**Invalid values:** {', '.join(invalid_values)}")
+                    st.error(f"**Valid API names:** {', '.join(valid_api_names)}")
+                    
+                    with st.expander(f"🔧 Fix Picklist Values for {field_name}"):
+                        st.write("**Your file contains invalid picklist API names.**")
+                        st.write("")
+                        st.write("**📝 Requirements:**")
+                        st.write(f"• File should contain API names (not labels)")
+                        st.write(f"• Valid API names for {field_name}: {', '.join(valid_api_names)}")
+                        st.write("")
+                        st.write("**✅ Solution:**")
+                        st.write("1. **Update your data file** to use valid API names")
+                        st.write("2. **Replace invalid values** with correct API names")
+                        st.write("3. **Re-upload the corrected file**")
+                        
+                        st.info("💡 **Note:** API names are used for data loading, but Salesforce UI will display the corresponding labels")
+                    
+                    return None  # Block upload due to invalid picklist values
+                
+                else:
+                    st.success(f"✅ All {valid_count} picklist values are valid API names for {field_name}")
+        
+        # Process lookup fields (existing logic)
+        if not lookup_fields:
+            if not picklist_fields:
+                st.info("📝 No lookup or picklist fields detected in your data.")
+            return df_resolved
+        
+        st.info(f"🔍 Found {len(lookup_fields)} lookup field(s) to resolve: {', '.join(lookup_fields.keys())}")
+        
+        # Resolve each lookup field
+        for field_name, field_info in lookup_fields.items():
+            referenced_object = field_info['referenced_object']
+            
+            st.info(f"🔄 Resolving {field_name} → {referenced_object}")
+            
+            # SMART VALIDATION: Check if parent object has ANY data
+            try:
+                # Fixed: Remove LIMIT from COUNT query (Salesforce doesn't allow LIMIT with aggregates)
+                parent_count_query = f"SELECT COUNT(Id) FROM {referenced_object}"
+                parent_count_result = sf_conn.query(parent_count_query)
+                parent_record_count = parent_count_result['totalSize']
+                
+                if parent_record_count == 0:
+                    # Parent object is completely empty - this is the error condition
+                    st.error(f"❌ **PARENT OBJECT IS EMPTY**")
+                    st.error(f"**Child Object:** {target_object}")
+                    st.error(f"**Parent Object:** {referenced_object}")
+                    st.error(f"**Lookup Field:** {field_name}")
+                    
+                    with st.expander(f"🚨 No Data in Parent Object: {referenced_object}"):
+                        child_record_count = len(df_resolved[df_resolved[field_name].notna()])
+                        st.write(f"**Problem:** {referenced_object} object has no records")
+                        st.write(f"**Impact:** Cannot upload {child_record_count} child records with lookup relationships")
+                        st.write(f"**Child records need:** Valid parent records to reference")
+                        
+                        st.error("**🚫 Data Integrity Issue:**")
+                        st.write("• Child records cannot exist without parent records")
+                        st.write(f"• {referenced_object} object must have data before child uploads")
+                        st.write("• Lookup relationships would be invalid")
+                        
+                        st.info("**✅ Solution:**")
+                        st.write(f"1. **Add data to {referenced_object} object first**")
+                        st.write(f"   - Create at least one {referenced_object} record in Salesforce")
+                        st.write(f"   - Ensure parent records exist before uploading child data")
+                        st.write(f"2. **Verify parent object setup**")
+                        st.write(f"   - Check if {referenced_object} object is properly configured")
+                        st.write(f"   - Confirm object permissions and access")
+                        st.write(f"3. **Upload in correct sequence**")
+                        st.write(f"   - First: Upload {referenced_object} records")
+                        st.write(f"   - Then: Upload {target_object} records")
+                    
+                    st.error(f"🚫 **CANNOT UPLOAD CHILD RECORDS**")
+                    st.error(f"The {referenced_object} object is empty. Child records need parent records to reference.")
+                    return None  # Block the upload
+                
+                else:
+                    # Parent object has data - proceed with normal lookup resolution
+                    st.success(f"✅ Parent object {referenced_object} has {parent_record_count} record(s) - proceeding with lookup resolution")
+                    
+            except Exception as e:
+                st.warning(f"⚠️ Could not verify parent object data: {str(e)}")
+                # Continue with normal processing if we can't check parent count
+            
+            # Get unique values to resolve
+            unique_values = df_resolved[field_name].dropna().unique()
+            
+            if len(unique_values) == 0:
+                continue
+                
+            # Create lookup mapping
+            lookup_mapping = {}
+            unresolved_values = []
+            
+            for value in unique_values:
+                if pd.isna(value) or str(value).strip() == '':
+                    continue
+                    
+                escaped_value = str(value).replace("'", "\\'")
+                
+                # Try multiple fields that might contain the lookup value
+                possible_fields = ['Name', 'Code__c', 'External_Id__c', 'Code', 'Number__c']
+                record_found = False
+                
+                for lookup_field in possible_fields:
+                    try:
+                        # Query the referenced object - CHECK FOR DUPLICATES
+                        soql = f"SELECT Id, Name FROM {referenced_object} WHERE {lookup_field} = '{escaped_value}'"
+                        result = sf_conn.query(soql)
+                        
+                        if result['totalSize'] > 0:
+                            # Check for duplicate parent records
+                            if result['totalSize'] > 1:
+                                # Multiple records found - let user choose
+                                duplicate_records = result['records']
+                                
+                                st.warning(f"⚠️ **MULTIPLE PARENT RECORDS FOUND**")
+                                st.info(f"**Field:** {field_name}")
+                                st.info(f"**Value:** '{value}'")
+                                st.info(f"**Parent Object:** {referenced_object}")
+                                st.info(f"**Found {result['totalSize']} records with the same {lookup_field}**")
+                                
+                                # Create user selection interface
+                                st.write(f"**Please select which parent record to use for '{value}':**")
+                                
+                                # Create selection options
+                                selection_options = []
+                                option_labels = []
+                                
+                                for i, record in enumerate(duplicate_records):
+                                    record_id = record['Id']
+                                    record_name = record.get('Name', 'Unknown')
+                                    option_label = f"{record_name} (ID: {record_id})"
+                                    selection_options.append(record_id)
+                                    option_labels.append(option_label)
+                                
+                                # Use session state key for this specific lookup value
+                                session_key = f"duplicate_selection_{field_name}_{value}_{hash(str(duplicate_records))}"
+                                
+                                selected_option = st.selectbox(
+                                    f"Choose parent record for '{value}':",
+                                    options=selection_options,
+                                    format_func=lambda x: next(label for i, label in enumerate(option_labels) if selection_options[i] == x),
+                                    key=session_key,
+                                    help=f"Select which {referenced_object} record should be the parent for child records with {field_name} = '{value}'"
+                                )
+                                
+                                if selected_option:
+                                    # User has made a selection
+                                    selected_record = next(rec for rec in duplicate_records if rec['Id'] == selected_option)
+                                    selected_name = selected_record.get('Name', str(value))
+                                    
+                                    lookup_mapping[value] = selected_option
+                                    record_found = True
+                                    
+                                    st.success(f"✅ Selected '{value}' → {selected_name} ({selected_option})")
+                                    
+                                    # Show impact information
+                                    affected_records = df_resolved[df_resolved[field_name] == value].shape[0]
+                                    st.info(f"📊 This selection will affect {affected_records} child record(s)")
+                                    
+                                    break
+                                else:
+                                    # No selection made yet - add to pending
+                                    st.warning(f"⏳ Please select a parent record for '{value}' to continue")
+                                    unresolved_values.append(f"{value} (PENDING USER SELECTION)")
+                                    record_found = False
+                                    break
+                            else:
+                                # Single record found - this is correct
+                                record_id = result['records'][0]['Id']
+                                record_name = result['records'][0].get('Name', str(value))
+                                lookup_mapping[value] = record_id
+                                record_found = True
+                                st.success(f"✅ Resolved '{value}' → {record_name} ({record_id})")
+                                break
+                    except Exception as e:
+                        # Try next field
+                        continue
+                
+                if not record_found:
+                    # Check if this is because parent record doesn't exist at all
+                    unresolved_values.append(f"{value} (MISSING PARENT RECORD)")
+            
+            # Apply the mapping
+            if lookup_mapping:
+                df_resolved[field_name] = df_resolved[field_name].map(lookup_mapping).fillna(df_resolved[field_name])
+                resolved_count = sum(1 for v in df_resolved[field_name] if v in lookup_mapping.values())
+                st.success(f"📊 Resolved {len(lookup_mapping)} values for {field_name} (affecting {resolved_count} records)")
+                
+                # Track lookup counts for enhanced validation
+                lookup_count_summary[field_name] = len(lookup_mapping)
+            
+            # Report unresolved values
+            if unresolved_values:
+                # Categorize different types of resolution failures
+                pending_selections = [v for v in unresolved_values if "PENDING USER SELECTION" in str(v)]
+                missing_individual_records = [v for v in unresolved_values if "MISSING PARENT RECORD" in str(v)]
+                other_errors = [v for v in unresolved_values if "PENDING USER SELECTION" not in str(v) and "MISSING PARENT RECORD" not in str(v)]
+                
+                if missing_individual_records:
+                    st.warning(f"⚠️ **Some Parent Records Not Found**")
+                    st.warning(f"**Field:** {field_name}")
+                    st.warning(f"**Parent Object:** {referenced_object} (has data, but missing specific records)")
+                    
+                    # Show detailed missing individual record information
+                    with st.expander(f"🔍 Missing Individual Parent Records"):
+                        st.write("**These specific parent records were not found:**")
+                        missing_values = [v.split(" (MISSING")[0] for v in missing_individual_records]
+                        for i, val in enumerate(missing_values, 1):
+                            affected_count = df_resolved[df_resolved[field_name] == val].shape[0]
+                            st.write(f"{i}. **'{val}'** - affects {affected_count} child record(s)")
+                        
+                        st.info("**📝 Note:** Parent object has data, but these specific records don't exist")
+                        st.write("**Options:**")
+                        st.write(f"1. Create these missing {referenced_object} records")
+                        st.write("2. Update child data to reference existing parent records")
+                        st.write("3. Check spelling/format of parent record names")
+                        st.write("4. Use existing Salesforce record IDs instead")
+                    
+                    # Calculate total impact
+                    total_affected = 0
+                    for val in missing_values:
+                        count = df_resolved[df_resolved[field_name] == val].shape[0]
+                        total_affected += count
+                    
+                    st.warning(f"📊 **Child records with missing parent references: {total_affected}**")
+                    st.info("💡 **These can be fixed by creating the missing parent records or updating references**")
+                
+                if pending_selections:
+                    st.warning(f"⏳ **PENDING USER SELECTIONS**")
+                    st.warning(f"**Field:** {field_name}")
+                    st.warning(f"**Values requiring selection:** {len(pending_selections)}")
+                    st.info("📋 **Please make selections above to continue with data loading**")
+                    st.info("Once all parent records are selected, the system will proceed with loading.")
+                    
+                    # Show affected child records count
+                    pending_values = [v.split(" (PENDING")[0] for v in pending_selections]
+                    total_affected = 0
+                    for val in pending_values:
+                        count = df_resolved[df_resolved[field_name] == val].shape[0]
+                        total_affected += count
+                        st.write(f"  • '{val}': {count} child record(s) waiting")
+                    
+                    st.info(f"📊 **Total child records waiting for parent selection: {total_affected}**")
+                
+                if other_errors:
+                    st.warning(f"⚠️ Could not resolve {len(other_errors)} values for {field_name}: {other_errors[:5]}{'...' if len(other_errors) > 5 else ''}")
+                    
+                    with st.expander(f"🔍 Troubleshooting {field_name} resolution"):
+                        st.write(f"**Referenced Object:** {referenced_object}")
+                        st.write(f"**Unresolved Values:** {other_errors}")
+                        st.write("**Possible solutions:**")
+                        st.write("1. Ensure the values exist in the referenced object")
+                        st.write("2. Check if the lookup field uses a different field (not Name/Code)")
+                        st.write("3. Verify spelling and exact match")
+                        st.write("4. Consider using the actual Salesforce record IDs instead")
+                
+                # Only block loading for pending selections (user needs to choose)
+                # Allow loading even with missing individual records (with warnings)
+                if pending_selections:
+                    st.info("🔄 **Ready to proceed once all parent selections are made**")
+                    st.info("The system will wait for your selections before continuing with data loading.")
+                    if return_stats:
+                        return None, lookup_fields, lookup_count_summary
+                    return None  # Return None to indicate selections needed
+        
+        if return_stats:
+            return df_resolved, lookup_fields, lookup_count_summary
+        return df_resolved
+        
+    except Exception as e:
+        st.error(f"❌ Error resolving lookup fields: {str(e)}")
+        if return_stats:
+            return df, {}, {}
+        return df
+
+
 def clean_dataframe_for_salesforce(df: pd.DataFrame) -> pd.DataFrame:
     """Clean DataFrame to make it compatible with Salesforce API (fixes NaN JSON error)"""
     df_cleaned = df.copy()
@@ -1882,57 +4683,87 @@ def create_standard_mapping_interface(csv_columns: list, sf_fields: list, sf_fie
     
     return field_mappings
 
-def create_custom_mapping_interface(csv_columns: list, sf_fields: list, sf_field_info: dict, existing_mappings: dict = None) -> dict:
+def create_custom_mapping_interface(csv_columns: list, sf_fields: list, sf_field_info: dict, existing_mappings: dict = None, sample_data: pd.DataFrame = None) -> dict:
     """Create custom mapping interface with full control"""
-    st.write("**✏️ Custom Field Mapping:**")
-    st.info("Manually configure each field mapping with full control")
+    st.markdown("## 🔗 CSV Column to Salesforce Field Mapping")
+    st.info("📋 Map your CSV columns to Salesforce Object fields for accurate data loading")
     
     if existing_mappings is None:
         existing_mappings = {}
     
     field_mappings = {}
-    sf_field_options = ["-- Skip Field --"] + sf_fields
     
-    # Create detailed mapping interface
-    for csv_col in csv_columns:
-        with st.container():
-            st.divider()
-            col1, col2 = st.columns([1, 1])
+    # Create Salesforce field options with labels
+    sf_field_options = ["⚠️ No mapping"] + [f"{field_name} ({sf_field_info.get(field_name, {}).get('label', field_name)})" for field_name in sf_fields]
+    sf_field_names = [""] + sf_fields
+    
+    st.markdown("**🎯 Column Mapping Configuration:**")
+    
+    # Create mapping table headers
+    col1, col2, col3 = st.columns([2, 3, 2])
+    
+    with col1:
+        st.markdown("**CSV Column**")
+    with col2:
+        st.markdown("**Maps to Salesforce Field**")
+    with col3:
+        st.markdown("**Sample Data**")
+    
+    st.divider()
+    
+    # Create detailed mapping interface for each column
+    for i, csv_col in enumerate(csv_columns):
+        col1, col2, col3 = st.columns([2, 3, 2])
+        
+        with col1:
+            st.write(f"**{csv_col}**")
+        
+        with col2:
+            # Get existing mapping or suggest new one
+            current_mapping = existing_mappings.get(csv_col, "")
             
-            with col1:
-                st.write(f"**CSV Column: {csv_col}**")
-                # Show column details
-                st.caption(f"Sample data preview available")
+            # Auto-suggest mapping if no existing mapping
+            if not current_mapping:
+                current_mapping = find_suggested_mapping(csv_col, sf_fields)
             
-            with col2:
-                # Get existing mapping or suggest new one
-                current_mapping = existing_mappings.get(csv_col, "-- Skip Field --")
-                
-                if current_mapping not in sf_field_options:
-                    # Find suggested mapping if current is not valid
-                    current_mapping = find_suggested_mapping(csv_col, sf_fields)
-                    if current_mapping not in sf_field_options:
-                        current_mapping = "-- Skip Field --"
-                
-                default_index = sf_field_options.index(current_mapping)
-                
-                mapped_field = st.selectbox(
-                    f"Map '{csv_col}' to Salesforce field:",
-                    options=sf_field_options,
-                    index=default_index,
-                    key=f"custom_mapping_{csv_col}",
-                    help=f"Select the Salesforce field to map '{csv_col}' to"
-                )
-                
-                field_mappings[csv_col] = mapped_field
-                
-                # Show field information
-                if mapped_field != "-- Skip Field --":
-                    sf_info = sf_field_info.get(mapped_field, {})
-                    st.success(f"✅ **{sf_info.get('label', mapped_field)}**")
-                    st.caption(f"Type: {sf_info.get('type', 'Unknown')} | Max Length: {sf_info.get('length', 'N/A')}")
-                else:
-                    st.warning("⏭️ Field will be skipped")
+            # Find index for current mapping
+            current_index = 0
+            if current_mapping and current_mapping in sf_field_names:
+                current_index = sf_field_names.index(current_mapping)
+            
+            selected_mapping = st.selectbox(
+                f"Field mapping for {csv_col}",
+                options=sf_field_options,
+                index=current_index,
+                key=f"custom_mapping_{i}_{csv_col}",
+                label_visibility="collapsed"
+            )
+            
+            # Store the mapping
+            if selected_mapping != "⚠️ No mapping":
+                field_name = selected_mapping.split(" (")[0]
+                field_mappings[csv_col] = field_name
+            else:
+                field_mappings[csv_col] = "-- Skip Field --"
+        
+        with col3:
+            # Show sample data if available
+            if sample_data is not None and csv_col in sample_data.columns:
+                try:
+                    # Get first non-null value as sample
+                    sample_series = sample_data[csv_col].dropna()
+                    if not sample_series.empty:
+                        sample_value = str(sample_series.iloc[0])
+                        # Truncate long values
+                        if len(sample_value) > 20:
+                            sample_value = sample_value[:20] + "..."
+                        st.write(f"`{sample_value}`")
+                    else:
+                        st.caption("No data")
+                except Exception:
+                    st.caption("No data")
+            else:
+                st.caption("No sample data")
     
     return field_mappings
 
@@ -2181,9 +5012,6 @@ def generate_retry_file(failed_records: list, target_object: str):
             st.success("✅ Retry file prepared! Fix the data issues and re-upload this file.")
     except Exception as e:
         st.error(f"❌ Error preparing retry file: {str(e)}")
-        st.success("✅ Retry file prepared for download! Fix the issues and try again.")
-    except Exception as e:
-        st.error(f"❌ Error preparing retry file: {str(e)}")
 
 def check_validation_status():
     """Check if user has completed validation for current org and objects"""
@@ -2222,7 +5050,277 @@ def check_validation_status():
             return True
         
         return recent_validation_found
-        
-    except Exception:
+    
+    except Exception as e:
         # If any error occurs, assume validation not completed
         return False
+
+
+def show_data_operations_help():
+    """Display help information for data operations"""
+    st.markdown("""
+    ###  Data Operations Help
+    
+    This section provides comprehensive data processing capabilities:
+    
+    ####  Basic Operations
+    - **Extract**: Pull data from Salesforce objects
+    - **Load**: Upload CSV files to Salesforce  
+    - **Transform**: Clean and prepare data for migration
+    - **SQL Migration**: Transfer data between SQL databases
+    - **Bulk Operations**: Handle large-scale data operations
+    
+    ####  Quick Start
+    1. Select your Salesforce org and objects
+    2. Choose your operation type (Extract/Load/SQL Migration/Bulk)
+    3. Upload data or configure extraction
+    4. Review and process your data
+    5. Monitor processing and download results
+    
+    For detailed documentation, check the Documentation folder.
+    """)
+
+
+def resolve_lookup_fields_with_mapping(sf_conn, df: pd.DataFrame, target_object: str, field_mappings: dict, return_stats: bool = False):
+    """Enhanced lookup field resolution with field mapping support
+    
+    Args:
+        sf_conn: Salesforce connection
+        df: DataFrame to process
+        target_object: Salesforce object name
+        field_mappings: Dict mapping CSV columns to Salesforce field names
+        return_stats: If True, returns (df, lookup_fields, lookup_counts) tuple
+        
+    Returns:
+        DataFrame or tuple based on return_stats parameter
+    """
+    df_resolved = df.copy()
+    lookup_count_summary = {}
+    
+    try:
+        # Get object metadata to identify lookup and picklist fields
+        object_desc = getattr(sf_conn, target_object).describe()
+        lookup_fields = {}
+        picklist_fields = {}
+        
+        # Create reverse mapping (Salesforce field -> CSV column)
+        reverse_mappings = {sf_field: csv_col for csv_col, sf_field in field_mappings.items()}
+        
+        # Find lookup and picklist fields using field mappings
+        for field in object_desc['fields']:
+            field_name = field['name']
+            
+            # Check if this Salesforce field is mapped to a CSV column
+            if field_name in reverse_mappings:
+                csv_column = reverse_mappings[field_name]
+                
+                if field['type'] == 'reference':
+                    # This is a lookup field that's mapped
+                    referenced_objects = field.get('referenceTo', [])
+                    if referenced_objects:
+                        lookup_fields[csv_column] = {
+                            'referenced_object': referenced_objects[0],  # Take first referenced object
+                            'label': field.get('label', field_name),
+                            'sf_field_name': field_name
+                        }
+                
+                elif field['type'] in ['picklist', 'multipicklist']:
+                    # This is a picklist field that's mapped
+                    picklist_values = field.get('picklistValues', [])
+                    if picklist_values:
+                        api_names = {}
+                        labels = {}
+                        for pv in picklist_values:
+                            if not pv.get('inactive', False):
+                                api_name = pv.get('valueName', pv.get('value', ''))
+                                label = pv.get('label', pv.get('value', ''))
+                                api_names[api_name] = label
+                                labels[label] = api_name
+                        
+                        picklist_fields[csv_column] = {
+                            'api_names': api_names,  # API name -> Label mapping
+                            'labels': labels,        # Label -> API name mapping
+                            'type': field['type'],
+                            'sf_field_name': field_name
+                        }
+        
+        # Display detected fields
+        if lookup_fields or picklist_fields:
+            st.success(f"✅ **Field Detection Results:**")
+            if lookup_fields:
+                st.info(f"🔗 **Lookup fields detected:** {len(lookup_fields)} field(s)")
+                for csv_col, field_info in lookup_fields.items():
+                    st.write(f"   • {csv_col} → {field_info['sf_field_name']} (references {field_info['referenced_object']})")
+            
+            if picklist_fields:
+                st.info(f"📋 **Picklist fields detected:** {len(picklist_fields)} field(s)")
+                for csv_col, field_info in picklist_fields.items():
+                    st.write(f"   • {csv_col} → {field_info['sf_field_name']} ({len(field_info['api_names'])} options)")
+        
+        # Process picklist fields first - validate API names
+        if picklist_fields:
+            st.info(f"🎯 Validating {len(picklist_fields)} picklist field(s)...")
+            
+            for csv_column, field_info in picklist_fields.items():
+                st.info(f"🔍 Validating picklist API names for {csv_column} → {field_info['sf_field_name']}")
+                
+                # Get unique values from the data (should be API names)
+                unique_values = df_resolved[csv_column].dropna().unique()
+                valid_api_names = list(field_info['api_names'].keys())
+                
+                # Validate each value
+                invalid_values = []
+                valid_count = 0
+                
+                for value in unique_values:
+                    value_str = str(value).strip()
+                    if value_str and value_str not in valid_api_names:
+                        invalid_values.append(value_str)
+                    elif value_str:
+                        valid_count += 1
+                
+                if invalid_values:
+                    st.error(f"🚫 **INVALID PICKLIST API NAMES FOUND**")
+                    st.error(f"**CSV Column:** {csv_column}")
+                    st.error(f"**Salesforce Field:** {field_info['sf_field_name']}")
+                    st.error(f"**Invalid values:** {', '.join(invalid_values)}")
+                    st.error(f"**Valid API names:** {', '.join(valid_api_names[:10])}{'...' if len(valid_api_names) > 10 else ''}")
+                    
+                    with st.expander(f"🔧 Fix Picklist Values for {csv_column}"):
+                        st.write("**Your file contains invalid picklist API names.**")
+                        st.write("")
+                        st.write("**📝 Requirements:**")
+                        st.write(f"• File should contain API names (not labels)")
+                        st.write(f"• Valid API names for {field_info['sf_field_name']}: {', '.join(valid_api_names[:10])}{'...' if len(valid_api_names) > 10 else ''}")
+                        st.write("")
+                        st.write("**✅ Solution:**")
+                        st.write("1. **Update your data file** to use valid API names")
+                        st.write("2. **Replace invalid values** with correct API names")
+                        st.write("3. **Re-upload the corrected file**")
+                        
+                        st.info("💡 **Note:** API names are used for data loading, but Salesforce UI will display the corresponding labels")
+                    
+                    return None  # Block processing due to invalid picklist values
+                
+                else:
+                    st.success(f"\u2705 All {valid_count} picklist values are valid API names for {csv_column}")
+        
+        # Process lookup fields with field mapping
+        if not lookup_fields:
+            if not picklist_fields:
+                st.info("📝 No lookup or picklist fields detected in your field mappings.")
+                st.info("💡 Make sure you've mapped CSV columns to Salesforce lookup/picklist fields")
+            if return_stats:
+                return df_resolved, {}, {}
+            return df_resolved
+        
+        st.info(f"🔍 Processing {len(lookup_fields)} lookup field(s)...")
+        
+        # Resolve each lookup field using mapped column names
+        for csv_column, field_info in lookup_fields.items():
+            referenced_object = field_info['referenced_object']
+            sf_field_name = field_info['sf_field_name']
+            
+            st.info(f"🔄 Resolving {csv_column} → {sf_field_name} → {referenced_object}")
+            
+            # Check if parent object has data
+            try:
+                parent_count_query = f"SELECT COUNT(Id) FROM {referenced_object}"
+                parent_count_result = sf_conn.query(parent_count_query)
+                parent_record_count = parent_count_result['records'][0]['expr0'] if parent_count_result['records'] else 0
+                
+                if parent_record_count == 0:
+                    st.error(f"❌ **CRITICAL ERROR - No parent records found**")
+                    st.error(f"**Parent Object:** {referenced_object}")
+                    st.error(f"**Issue:** The parent object {referenced_object} contains no records")
+                    st.error(f"**Impact:** Cannot resolve lookup values for {csv_column}")
+                    
+                    with st.expander(f"🔧 Fix Missing Parent Records"):
+                        st.write("**The parent object has no data to reference.**")
+                        st.write("")
+                        st.write("**✅ Solutions:**")
+                        st.write(f"1. **Load parent data first** - Insert records into {referenced_object}")
+                        st.write(f"2. **Verify object name** - Ensure {referenced_object} is the correct parent object")
+                        st.write(f"3. **Check permissions** - Verify you have access to {referenced_object} records")
+                        st.write("")
+                        st.write("**📝 Recommended Order:**")
+                        st.write(f"1. Load data into {referenced_object} first")
+                        st.write(f"2. Then load data into {target_object} with lookup references")
+                    
+                    return None
+                
+                else:
+                    st.success(f"✅ Found {parent_record_count:,} records in {referenced_object}")
+                    
+            except Exception as count_error:
+                st.warning(f"⚠️ Could not verify parent object data: {str(count_error)}")
+            
+            # Get unique values to resolve from the CSV column
+            unique_values = df_resolved[csv_column].dropna().unique()
+            
+            if len(unique_values) == 0:
+                st.info(f"📝 No values to resolve for {csv_column}")
+                continue
+                
+            # Create lookup mapping
+            lookup_mapping = {}
+            unresolved_values = []
+            
+            for value in unique_values:
+                if pd.isna(value) or str(value).strip() == '':
+                    continue
+                    
+                escaped_value = str(value).replace("'", "\\'")
+                
+                # Try multiple fields that might contain the lookup value
+                possible_fields = ['Name', 'Code__c', 'External_Id__c', 'Code', 'Number__c']
+                record_found = False
+                
+                for lookup_field in possible_fields:
+                    try:
+                        # Query the referenced object
+                        soql = f"SELECT Id, Name FROM {referenced_object} WHERE {lookup_field} = '{escaped_value}'"
+                        result = sf_conn.query(soql)
+                        
+                        if result['totalSize'] > 0:
+                            record_id = result['records'][0]['Id']
+                            record_name = result['records'][0].get('Name', str(value))
+                            lookup_mapping[value] = record_id
+                            record_found = True
+                            st.success(f"✅ Resolved '{value}' → {record_name} ({record_id})")
+                            break
+                    except Exception as e:
+                        # Try next field
+                        continue
+                
+                if not record_found:
+                    unresolved_values.append(f"{value} (MISSING PARENT RECORD)")
+            
+            # Apply the mapping to the CSV column
+            if lookup_mapping:
+                df_resolved[csv_column] = df_resolved[csv_column].map(lookup_mapping).fillna(df_resolved[csv_column])
+                resolved_count = sum(1 for v in df_resolved[csv_column] if v in lookup_mapping.values())
+                st.success(f"📊 Resolved {len(lookup_mapping)} values for {csv_column} (affecting {resolved_count} records)")
+                
+                # Track lookup counts for reporting
+                lookup_count_summary[csv_column] = len(lookup_mapping)
+            
+            # Report unresolved values
+            if unresolved_values:
+                st.warning(f"⚠️ **{len(unresolved_values)} values could not be resolved for {csv_column}:**")
+                for unresolved in unresolved_values[:10]:  # Show first 10
+                    st.write(f"   • {unresolved}")
+                if len(unresolved_values) > 10:
+                    st.write(f"   ... and {len(unresolved_values) - 10} more")
+        
+        # Return results
+        if return_stats:
+            return df_resolved, lookup_fields, lookup_count_summary
+        return df_resolved
+        
+    except Exception as e:
+        st.error(f"❌ Error in lookup field resolution: {str(e)}")
+        st.exception(e)
+        if return_stats:
+            return df, {}, {}
+        return df

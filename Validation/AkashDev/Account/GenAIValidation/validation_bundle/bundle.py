@@ -276,6 +276,77 @@ def validate_PhoneRule(df):
         print(f"Warning: Error in validation rule 'PhoneRule': {e}")
         return pd.Series([False] * len(df))  # Mark all as invalid on error
 
+def validate_phone_no_only_10_digit(df):
+    """
+    Validation Rule: phone_no_only_10_digit
+    Salesforce Object: Account
+    Primary Field: Id
+    
+    
+    Original Apex Formula:
+    AND(
+  NOT(ISBLANK(Phone)),
+  NOT(REGEX(Phone, "^[0-9]{10}$"))
+)
+    
+    Args:
+        df (pandas.DataFrame): Input DataFrame to validate
+    Returns:
+        pandas.Series: Boolean mask indicating validation results (True = valid, False = invalid)
+    """
+    # Primary Field: Id
+    
+    # Import required modules
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, date
+    import math
+    
+    try:
+        # Ensure all required columns exist
+        required_columns = []
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            print(f"Warning: Missing columns for validation rule 'phone_no_only_10_digit': {missing_columns}")
+            return pd.Series([False] * len(df))  # Mark all as invalid if columns missing
+        
+        # Fill NaN values to avoid errors
+        df_clean = df.fillna('')
+        
+        # Apply validation logic
+        validation_result = _and( _not(_is_blank(df['Phone'])), _not(df['REGEX'](df['Phone'], "^[0-9]{10}$")) )
+        
+        # Ensure result is a boolean Series
+        if not isinstance(validation_result, pd.Series):
+            validation_result = pd.Series([bool(validation_result)] * len(df))
+        
+        # Salesforce validation rules define ERROR conditions (when validation should FAIL)
+        # If the formula evaluates to True = Error condition = Record is INVALID
+        # If the formula evaluates to False = No error = Record is VALID
+        # So we need to invert: True becomes False (invalid), False becomes True (valid)
+        
+        # Debug: Print sample of validation logic for troubleshooting
+        if len(df) > 0:
+            sample_value = validation_result.iloc[0] if hasattr(validation_result, 'iloc') else validation_result
+            print(f"DEBUG - Rule 'phone_no_only_10_digit': Formula result for first record = {sample_value} (True=Error/Invalid, False=NoError/Valid)")
+            
+            # Additional debugging for ISBLANK scenarios
+            if '_is_blank' in str(validation_result):
+                sample_field_value = df_clean.iloc[0].get('Id', 'COLUMN_NOT_FOUND') if len(df_clean) > 0 else 'NO_DATA'
+                print(f"DEBUG - Rule 'phone_no_only_10_digit': Field 'Id' value for first record = '{sample_field_value}'")
+                print(f"DEBUG - Rule 'phone_no_only_10_digit': Available columns = {list(df.columns)}")
+                if 'Id' not in df.columns:
+                    print(f"WARNING - Rule 'phone_no_only_10_digit': Column 'Id' not found in data! This will cause validation to fail.")
+        
+        return ~validation_result
+        
+    except KeyError as e:
+        print(f"Warning: Column {e} not found in DataFrame for validation rule 'phone_no_only_10_digit'")
+        return pd.Series([False] * len(df))  # Mark all as invalid if column missing
+    except Exception as e:
+        print(f"Warning: Error in validation rule 'phone_no_only_10_digit': {e}")
+        return pd.Series([False] * len(df))  # Mark all as invalid on error
+
 def validate_record(row):
     '''Validate a single record (row) and return result dict'''
     import pandas as pd
@@ -313,6 +384,21 @@ def validate_record(row):
         print(f"ERROR validate_record: validate_PhoneRule failed with error: {str(e)}")
         rule_results['validate_PhoneRule'] = False
         errors.append(f'validate_PhoneRule (error: {str(e)})')
+    try:
+        print(f"DEBUG validate_record: Calling validate_phone_no_only_10_digit on row data")
+        func_result = validate_phone_no_only_10_digit(df)
+        if hasattr(func_result, 'iloc'):
+            rule_results['validate_phone_no_only_10_digit'] = bool(func_result.iloc[0])
+        else:
+            rule_results['validate_phone_no_only_10_digit'] = bool(func_result)
+        print(f"DEBUG validate_record: validate_phone_no_only_10_digit returned {rule_results['validate_phone_no_only_10_digit']}")
+        if not rule_results['validate_phone_no_only_10_digit']:
+            errors.append('validate_phone_no_only_10_digit')
+            print(f"DEBUG validate_record: Added validate_phone_no_only_10_digit to errors list")
+    except Exception as e:
+        print(f"ERROR validate_record: validate_phone_no_only_10_digit failed with error: {str(e)}")
+        rule_results['validate_phone_no_only_10_digit'] = False
+        errors.append(f'validate_phone_no_only_10_digit (error: {str(e)})')
     if errors:
         is_valid = False
         print(f"DEBUG validate_record: Record INVALID due to errors: {errors}")

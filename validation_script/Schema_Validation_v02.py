@@ -200,16 +200,30 @@ for field in unique_fields:
         if duplicates.any():
             data_df.loc[duplicates, 'Issues'] = data_df.loc[duplicates, 'Issues'] + f"Duplicate value in unique field '{field}'; "
 
-# Validation 6: Check picklist values
+# Validation 6: Check picklist values (API names)
 picklist_fields = mapping_df[mapping_df['Type'] == 'picklist'][['Field Name', 'Picklist Values']].dropna()
 for _, row in picklist_fields.iterrows():
     field = row['Field Name']
-    valid_values = [val.strip() for val in row['Picklist Values'].split(',') if val.strip()]
+    # Valid API names that should be present in uploaded files
+    valid_api_names = [val.strip() for val in row['Picklist Values'].split(',') if val.strip()]
+    
     if field in data_df.columns:
-        # Check if values in data.csv are in the valid picklist values (ignoring NaN)
-        invalid_values = data_df[field].apply(lambda x: str(x).strip() not in valid_values if pd.notna(x) and str(x).strip() != '' else False)
+        # Check if values in data file match valid picklist API names (ignoring NaN)
+        invalid_values = data_df[field].apply(
+            lambda x: str(x).strip() not in valid_api_names 
+            if pd.notna(x) and str(x).strip() != '' 
+            else False
+        )
+        
         if invalid_values.any():
-            data_df.loc[invalid_values, 'Issues'] = data_df.loc[invalid_values, 'Issues'] + f"Invalid picklist value in '{field}'; "
+            # Get the invalid values for better error reporting
+            invalid_vals = data_df.loc[invalid_values, field].unique()
+            invalid_vals_str = ", ".join([str(v) for v in invalid_vals if pd.notna(v)])
+            
+            data_df.loc[invalid_values, 'Issues'] = (
+                data_df.loc[invalid_values, 'Issues'] + 
+                f"Invalid picklist API name in '{field}' (found: {invalid_vals_str}, valid: {', '.join(valid_api_names)}); "
+            )
 
 # Clean up Issues column (remove trailing semicolons and spaces)
 data_df['Issues'] = data_df['Issues'].str.rstrip('; ')
