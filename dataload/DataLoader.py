@@ -139,9 +139,9 @@ elif data_source == "file":
         exit()
     try:
         if file.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(file)
+            df = pd.read_excel(file, dtype=str)
         elif file.endswith('.csv'):
-            df = pd.read_csv(file)
+            df = pd.read_csv(file, dtype=str)
         else:
             raise ValueError("Unsupported file format. Please select a CSV or Excel file.")
         
@@ -286,6 +286,73 @@ selected_object = select_salesforce_object(filtered_objects)
 if not selected_object or selected_object not in filtered_objects:
     raise ValueError("No valid Salesforce object selected.")
 print(f"Selected Salesforce object: {selected_object}")
+
+# --- Step 4.5: CRITICAL - Validate Master-Detail Relationships ---
+# Master-Detail relationships are MANDATORY and blocking
+# If any parent records are missing, data load will FAIL
+print("\n" + "="*80)
+print("MASTER-DETAIL RELATIONSHIP VALIDATION")
+print("="*80)
+
+try:
+    from dataload.master_detail_validator import (
+        identify_master_detail_fields,
+        validate_all_master_detail_relationships,
+        generate_master_detail_validation_report,
+        check_cascading_delete_warnings
+    )
+    
+    # Check if object has Master-Detail relationships
+    md_fields = identify_master_detail_fields(sf_conn, selected_object)
+    
+    if md_fields:
+        print(f"\n🔗 Found {len(md_fields)} Master-Detail relationship(s)")
+        
+        # Run comprehensive validation
+        is_valid, validation_summary = validate_all_master_detail_relationships(
+            sf_conn=sf_conn,
+            data_df=df_mapped,
+            object_name=selected_object
+        )
+        
+        # Print validation report
+        report = generate_master_detail_validation_report(validation_summary)
+        print(report)
+        
+        # Show cascading delete warnings
+        warnings = check_cascading_delete_warnings(sf_conn, selected_object, md_fields)
+        print("\n⚠️  CASCADING DELETE WARNINGS:")
+        for warning in warnings:
+            print(warning)
+        
+        # BLOCK if validation failed
+        if not is_valid:
+            print("\n" + "!"*80)
+            print("❌ CANNOT PROCEED - MASTER-DETAIL VALIDATION FAILED")
+            print("!"*80)
+            tkinter.messagebox.showerror(
+                "Master-Detail Validation Failed",
+                "Cannot proceed with data load.\n\n"
+                f"Master-Detail relationships are MANDATORY and blocking.\n"
+                f"Missing {validation_summary['blocking_issues']} parent record(s).\n\n"
+                "Please ensure all parent records exist in Salesforce before loading."
+            )
+            raise RuntimeError("Master-Detail validation failed - data load blocked")
+    else:
+        print("✅ No Master-Detail relationships found for this object")
+
+except RuntimeError as e:
+    if "validation failed" in str(e).lower():
+        raise
+    print(f"❌ Error during Master-Detail validation: {str(e)}")
+    tkinter.messagebox.showerror(
+        "Validation Error",
+        f"Error validating Master-Detail relationships:\n{str(e)}"
+    )
+    raise
+except ImportError:
+    # master_detail_validator module might not be available in older installs
+    print("⚠️  Master-Detail validation module not available - skipping validation")
 
 # --- Step 5: Prepare Data and Perform Load ---
 
@@ -1010,6 +1077,76 @@ if skip_columns:
     print(f"Remaining columns for loading: {len(remaining_columns)} ({', '.join(remaining_columns)})")
 else:
     print("User chose to load all columns (no columns skipped)")
+
+# --- LOOKUP RESOLUTION ---
+print("\n" + "="*80)
+print("RESOLVING LOOKUP FIELDS")
+print("="*80)
+
+try:
+    from dataload.lookup_resolver import get_lookup_fields_for_object, resolve_lookup_value
+    
+    # Get all lookup fields for this object
+    lookup_fields = get_lookup_fields_for_object(sf_conn, selected_object)
+    
+    if lookup_fields:
+        print(f"Found {len(lookup_fields)} lookup field(s) in {selected_object}")
+        
+        # For each lookup field in the dataframe, resolve values to Salesforce IDs
+        for column in df_mapped.columns:
+            # Check if this column corresponds to a lookup field
+            lookup_info = None
+            for field_name, field_data in lookup_fields.items():
+                if field_name == column:
+                    lookup_info = field_data
+                    break
+            
+            if not lookup_info:
+                continue
+            
+            parent_object = lookup_info['reference_to'][0]
+            print(f"\n🔗 {column} → {parent_object}")
+            
+            # Resolve each non-NULL value in this column
+            resolved_count = 0
+            failed_count = 0
+            
+            for idx, value in enumerate(df_mapped[column]):
+                # Skip NULL values
+                if pd.isna(value) or str(value).strip() == '':
+                    continue
+                
+                value_str = str(value).strip()
+                
+                # Try to resolve this value
+                resolved_id, error = resolve_lookup_value(
+                    sf_conn=sf_conn,
+                    parent_object=parent_object,
+                    value=value_str,
+                    source_object=selected_object,
+                    lookup_field_name=column
+                )
+                
+                if error:
+                    print(f"   ❌ Row {idx + 1}: '{value_str}' → ERROR: {error}")
+                    failed_count += 1
+                    # Stop if any lookup fails
+                    raise ValueError(f"Lookup resolution failed at row {idx + 1}: {error}")
+                else:
+                    # Update dataframe with resolved ID
+                    df_mapped.at[idx, column] = resolved_id
+                    resolved_count += 1
+            
+            if resolved_count > 0:
+                print(f"   ✅ Resolved {resolved_count} values")
+    else:
+        print("✅ No lookup fields found - proceeding with data as-is")
+
+except ImportError:
+    print("⚠️  Lookup resolver module not found - proceeding without lookup resolution")
+except Exception as e:
+    print(f"❌ Error during lookup resolution: {str(e)}")
+    raise
 
 # --- Batch Size and Parallel Processing Selection ---
 batch_size = 10000  # Default batch size

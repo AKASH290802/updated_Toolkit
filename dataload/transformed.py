@@ -235,6 +235,69 @@ if not selected_object or selected_object not in filtered_objects:
     raise ValueError("No valid Salesforce object selected.")
 print(f"Selected Salesforce object: {selected_object}")
 
+# --- Step 5.5: CRITICAL - Validate Master-Detail Relationships ---
+# Master-Detail relationships are MANDATORY and blocking
+# If any parent records are missing, data load will FAIL
+print("\n" + "="*80)
+print("MASTER-DETAIL RELATIONSHIP VALIDATION")
+print("="*80)
+
+from dataload.master_detail_validator import (
+    identify_master_detail_fields,
+    validate_all_master_detail_relationships,
+    generate_master_detail_validation_report,
+    check_cascading_delete_warnings
+)
+
+try:
+    # Check if object has Master-Detail relationships
+    md_fields = identify_master_detail_fields(sf_conn, selected_object)
+    
+    if md_fields:
+        print(f"\n🔗 Found {len(md_fields)} Master-Detail relationship(s)")
+        
+        # Run comprehensive validation
+        is_valid, validation_summary = validate_all_master_detail_relationships(
+            sf_conn=sf_conn,
+            data_df=df_mapped,
+            object_name=selected_object
+        )
+        
+        # Print validation report
+        report = generate_master_detail_validation_report(validation_summary)
+        print(report)
+        
+        # Show cascading delete warnings
+        warnings = check_cascading_delete_warnings(sf_conn, selected_object, md_fields)
+        print("\n⚠️  CASCADING DELETE WARNINGS:")
+        for warning in warnings:
+            print(warning)
+        
+        # BLOCK if validation failed
+        if not is_valid:
+            print("\n" + "!"*80)
+            print("❌ CANNOT PROCEED - MASTER-DETAIL VALIDATION FAILED")
+            print("!"*80)
+            tkinter.messagebox.showerror(
+                "Master-Detail Validation Failed",
+                "Cannot proceed with data load.\n\n"
+                f"Master-Detail relationships are MANDATORY and blocking.\n"
+                f"Missing {validation_summary['blocking_issues']} parent record(s).\n\n"
+                "Please ensure all parent records exist in Salesforce before loading."
+            )
+            raise RuntimeError("Master-Detail validation failed - data load blocked")
+    else:
+        print("✅ No Master-Detail relationships found for this object")
+
+except Exception as e:
+    print(f"❌ Error during Master-Detail validation: {str(e)}")
+    if "validation failed" not in str(e).lower():
+        tkinter.messagebox.showerror(
+            "Validation Error",
+            f"Error validating Master-Detail relationships:\n{str(e)}"
+        )
+        raise
+
 # --- Step 6: Validate Lookup Fields ---
 # Get the object's field metadata
 object_metadata = getattr(sf_conn, selected_object).describe()
