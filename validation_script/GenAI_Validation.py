@@ -310,6 +310,24 @@ class SalesforceFormulaConverter:
         """Convert field references for row-based validation functions"""
         print(f"DEBUG: Starting field reference conversion for: {formula}")
         
+        # FIRST: Extract and protect quoted strings to preserve string literals
+        quoted_strings = {}
+        quote_placeholder_count = 0
+        
+        # Extract all quoted strings (both single and double quotes) and replace with placeholders
+        def protect_quoted_string(match):
+            nonlocal quote_placeholder_count
+            quoted_val = match.group(0)
+            placeholder = f"__QUOTED_STRING_{quote_placeholder_count}__"
+            quoted_strings[placeholder] = quoted_val
+            quote_placeholder_count += 1
+            return placeholder
+        
+        # Protect quoted strings
+        formula = re.sub(r"'[^']*'|\"[^\"]*\"", protect_quoted_string, formula)
+        print(f"DEBUG: Protected quoted strings: {quoted_strings}")
+        print(f"DEBUG: After protecting quotes: {formula}")
+        
         # First handle Salesforce-specific references
         # Remove or simplify permission references (always assume True for validation)
         original_formula = formula
@@ -325,27 +343,56 @@ class SalesforceFormulaConverter:
         if formula != original_formula:
             print(f"DEBUG: After relationship field conversion: {formula}")
         
-        # Use a simpler, more reliable approach for field references
-        # Split on whitespace and process each token
-        import re
-        
-        # Find all potential field names (not inside quotes, not functions)
-        # This regex finds words that could be field names
-        tokens = re.findall(r"'[^']*'|\"[^\"]*\"|\b[A-Za-z_][A-Za-z0-9_]*\b", formula)
+        # Now find and replace field references
+        # Pattern to find potential field names (but not inside placeholders)
+        tokens = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', formula)
         
         result_formula = formula
         
-        for token in tokens:
-            # Skip quoted strings
-            if token.startswith(("'", '"')):
-                continue
-                
+        for token in set(tokens):  # Use set to avoid duplicate replacements
             # Skip function names and keywords
             if token.upper() in self.function_mappings or token.upper() in ['AND', 'OR', 'NOT', 'IF', 'TRUE', 'FALSE']:
                 continue
                 
             # Skip common keywords
             if token.lower() in ['true', 'false', 'null']:
+                continue
+            
+            # Skip helper function names (Python equivalents that start with _)
+            if token.startswith('_') and token in ['_ispickval', '_is_blank', '_is_null', '_to_number', 
+                                                     '_trim', '_left', '_right', '_mid', '_find', '_contains',
+                                                     '_today', '_now', '_year', '_month', '_day', '_and', '_or',
+                                                     '_not', '_if', '_case', '_begins_with', '_ends_with',
+                                                     '_ceiling', '_floor']:
+                continue
+            
+            # Skip placeholder names
+            if 'QUOTED_STRING' in token:
+                continue
+            
+            # Define standard Salesforce fields that should NOT be treated as dynamic fields
+            standard_fields = {
+                'Id', 'Name', 'Type', 'Status', 'CreatedDate', 'LastModifiedDate',
+                'OwnerId', 'Owner', 'IsDeleted', 'CreatedById', 'LastModifiedById',
+                'SystemModstamp', 'Email', 'Phone', 'Description', 'RecordType',
+                'Industry', 'Website', 'BillingStreet', 'BillingCity', 'BillingState',
+                'BillingPostalCode', 'BillingCountry', 'ShippingStreet', 'ShippingCity',
+                'ShippingState', 'ShippingPostalCode', 'ShippingCountry', 'Amount',
+                'CloseDate', 'StageName', 'Probability', 'LeadSource', 'Rating',
+                'AnnualRevenue', 'NumberOfEmployees', 'Fax', 'MobilePhone',
+                'Department', 'Title', 'MasterRecordId', 'IsCompetitor'
+            }
+            
+            # Skip if it's a standard field or permission/user reference
+            if token in standard_fields:
+                continue
+            
+            # Skip permission and user references (they can't be safely accessed)
+            if token.startswith('$Permission.') or token.startswith('$User.'):
+                # Replace with safe fallback
+                safe_get_replacement = "''"  # Empty string for permissions/users
+                pattern = r'\b' + re.escape(token) + r'\b'
+                result_formula = re.sub(pattern, safe_get_replacement, result_formula)
                 continue
             
             # Check if this looks like a Salesforce field
@@ -357,12 +404,12 @@ class SalesforceFormulaConverter:
             # Relationship fields end with __r
             elif token.endswith('__r'):
                 is_field = True
-            # Field names with underscores (like WOD_2__Something)
+            # Field names with underscores (likely custom)
             elif '_' in token and len(token) > 2:
                 is_field = True
             # Standard fields that start with uppercase
-            elif token[0].isupper() and len(token) > 1:
-                # Check if it's likely a field name (not just a random word)
+            elif token[0].isupper() and len(token) > 1 and token not in standard_fields:
+                # Check if it's likely a field name (has underscores or is reasonably long)
                 if any(char in token for char in ['_']) or len(token) > 3:
                     is_field = True
             
@@ -376,12 +423,29 @@ class SalesforceFormulaConverter:
                 if old_formula != result_formula:
                     print(f"DEBUG: Converted field '{token}' -> 'safe_get('{token}')'")
         
+        # FINALLY: Restore the protected quoted strings
+        for placeholder, original_value in quoted_strings.items():
+            result_formula = result_formula.replace(placeholder, original_value)
+            print(f"DEBUG: Restored {placeholder} -> {original_value}")
+        
         print(f"DEBUG: Final field conversion result: {result_formula}")
         return result_formula
     
     def _convert_functions(self, formula: str) -> str:
         """Convert Salesforce functions to Python equivalents"""
-        for sf_func, py_func in self.function_mappings.items():
+        # Add additional function mappings for missing Salesforce functions
+        extended_mappings = self.function_mappings.copy()
+        extended_mappings.update({
+            'REGEX': '_regex',
+            'MOD': '_mod',
+            'SUBSTITUTE': '_substitute',
+            'CONCATENATE': '_concatenate',
+            'DATEVALUE': '_datevalue',
+            'INCLUDES': '_includes',
+            'EXCLUDES': '_excludes',
+        })
+        
+        for sf_func, py_func in extended_mappings.items():
             # Replace function calls (case insensitive)
             pattern = rf'\b{sf_func}\s*\('
             replacement = f'{py_func}('
@@ -391,20 +455,26 @@ class SalesforceFormulaConverter:
     
     def _convert_operators(self, formula: str) -> str:
         """Convert Salesforce operators to Python operators"""
-        # Process operators in a specific order to avoid conflicts
-        # First handle compound operators
-        formula = formula.replace('<>', ' != ')
-        formula = formula.replace('&&', ' and ')
-        formula = formula.replace('||', ' or ')
+        # Process operators in order: compound first, then single
         
-        # Handle single equals more carefully - only replace if not already ==
-        # Use regex to avoid replacing == with = == =
-        import re
-        # Replace single = that's not already part of == or !=
+        # Compound operators (must be done first to avoid partial replacements)
+        formula = re.sub(r'<>', ' != ', formula)
+        formula = re.sub(r'&&', ' and ', formula)
+        formula = re.sub(r'\|\|', ' or ', formula)
+        
+        # Less/Greater than or equal
+        formula = re.sub(r'<=', ' <= ', formula)
+        formula = re.sub(r'>=', ' >= ', formula)
+        
+        # Less/Greater than (single)
+        formula = re.sub(r'(?<![<>!])\s*<\s*(?!=)', ' < ', formula)
+        formula = re.sub(r'(?<![<>!])\s*>\s*(?!=)', ' > ', formula)
+        
+        # Single equals (not already ==)
         formula = re.sub(r'(?<![=!<>])\s*=\s*(?!=)', ' == ', formula)
         
-        # Handle NOT operator carefully
-        formula = re.sub(r'\b!\s*(?!=)', ' not ', formula)
+        # NOT operator (! but not !=)
+        formula = re.sub(r'!(?!=)', ' not ', formula)
         
         return formula
     
@@ -420,10 +490,31 @@ class SalesforceFormulaConverter:
     def _postprocess_formula_for_validation(self, formula: str) -> str:
         """Final processing for validation context - no DataFrame wrapping needed"""
         # Convert boolean literals to proper Python case
-        formula = re.sub(r'\btrue\b', 'True', formula, flags=re.IGNORECASE)
-        formula = re.sub(r'\bfalse\b', 'False', formula, flags=re.IGNORECASE)
+        # BUT: Be careful not to replace inside string literals
         
-        return formula.strip()
+        # Protect quoted strings first
+        quoted_strings = {}
+        quote_placeholder_count = 0
+        
+        def protect_quoted_string(match):
+            nonlocal quote_placeholder_count
+            quoted_val = match.group(0)
+            placeholder = f"__QUOTED_STRING_{quote_placeholder_count}__"
+            quoted_strings[placeholder] = quoted_val
+            quote_placeholder_count += 1
+            return placeholder
+        
+        formula_protected = re.sub(r"'[^']*'|\"[^\"]*\"", protect_quoted_string, formula)
+        
+        # Now convert boolean values
+        formula_protected = re.sub(r'\btrue\b', 'True', formula_protected, flags=re.IGNORECASE)
+        formula_protected = re.sub(r'\bfalse\b', 'False', formula_protected, flags=re.IGNORECASE)
+        
+        # Restore quoted strings
+        for placeholder, original_value in quoted_strings.items():
+            formula_protected = formula_protected.replace(placeholder, original_value)
+        
+        return formula_protected.strip()
     
     def generate_helper_functions(self) -> str:
         """Generate Python helper functions for Salesforce functions"""
@@ -562,6 +653,48 @@ def _floor(number):
     if hasattr(number, 'apply'):
         return number.apply(math.floor)
     return math.floor(number) if number else 0
+
+def _mod(dividend, divisor):
+    """Salesforce MOD function"""
+    if hasattr(dividend, 'apply'):
+        return dividend.apply(lambda x: x % divisor if divisor else 0)
+    return int(dividend) % int(divisor) if dividend and divisor else 0
+
+def _regex(text, pattern):
+    """Salesforce REGEX function - checks if text matches pattern"""
+    import re as regex_module
+    if hasattr(text, 'str'):
+        return text.str.contains(pattern, regex=True, na=False)
+    return bool(regex_module.search(pattern, str(text))) if text else False
+
+def _substitute(text, search_text, replace_text):
+    """Salesforce SUBSTITUTE function - replaces text"""
+    if hasattr(text, 'str'):
+        return text.str.replace(search_text, replace_text)
+    return str(text).replace(search_text, replace_text) if text else ''
+
+def _concatenate(*args):
+    """Salesforce CONCATENATE function - joins strings"""
+    return ''.join(str(arg) for arg in args if arg is not None)
+
+def _datevalue(date_string):
+    """Salesforce DATEVALUE function - converts string to date"""
+    try:
+        return pd.to_datetime(date_string)
+    except:
+        return None
+
+def _includes(field_value, search_value):
+    """Salesforce INCLUDES function for multi-select picklists"""
+    if hasattr(field_value, 'str'):
+        return field_value.str.contains(search_value, na=False)
+    return search_value in str(field_value) if field_value else False
+
+def _excludes(field_value, search_value):
+    """Salesforce EXCLUDES function for multi-select picklists"""
+    if hasattr(field_value, 'str'):
+        return ~field_value.str.contains(search_value, na=True)
+    return search_value not in str(field_value) if field_value else True
 '''
 
     def convert_formula_to_python_function(self, formula: str, function_name: str, rule_name: str, error_message: str) -> str:
@@ -1405,16 +1538,25 @@ def build_function_code(name, formula, field, obj):
         field_comment = f"# Field: {primary_field} (No formula provided - using default ISBLANK check)"
     
     # Generate the function with helper methods
+    # Build field_names string safely to avoid f-string issues
+    field_names_str = str(field_names)
+    additional_fields_str = ", ".join(field_names[1:]) if len(field_names) > 1 else ""
+    obj_str = obj if obj and obj.lower() != 'nan' else 'Not specified'
+    formula_str = formula if formula and formula.lower() != 'nan' else 'Not specified'
+    
+    # Escape curly braces in docstring to avoid f-string conflicts
+    docstring_additional = f"Additional Fields: {additional_fields_str}" if additional_fields_str else ""
+    
     return f'''
 def {func_name}(df):
     """
     Validation Rule: {name}
-    Salesforce Object: {obj if obj and obj.lower() != 'nan' else 'Not specified'}
+    Salesforce Object: {obj_str}
     Primary Field: {primary_field}
-    {"Additional Fields: " + ", ".join(field_names[1:]) if len(field_names) > 1 else ""}
+    {docstring_additional}
     
     Original Apex Formula:
-    {formula if formula and formula.lower() != 'nan' else 'Not specified'}
+    {formula_str}
     
     Args:
         df (pandas.DataFrame): Input DataFrame to validate
@@ -1431,7 +1573,7 @@ def {func_name}(df):
     
     try:
         # Ensure all required columns exist
-        required_columns = {repr(field_names)}
+        required_columns = {field_names_str}
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             print(f"Warning: Missing columns for validation rule '{name}': {{missing_columns}}")
@@ -1475,3 +1617,54 @@ def {func_name}(df):
         return pd.Series([False] * len(df))  # Mark all as invalid on error
 '''
 
+
+def add_master_detail_awareness_to_validation_rules(
+    validation_rules_df: pd.DataFrame,
+    sf_conn,
+    object_name: str
+) -> pd.DataFrame:
+    """
+    Add Master-Detail awareness to validation rules
+    Flags validation rules that involve Master-Detail fields
+    
+    Args:
+        validation_rules_df: DataFrame of validation rules
+        sf_conn: Salesforce connection
+        object_name: Object name
+    
+    Returns:
+        Updated DataFrame with Master-Detail metadata
+    """
+    try:
+        # Get Master-Detail fields
+        object_metadata = getattr(sf_conn, object_name).describe()
+        md_field_names = [
+            field['name'] for field in object_metadata['fields']
+            if field.get('type') == 'masterdetail'
+        ]
+        
+        if not md_field_names:
+            return validation_rules_df
+        
+        # Add Master-Detail flag column
+        validation_rules_df['involves_master_detail'] = False
+        validation_rules_df['master_detail_fields_involved'] = ''
+        
+        # Check each rule for Master-Detail field references
+        for idx, rule in validation_rules_df.iterrows():
+            formula = str(rule.get('ErrorConditionFormula', ''))
+            
+            involved_md_fields = []
+            for md_field in md_field_names:
+                if md_field in formula:
+                    involved_md_fields.append(md_field)
+            
+            if involved_md_fields:
+                validation_rules_df.at[idx, 'involves_master_detail'] = True
+                validation_rules_df.at[idx, 'master_detail_fields_involved'] = ','.join(involved_md_fields)
+        
+        return validation_rules_df
+    
+    except Exception as e:
+        print(f"Warning: Could not add Master-Detail awareness: {str(e)}")
+        return validation_rules_df

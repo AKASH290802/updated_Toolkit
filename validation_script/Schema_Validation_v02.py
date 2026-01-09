@@ -169,6 +169,69 @@ def is_valid_email(email):
 
 # Validation 1 & 3: Check for required fields (mapping.csv Required == True)
 required_fields = mapping_df[mapping_df['Required'] == True]['Field Name'].tolist()
+
+# --- NEW: Master-Detail Validation ---
+print("\n" + "="*80)
+print("MASTER-DETAIL RELATIONSHIP VALIDATION")
+print("="*80)
+
+try:
+    from master_detail_validation_helper import (
+        identify_master_detail_fields_for_validation,
+        validate_master_detail_field_required
+    )
+    
+    # Get object metadata
+    object_metadata = getattr(sf_conn, object_name).describe()
+    md_fields = identify_master_detail_fields_for_validation(object_metadata['fields'])
+    
+    if md_fields:
+        print(f"\n🔗 Found {len(md_fields)} Master-Detail field(s)")
+        
+        md_issues = []
+        for md_field_name, md_field_info in md_fields.items():
+            if md_field_name in data_df.columns:
+                # Validate that Master-Detail field has no NULL values
+                md_validation = validate_master_detail_field_required(
+                    md_field_name,
+                    md_field_info,
+                    data_df
+                )
+                
+                print(f"\n{md_field_name} → {md_field_info['parent_object']}")
+                print(f"  Status: {md_validation['message']}")
+                
+                # Add Master-Detail issues to data
+                if md_validation['missing_count'] > 0:
+                    for row_idx in md_validation['null_rows']:
+                        data_df.loc[row_idx, 'Issues'] = (
+                            data_df.loc[row_idx, 'Issues'] + 
+                            f"🚫 CRITICAL: Master-Detail field '{md_field_name}' is NULL (Master-Detail relationships are MANDATORY); "
+                        )
+                    md_issues.append(f"{md_field_name}: {md_validation['missing_count']} missing values")
+        
+        # Summary
+        if md_issues:
+            print(f"\n❌ Master-Detail Issues Found:")
+            for issue in md_issues:
+                print(f"   - {issue}")
+        else:
+            print("\n✅ All Master-Detail fields are valid")
+        
+        # Add cascading delete warning
+        print("\n⚠️  CASCADING DELETE WARNING:")
+        for md_field_name, md_field_info in md_fields.items():
+            print(f"   - If parent {md_field_info['parent_object']} is deleted, all child records will be deleted")
+    else:
+        print("✅ No Master-Detail relationships found for this object")
+
+except ImportError:
+    print("⚠️  Master-Detail validation module not available - skipping")
+except Exception as e:
+    print(f"⚠️  Error during Master-Detail validation: {str(e)}")
+
+# --- End Master-Detail Validation ---
+
 for field in required_fields:
     if field in data_df.columns:
         # Check for null values in required fields
@@ -200,16 +263,30 @@ for field in unique_fields:
         if duplicates.any():
             data_df.loc[duplicates, 'Issues'] = data_df.loc[duplicates, 'Issues'] + f"Duplicate value in unique field '{field}'; "
 
-# Validation 6: Check picklist values
+# Validation 6: Check picklist values (API names)
 picklist_fields = mapping_df[mapping_df['Type'] == 'picklist'][['Field Name', 'Picklist Values']].dropna()
 for _, row in picklist_fields.iterrows():
     field = row['Field Name']
-    valid_values = [val.strip() for val in row['Picklist Values'].split(',') if val.strip()]
+    # Valid API names that should be present in uploaded files
+    valid_api_names = [val.strip() for val in row['Picklist Values'].split(',') if val.strip()]
+    
     if field in data_df.columns:
-        # Check if values in data.csv are in the valid picklist values (ignoring NaN)
-        invalid_values = data_df[field].apply(lambda x: str(x).strip() not in valid_values if pd.notna(x) and str(x).strip() != '' else False)
+        # Check if values in data file match valid picklist API names (ignoring NaN)
+        invalid_values = data_df[field].apply(
+            lambda x: str(x).strip() not in valid_api_names 
+            if pd.notna(x) and str(x).strip() != '' 
+            else False
+        )
+        
         if invalid_values.any():
-            data_df.loc[invalid_values, 'Issues'] = data_df.loc[invalid_values, 'Issues'] + f"Invalid picklist value in '{field}'; "
+            # Get the invalid values for better error reporting
+            invalid_vals = data_df.loc[invalid_values, field].unique()
+            invalid_vals_str = ", ".join([str(v) for v in invalid_vals if pd.notna(v)])
+            
+            data_df.loc[invalid_values, 'Issues'] = (
+                data_df.loc[invalid_values, 'Issues'] + 
+                f"Invalid picklist API name in '{field}' (found: {invalid_vals_str}, valid: {', '.join(valid_api_names)}); "
+            )
 
 # Clean up Issues column (remove trailing semicolons and spaces)
 data_df['Issues'] = data_df['Issues'].str.rstrip('; ')
