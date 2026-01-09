@@ -17,8 +17,11 @@ from ui_components import (
     unit_testing_operations,
     config_management,
     dashboard_overview,
-    logs_reports
+    logs_reports,
+    org_migration,
+    object_comparison
 )
+from ui_components.data_hub import show_data_hub_interface, initialize_data_hub
 
 # Page configuration
 st.set_page_config(
@@ -262,48 +265,46 @@ def main():
         # Navigation menu
         st.markdown("#### 📋 Modules")
         
-        # Workflow order: Dashboard → Configuration → 1.Validation → 2.Data Operations → 3.Unit Testing → Mapping (view only) → Logs & Reports (view only)
+        # Page list for consistent referencing
+        page_list = [
+            "🏠 Dashboard",
+            "⚙️ Configuration",
+            "📊 Data Hub",
+            "1️⃣ Validation",
+            "2️⃣ Data Operations",
+            "3️⃣ Unit Testing",
+            "🗺️ Mapping",
+            "🔄 Org Migration",
+            "🔍 Object Comparison",
+            "📋 Logs & Reports"
+        ]
         
-        # Check if we need to update the page programmatically
-        if 'active_page' in st.session_state and st.session_state.active_page:
-            default_index = [
-                "🏠 Dashboard",
-                "⚙️ Configuration", 
-                "1️⃣ Validation",
-                "2️⃣ Data Operations",
-                "3️⃣ Unit Testing",
-                "🗺️ Mapping",
-                "📋 Logs & Reports"
-            ].index(st.session_state.active_page) if st.session_state.active_page in [
-                "🏠 Dashboard",
-                "⚙️ Configuration", 
-                "1️⃣ Validation",
-                "2️⃣ Data Operations",
-                "3️⃣ Unit Testing",
-                "🗺️ Mapping",
-                "📋 Logs & Reports"
-            ] else 0
-        else:
-            default_index = 0
+        # Initialize active_page if not exists
+        if 'active_page' not in st.session_state:
+            st.session_state.active_page = "🏠 Dashboard"
+        
+        # Ensure active_page is valid
+        if st.session_state.active_page not in page_list:
+            st.session_state.active_page = "🏠 Dashboard"
+        
+        # Get current index for radio button
+        current_index = page_list.index(st.session_state.active_page)
+        
+        # Use a unique key that changes when session state changes to force radio refresh
+        nav_key = f"nav_{st.session_state.active_page.replace(' ', '_').replace('️⃣', '')}"
         
         page = st.radio(
             "Choose a module:",
-            [
-                "🏠 Dashboard",
-                "⚙️ Configuration", 
-                "1️⃣ Validation",
-                "2️⃣ Data Operations",
-                "3️⃣ Unit Testing",
-                "🗺️ Mapping",
-                "📋 Logs & Reports"
-            ],
-            index=default_index,
-            key="navigation_menu"
+            page_list,
+            index=current_index,
+            key=nav_key
         )
         
         # Update active page when navigation changes
-        if page != st.session_state.active_page:
-            st.session_state.active_page = page
+        st.session_state.active_page = page
+        
+        # Debug info (uncomment for troubleshooting navigation issues)
+        # st.sidebar.caption(f"Debug: Current page = {st.session_state.active_page}")
         
         st.divider()
         
@@ -315,7 +316,9 @@ def main():
             st.warning("⚠️ No organization selected")
             
         if st.session_state.current_object:
-            st.info(f"📋 **Object:** {st.session_state.current_object}")
+            st.success(f"🎯 **Current Object:** {st.session_state.current_object}")
+        else:
+            st.info("📋 **Current Object:** None selected")
         
         # Connection status
         if st.session_state.sf_connection and st.session_state.connected_org:
@@ -323,16 +326,21 @@ def main():
         elif st.session_state.current_org:
             st.info("🔌 Ready to connect")
     
-    # Main content area - use the current page selection
-    current_page = page if page else st.session_state.active_page
+    # Main content area - use session state as the source of truth
+    current_page = st.session_state.active_page
     
     # Use session state credentials (may be updated by config management)
     current_credentials = st.session_state.get('credentials', credentials)
+    
+    # Initialize Data Hub
+    data_hub = initialize_data_hub()
     
     if current_page == "🏠 Dashboard":
         dashboard_overview.show_dashboard(current_credentials)
     elif current_page == "⚙️ Configuration":
         config_management.show_configuration(current_credentials)
+    elif current_page == "📊 Data Hub":
+        show_data_hub_interface(st.session_state.get('sf_connection', None))
     elif current_page == "1️⃣ Validation":
         validation_operations.show_validation_operations(current_credentials)
     elif current_page == "2️⃣ Data Operations":
@@ -341,6 +349,10 @@ def main():
         unit_testing_operations.show_unit_testing(current_credentials)
     elif current_page == "🗺️ Mapping":
         mapping_operations.show_mapping_operations(current_credentials)
+    elif current_page == "🔄 Org Migration":
+        org_migration.show_org_migration(current_credentials)
+    elif current_page == "🔍 Object Comparison":
+        object_comparison.show_object_comparison()
     elif current_page == "📋 Logs & Reports":
         logs_reports.show_logs_reports()
 
