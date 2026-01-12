@@ -162,7 +162,7 @@ def create_progress_tracker(steps: List[str], current_step: int = 0):
         else:
             st.write(f"⏳ {step}")
 
-def validate_file_upload(uploaded_file, allowed_extensions: List[str] = ['.csv', '.xlsx', '.xls']) -> bool:
+def validate_file_upload(uploaded_file, allowed_extensions: List[str] = ['.csv', '.xlsx', '.xls', '.psv']) -> bool:
     """Validate uploaded file"""
     if uploaded_file is None:
         return False
@@ -173,6 +173,55 @@ def validate_file_upload(uploaded_file, allowed_extensions: List[str] = ['.csv',
         return False
     
     return True
+
+def load_data_file(file_path_or_uploaded_file, file_type: str = None) -> Optional[pd.DataFrame]:
+    """
+    Load data from CSV, Excel, or PSV file
+    
+    Args:
+        file_path_or_uploaded_file: Either file path string or Streamlit uploaded file object
+        file_type: Optional file type override ('.csv', '.xlsx', '.xls', '.psv')
+    
+    Returns:
+        pandas.DataFrame or None if error
+    """
+    try:
+        import pandas as pd
+        
+        # Determine if it's a file path or uploaded file
+        if hasattr(file_path_or_uploaded_file, 'name'):
+            # It's an uploaded file object
+            uploaded_file = file_path_or_uploaded_file
+            file_ext = file_type or os.path.splitext(uploaded_file.name)[1].lower()
+            
+            if file_ext in ['.csv']:
+                return pd.read_csv(uploaded_file, dtype=str)
+            elif file_ext in ['.xlsx', '.xls']:
+                return pd.read_excel(uploaded_file, dtype=str)
+            elif file_ext in ['.psv']:
+                return pd.read_csv(uploaded_file, sep='|', dtype=str)
+            else:
+                st.error(f"Unsupported file format: {file_ext}")
+                return None
+                
+        else:
+            # It's a file path
+            file_path = file_path_or_uploaded_file
+            file_ext = file_type or os.path.splitext(file_path)[1].lower()
+            
+            if file_ext in ['.csv']:
+                return pd.read_csv(file_path, dtype=str)
+            elif file_ext in ['.xlsx', '.xls']:
+                return pd.read_excel(file_path, dtype=str)
+            elif file_ext in ['.psv']:
+                return pd.read_csv(file_path, sep='|', dtype=str)
+            else:
+                st.error(f"Unsupported file format: {file_ext}")
+                return None
+                
+    except Exception as e:
+        st.error(f"Error loading file: {str(e)}")
+        return None
 
 def save_uploaded_file(uploaded_file, directory: str) -> str:
     """Save uploaded file to specified directory"""
@@ -282,3 +331,365 @@ def create_download_zip(files: Dict[str, pd.DataFrame], zip_name: str):
         mime="application/zip",
         use_container_width=True
     )
+
+def query_bulk_data(object_name: str, query: str, sf_conn) -> pd.DataFrame:
+    """
+    Query Salesforce data in bulk - used by ETL engine
+    This function matches the Utils.query_bulk_data from the provided script
+    """
+    try:
+        if not sf_conn:
+            st.error("No Salesforce connection available")
+            return pd.DataFrame()
+        
+        result = sf_conn.query_all(query)
+        records = result['records']
+        
+        if records:
+            df = pd.DataFrame(records)
+            # Remove attributes column if it exists
+            if 'attributes' in df.columns:
+                df = df.drop('attributes', axis=1)
+            return df
+        else:
+            return pd.DataFrame()
+            
+    except Exception as e:
+        st.error(f"Salesforce bulk query failed: {str(e)}")
+        return pd.DataFrame()
+
+# ============================================================================
+# PICKLIST MAPPING FUNCTIONS
+# ============================================================================
+
+def get_picklist_mapping_path(org_name: str, object_name: str) -> str:
+    """Get the path for picklist mapping file"""
+    base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'picklist_mappings')
+    org_dir = os.path.join(base_dir, org_name)
+    object_dir = os.path.join(org_dir, object_name)
+    
+    # Create directories if they don't exist
+    os.makedirs(object_dir, exist_ok=True)
+    
+    return os.path.join(object_dir, 'picklist_mappings.json')
+
+def save_picklist_mappings(org_name: str, object_name: str, mappings: Dict) -> bool:
+    """
+    Save picklist mappings to JSON file
+    
+    Args:
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        mappings: Dictionary with structure:
+            {
+                "field_name": {
+                    "csv_column": "column_name",
+                    "mappings": {"source": "target", ...}
+                }
+            }
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        file_path = get_picklist_mapping_path(org_name, object_name)
+        
+        # Prepare data structure
+        data = {
+            "org_name": org_name,
+            "object_name": object_name,
+            "last_updated": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "fields": mappings
+        }
+        
+        # Save to JSON
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        
+        return True
+    except Exception as e:
+        st.error(f"Error saving picklist mappings: {str(e)}")
+        return False
+
+def load_picklist_mappings(org_name: str, object_name: str, field_name: Optional[str] = None) -> Optional[Dict]:
+    """
+    Load picklist mappings from JSON file
+    
+    Args:
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        field_name: Optional - specific field name to load mappings for
+    
+    Returns:
+        Dictionary of mappings or None if not found
+        If field_name provided: {"source": "target", ...}
+        If field_name not provided: Full structure with all fields
+    """
+    try:
+        file_path = get_picklist_mapping_path(org_name, object_name)
+        
+        if not os.path.exists(file_path):
+            return None
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        if field_name:
+            # Return mappings for specific field
+            field_data = data.get('fields', {}).get(field_name, {})
+            return field_data.get('mappings', {})
+        else:
+            # Return all fields
+            return data.get('fields', {})
+            
+    except Exception as e:
+        st.error(f"Error loading picklist mappings: {str(e)}")
+        return None
+
+def get_all_picklist_mappings(org_name: str, object_name: str) -> Dict:
+    """
+    Get all picklist mappings for an object
+    
+    Returns:
+        Dictionary with full structure including metadata
+    """
+    try:
+        file_path = get_picklist_mapping_path(org_name, object_name)
+        
+        if not os.path.exists(file_path):
+            return {
+                "org_name": org_name,
+                "object_name": object_name,
+                "fields": {}
+            }
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+            
+    except Exception as e:
+        st.error(f"Error loading picklist mappings: {str(e)}")
+        return {"org_name": org_name, "object_name": object_name, "fields": {}}
+
+def update_picklist_mapping(org_name: str, object_name: str, field_name: str, 
+                            csv_column: str, field_mappings: Dict) -> bool:
+    """
+    Update or add mappings for a specific field
+    
+    Args:
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        field_name: Salesforce field name
+        csv_column: CSV column name
+        field_mappings: Dictionary of source->target mappings
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Load existing mappings
+        all_mappings = get_all_picklist_mappings(org_name, object_name)
+        
+        # Update or add field mappings
+        if 'fields' not in all_mappings:
+            all_mappings['fields'] = {}
+        
+        all_mappings['fields'][field_name] = {
+            "csv_column": csv_column,
+            "mappings": field_mappings
+        }
+        
+        # Save updated mappings
+        return save_picklist_mappings(org_name, object_name, all_mappings['fields'])
+        
+    except Exception as e:
+        st.error(f"Error updating picklist mapping: {str(e)}")
+        return False
+
+def delete_picklist_mappings(org_name: str, object_name: str, field_name: Optional[str] = None) -> bool:
+    """
+    Delete picklist mappings
+    
+    Args:
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        field_name: Optional - if provided, delete only this field's mappings
+                    if not provided, delete entire file
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        file_path = get_picklist_mapping_path(org_name, object_name)
+        
+        if not os.path.exists(file_path):
+            return True  # Already doesn't exist
+        
+        if field_name:
+            # Delete specific field
+            all_mappings = get_all_picklist_mappings(org_name, object_name)
+            if 'fields' in all_mappings and field_name in all_mappings['fields']:
+                del all_mappings['fields'][field_name]
+                return save_picklist_mappings(org_name, object_name, all_mappings['fields'])
+            return True
+        else:
+            # Delete entire file
+            os.remove(file_path)
+            return True
+            
+    except Exception as e:
+        st.error(f"Error deleting picklist mappings: {str(e)}")
+        return False
+
+def transform_picklist_value(org_name: str, object_name: str, field_name: str, source_value: str) -> str:
+    """
+    Transform source value to target value using saved mappings
+    
+    Args:
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        field_name: Salesforce field name
+        source_value: Source value from file
+    
+    Returns:
+        Target value if mapping exists, otherwise original source_value
+    """
+    try:
+        mappings = load_picklist_mappings(org_name, object_name, field_name)
+        
+        if mappings and str(source_value) in mappings:
+            return mappings[str(source_value)]
+        
+        return source_value
+        
+    except Exception as e:
+        return source_value
+
+def extract_picklist_values_from_file(df: pd.DataFrame, org_name: str, object_name: str, 
+                                      sf_conn: sf.Salesforce, field_mappings: Dict = None) -> Dict:
+    """
+    Extract unique values from picklist fields in uploaded file and compare with Salesforce
+    
+    Args:
+        df: DataFrame with uploaded data
+        org_name: Salesforce org name
+        object_name: Salesforce object name
+        sf_conn: Salesforce connection
+        field_mappings: Optional CSV to Salesforce field mappings
+    
+    Returns:
+        Dictionary with structure:
+        {
+            "Status__c": {
+                "csv_column": "Status_CSV",
+                "sf_field_type": "picklist",
+                "source_values": ["Act", "Inact", "Pend", "Active"],
+                "unique_count": {"Act": 12, "Inact": 8, "Pend": 15, "Active": 45},
+                "salesforce_values": ["Active", "Inactive", "Pending"],
+                "needs_mapping": ["Act", "Inact", "Pend"],
+                "already_valid": ["Active"],
+                "existing_mappings": {"Act": "Active", ...}  # If mappings exist
+            }
+        }
+    """
+    try:
+        result = {}
+        
+        # Verify DataFrame is valid
+        if df is None or df.empty:
+            st.warning("⚠️ DataFrame is empty or None")
+            return result
+        
+        # Get Salesforce object description
+        obj_desc = get_object_description(sf_conn, object_name)
+        if not obj_desc:
+            st.error(f"❌ Could not get Salesforce object description for {object_name}")
+            return result
+        
+        fields = obj_desc.get('fields', [])
+        
+        # Create field info map
+        field_info_map = {field['name']: field for field in fields}
+        
+        # Get picklist fields count for debugging
+        picklist_fields_in_sf = [f['name'] for f in fields if f.get('type', '').lower() in ['picklist', 'multipicklist']]
+        
+        # Load existing mappings if any
+        existing_mappings = load_picklist_mappings(org_name, object_name)
+        
+        # Track matched columns for debugging
+        matched_columns = []
+        
+        # Iterate through DataFrame columns
+        for csv_column in df.columns:
+            # Determine Salesforce field name
+            if field_mappings and csv_column in field_mappings:
+                sf_field_name = field_mappings[csv_column]
+            else:
+                sf_field_name = csv_column
+            
+            # Check if this is a picklist field in Salesforce
+            if sf_field_name in field_info_map:
+                field_info = field_info_map[sf_field_name]
+                field_type = field_info.get('type', '').lower()
+                
+                if field_type in ['picklist', 'multipicklist']:
+                    # Get Salesforce valid values (active only)
+                    picklist_values = field_info.get('picklistValues', [])
+                    sf_valid_values = [pv.get('value', '') for pv in picklist_values if pv.get('active', True)]
+                    
+                    # Get unique values from file (excluding null/empty)
+                    file_values = df[csv_column].dropna()
+                    file_values = file_values[file_values.astype(str).str.strip() != '']
+                    
+                    unique_values = file_values.unique().tolist()
+                    unique_values = [str(v) for v in unique_values]
+                    
+                    # Count occurrences
+                    value_counts = df[csv_column].value_counts().to_dict()
+                    value_counts = {str(k): int(v) for k, v in value_counts.items() if pd.notna(k) and str(k).strip() != ''}
+                    
+                    # Determine which values need mapping
+                    needs_mapping = []
+                    already_valid = []
+                    
+                    for value in unique_values:
+                        if value in sf_valid_values:
+                            already_valid.append(value)
+                        else:
+                            needs_mapping.append(value)
+                    
+                    # Get existing mappings for this field
+                    field_existing_mappings = {}
+                    if existing_mappings and sf_field_name in existing_mappings:
+                        field_existing_mappings = existing_mappings[sf_field_name].get('mappings', {})
+                    
+                    # Include ALL picklist fields found (not just those needing mapping)
+                    if unique_values or sf_valid_values:  # If there are any values in file or Salesforce
+                        result[sf_field_name] = {
+                            "csv_column": csv_column,
+                            "sf_field_type": field_type,
+                            "source_values": unique_values,
+                            "unique_count": value_counts,
+                            "salesforce_values": sf_valid_values,
+                            "needs_mapping": needs_mapping,
+                            "already_valid": already_valid,
+                            "existing_mappings": field_existing_mappings,
+                            "has_data": len(unique_values) > 0
+                        }
+                        matched_columns.append(csv_column)
+        
+        # Debug logging
+        if not result:
+            st.warning(f"🔍 Analysis Details:")
+            st.info(f"• DataFrame has {len(df)} rows and {len(df.columns)} columns")
+            st.info(f"• Columns in file: {', '.join(list(df.columns)[:10])}")
+            st.info(f"• Picklist fields in Salesforce {object_name}: {len(picklist_fields_in_sf)}")
+            if picklist_fields_in_sf:
+                st.info(f"• Salesforce picklist fields: {', '.join(picklist_fields_in_sf[:10])}")
+            st.info(f"• Matched columns: {len(matched_columns)}")
+        
+        return result
+        
+    except Exception as e:
+        st.error(f"Error extracting picklist values: {str(e)}")
+        return {}

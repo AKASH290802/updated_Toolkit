@@ -55,9 +55,6 @@ def analyze_genai_validation_results(org_name: str, object_name: str) -> Dict:
             'GenAIValidation'
         )
         
-        st.info(f"🔍 **DYNAMIC VALIDATION**: Analyzing {org_name} -> {object_name}")
-        st.info(f"📁 **VALIDATION PATH**: {validation_path}")
-        
         if os.path.exists(validation_path):
             # DYNAMIC FILE DISCOVERY
             validation_files = [f for f in os.listdir(validation_path) if f.endswith(('.py', '.txt', '.json'))]
@@ -73,16 +70,6 @@ def analyze_genai_validation_results(org_name: str, object_name: str) -> Dict:
             
             # DYNAMIC VERIFICATION OF PARSING RESULTS
             if validation_rules:
-                st.success(f"✅ Successfully parsed {len(validation_rules)} validation functions from bundle")
-                
-                # VERIFY OBJECT-SPECIFIC RULES
-                object_specific_count = sum(1 for rule in validation_rules 
-                                          if object_name.lower() in str(rule).lower())
-                if object_specific_count > 0:
-                    st.success(f"✅ **OBJECT-SPECIFIC**: {object_specific_count} rules contain {object_name}")
-                else:
-                    st.warning(f"⚠️ Rules may be generic, not specifically for {object_name}")
-                
                 # Analyze validation patterns
                 validation_insights['field_patterns'] = analyze_validation_patterns(validation_rules)
                 
@@ -97,11 +84,7 @@ def analyze_genai_validation_results(org_name: str, object_name: str) -> Dict:
                 for rule in validation_rules:
                     risk_level = rule.get('risk_level', 'unknown')
                     risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
-                
-                st.info(f"📊 **DYNAMIC RISK DISTRIBUTION**: {risk_counts}")
-                st.success(f"✅ **ANALYSIS COMPLETE**: {len(validation_rules)} rules for {object_name}")
             else:
-                st.warning(f"⚠️ **NO RULES PARSED**: Parser returned empty for {object_name}")
                 validation_insights['metadata']['parsing_method'] = 'failed'
         else:
             st.warning(f"⚠️ **NO VALIDATION FOLDER**: {validation_path}")
@@ -130,9 +113,6 @@ def analyze_genai_validation_results(org_name: str, object_name: str) -> Dict:
             validation_rules = parse_validation_bundle(validation_path, object_name)
             validation_insights['validation_rules'] = validation_rules
             
-            # Debug: Show actual count
-            st.info(f"✅ Successfully parsed {len(validation_rules)} validation functions from bundle")
-            
             # Analyze validation patterns
             validation_insights['field_patterns'] = analyze_validation_patterns(validation_rules)
             
@@ -147,16 +127,11 @@ def analyze_genai_validation_results(org_name: str, object_name: str) -> Dict:
             for rule in validation_rules:
                 risk_level = rule.get('risk_level', 'unknown')
                 risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
-            
-            st.info(f"📊 Risk distribution: {risk_counts}")
-            st.info(f"✅ Analyzed {len(validation_rules)} validation rules for {object_name}")
         else:
-            st.warning(f"⚠️ No GenAI validation found for {org_name}/{object_name}")
+            pass
             
     except Exception as e:
-        st.error(f"❌ Error analyzing GenAI validation: {str(e)}")
-        import traceback
-        st.error(f"Stack trace: {traceback.format_exc()}")
+        pass
     
     return validation_insights
 
@@ -202,27 +177,24 @@ def parse_validation_bundle(validation_path: str, object_name: str) -> List[Dict
             
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef) and node.name.startswith('validate_'):
+                    # Skip utility functions
+                    if node.name in ['validate_record', 'validate_dataframe']:
+                        continue
                     total_functions += 1
                     rule_info = extract_validation_rule_info(node, bundle_content)
                     if rule_info:
                         validation_rules.append(rule_info)
                         successful_extractions += 1
                         
-            st.info(f"📋 Found {total_functions} validation functions, successfully extracted {successful_extractions}")
-                        
-        except SyntaxError:
+        except SyntaxError as e:
             # If AST parsing fails, try Salesforce formula parsing
-            st.info("🔄 AST parsing failed, attempting Salesforce formula parsing...")
             validation_rules = parse_salesforce_validation_content(bundle_content, object_name)
             
     except Exception as e:
-        st.error(f"Error parsing validation bundle: {str(e)}")
-        st.warning("🔄 Falling back to basic validation rule generation...")
         validation_rules = generate_fallback_validation_rules(object_name)
     
     # Ensure we have at least some validation rules
     if not validation_rules:
-        st.warning("⚠️ No validation rules extracted, generating fallback rules...")
         validation_rules = generate_fallback_validation_rules(object_name)
     
     return validation_rules
@@ -234,12 +206,29 @@ def parse_salesforce_validation_content(content: str, object_name: str) -> List[
     try:
         import re
         
-        # Pattern 1: Look for validation_result assignments
-        validation_patterns = re.findall(r'validation_result\s*=\s*(.+?)(?=\n|$)', content, re.MULTILINE | re.DOTALL)
+        # First try to extract function names for better rule naming
+        function_names = re.findall(r'def\s+(validate_[^\(]+)', content)
+        
+        # Pattern 1: Look for main validation_result assignments (first occurrence in each function)
+        # Split content by function definitions and extract one validation_result per function
+        function_sections = re.split(r'def\s+validate_[^\(]+\([^)]*\):', content)
+        validation_patterns = []
+        
+        # Skip the first section (before any validate_ function)
+        for section in function_sections[1:]:
+            # Find the first validation_result assignment in this function
+            pattern_match = re.search(r'validation_result\s*=\s*(.+?)(?=\n|$)', section, re.MULTILINE)
+            if pattern_match:
+                validation_patterns.append(pattern_match.group(1))
+        
         
         for i, pattern in enumerate(validation_patterns):
-            rule_name = f"ValidationRule_{i+1}"
-            
+            # Use actual function name if available, otherwise generate generic name
+            if i < len(function_names):
+                rule_name = function_names[i].replace('validate_', '').replace('_', ' ').title()
+            else:
+                rule_name = f"ValidationRule_{i+1}"
+        
             # Extract field references
             field_matches = re.findall(r"df\['([^']+)'\]", pattern)
             fields = list(set(field_matches))
@@ -257,8 +246,6 @@ def parse_salesforce_validation_content(content: str, object_name: str) -> List[
                 'object_name': object_name
             })
         
-        st.info(f"📋 Extracted {len(validation_rules)} Salesforce validation formulas")
-            
     except Exception as e:
         st.warning(f"⚠️ Salesforce parsing failed: {str(e)}")
         
@@ -266,7 +253,6 @@ def parse_salesforce_validation_content(content: str, object_name: str) -> List[
 
 def generate_fallback_validation_rules(object_name: str) -> List[Dict]:
     """Generate basic validation rules when parsing fails"""
-    st.info(f"🔧 Generating fallback validation rules for {object_name}")
     
     fallback_rules = [
         {
@@ -381,7 +367,7 @@ def extract_validation_rule_info(func_node: ast.FunctionDef, source_code: str) -
         # Parse rule details from docstring
         rule_info = {
             'function_name': func_node.name,
-            'rule_name': func_node.name.replace('validate_', ''),
+            'rule_name': func_node.name.replace('validate_', '').replace('_', ' ').title(),
             'source_code': func_source,
             'docstring': docstring,
             'fields': [],
@@ -390,27 +376,31 @@ def extract_validation_rule_info(func_node: ast.FunctionDef, source_code: str) -
             'risk_level': 'medium'
         }
         
-        # Enhanced field extraction from docstring
-        if "Field:" in docstring:
-            fields_lines = [line.strip() for line in docstring.split('\n') if 'Field:' in line]
-            if fields_lines:
-                fields_text = fields_lines[0].split('Field:')[1].strip()
-                # Handle multi-line field definitions
-                if fields_text:
-                    rule_info['fields'] = [f.strip() for f in fields_text.split(',') if f.strip()]
-                else:
-                    # Try to find fields in the next lines after "Field:"
-                    docstring_lines = docstring.split('\n')
-                    field_start_idx = None
-                    for i, line in enumerate(docstring_lines):
-                        if 'Field:' in line:
-                            field_start_idx = i
-                            break
-                    
-                    if field_start_idx is not None and field_start_idx + 1 < len(docstring_lines):
-                        next_line = docstring_lines[field_start_idx + 1].strip()
-                        if next_line and not next_line.startswith('Apex'):
-                            rule_info['fields'] = [f.strip() for f in next_line.split(',') if f.strip()]
+        # Try to extract better rule name from docstring
+        if "Validation Rule:" in docstring:
+            rule_lines = [line.strip() for line in docstring.split('\n') if 'Validation Rule:' in line]
+            if rule_lines:
+                rule_name_from_doc = rule_lines[0].split('Validation Rule:')[1].strip()
+                if rule_name_from_doc:
+                    # Format the rule name nicely
+                    old_name = rule_info['rule_name']
+                    rule_info['rule_name'] = rule_name_from_doc.replace('_', ' ').title()
+        
+        # Enhanced field extraction from docstring (but be more specific)
+        # Look for "Field:" but NOT "Primary Field:" to avoid confusion
+        import re
+        field_pattern = r'(?<!Primary\s)Field:\s*(.+?)(?=\n|$)'
+        field_matches = re.findall(field_pattern, docstring, re.MULTILINE)
+        
+        if field_matches:
+            fields_text = field_matches[0].strip()
+            if fields_text:
+                rule_info['fields'] = [f.strip() for f in fields_text.split(',') if f.strip()]
+        
+        # PRIORITIZE: Always try to extract fields from actual code first
+        code_fields = extract_fields_from_code(func_source)
+        if code_fields:
+            rule_info['fields'] = code_fields  # Override docstring fields with actual code fields
         
         # Enhanced Apex formula extraction
         if "Apex Formula:" in docstring:
@@ -432,10 +422,14 @@ def extract_validation_rule_info(func_node: ast.FunctionDef, source_code: str) -
         # Assess risk level with improved analysis
         rule_info['risk_level'] = assess_rule_risk_level_improved(rule_info)
         
-        # Ensure we have at least basic info
+        # Final fallback: Ensure we have at least some field info
         if not rule_info['fields']:
-            # Try to extract field names from function code as fallback
+            # Try to extract field names from function code as final fallback
             rule_info['fields'] = extract_fields_from_code(func_source)
+            
+        # If still no fields, use a default
+        if not rule_info['fields']:
+            rule_info['fields'] = ['Unknown']
         
         return rule_info
         
@@ -443,7 +437,7 @@ def extract_validation_rule_info(func_node: ast.FunctionDef, source_code: str) -
         # Create a basic rule info even if parsing fails
         return {
             'function_name': func_node.name,
-            'rule_name': func_node.name.replace('validate_', ''),
+            'rule_name': func_node.name.replace('validate_', '').replace('_', ' ').title(),
             'source_code': '',
             'docstring': '',
             'fields': ['Unknown'],
@@ -459,18 +453,30 @@ def extract_fields_from_code(func_source: str) -> List[str]:
     # Look for common field patterns in the code
     import re
     
-    # Pattern 1: df['FieldName']
+    # Pattern 1: df['FieldName'] or df["FieldName"]
     field_pattern1 = re.findall(r"df\s*\[\s*['\"]([^'\"]+)['\"]\s*\]", func_source)
     fields.extend(field_pattern1)
     
-    # Pattern 2: Column references
-    field_pattern2 = re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*__c)['\"]", func_source)
+    # Pattern 2: _is_blank(df['FieldName']) and similar function calls
+    field_pattern2 = re.findall(r"_is_blank\s*\(\s*df\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*\)", func_source)
     fields.extend(field_pattern2)
+    
+    # Pattern 3: df.FieldName references
+    field_pattern3 = re.findall(r"df\.([A-Za-z_][A-Za-z0-9_]*)", func_source)
+    fields.extend(field_pattern3)
+    
+    # Pattern 4: Custom field references (__c suffix)
+    field_pattern4 = re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*__c)['\"]", func_source)
+    fields.extend(field_pattern4)
     
     # Remove duplicates and filter out common non-field words
     fields = list(set(fields))
-    exclude_words = ['True', 'False', 'None', 'index', 'columns', 'fillna', 'astype', 'str']
-    fields = [f for f in fields if f not in exclude_words and len(f) > 2]
+    exclude_words = [
+        'True', 'False', 'None', 'index', 'columns', 'fillna', 'astype', 'str', 
+        'iloc', 'loc', 'values', 'dtype', 'dtypes', 'shape', 'size', 'empty',
+        'isna', 'notna', 'dropna', 'head', 'tail', 'describe'
+    ]
+    fields = [f for f in fields if f not in exclude_words and len(f) > 1]
     
     return fields[:5]  # Limit to 5 fields
 
@@ -1268,6 +1274,7 @@ def generate_enhanced_data_loading_tests(validation_rules: List[Dict], field_ana
             'test_id': f"EDL_{rule['rule_name']}_POS_{i+1:03d}",
             'test_category': 'Enhanced Data Loading',
             'test_description': f"Load valid data that should pass {rule['rule_name']} validation",
+            'validation_rule': rule['rule_name'],
             'validation_rule_target': rule['rule_name'],
             'data_expectation': 'LOAD_SUCCESS',
             'validation_expectation': 'PASS',
@@ -1281,6 +1288,7 @@ def generate_enhanced_data_loading_tests(validation_rules: List[Dict], field_ana
             'test_id': f"EDL_{rule['rule_name']}_NEG_{i+1:03d}",
             'test_category': 'Enhanced Data Loading',
             'test_description': f"Attempt to load invalid data that should fail {rule['rule_name']} validation",
+            'validation_rule': rule['rule_name'],
             'validation_rule_target': rule['rule_name'],
             'data_expectation': 'LOAD_REJECT',
             'validation_expectation': 'FAIL',
@@ -3795,8 +3803,6 @@ def generate_enhanced_unit_tests(sf_conn, object_name: str, test_types: list, te
             validation_tests = generate_validation_based_tests(prioritized_rules, fields)
             unit_tests.extend(validation_tests)
             test_cases_generated += len(validation_tests)
-            
-            st.success(f"🤖 Generated {len(validation_tests)} validation-driven test cases")
         
         # Generate data pattern tests
         if test_strategy in ["Data-Pattern-Driven", "Hybrid Approach"] and validation_insights['field_patterns']:
@@ -3804,8 +3810,6 @@ def generate_enhanced_unit_tests(sf_conn, object_name: str, test_types: list, te
             pattern_tests = generate_pattern_based_tests(validation_insights['field_patterns'], fields)
             unit_tests.extend(pattern_tests)
             test_cases_generated += len(pattern_tests)
-            
-            st.success(f"📊 Generated {len(pattern_tests)} data-pattern-driven test cases")
         
         # Phase 5: Standard Test Generation (if needed)
         coverage_multiplier = {"Basic": 1, "Comprehensive": 2, "Full Coverage": 3}[test_coverage]
@@ -3856,14 +3860,6 @@ def generate_enhanced_unit_tests(sf_conn, object_name: str, test_types: list, te
         validation_source = validation_insights.get('metadata', {}).get('validation_source', 'unknown')
         files_found = validation_insights.get('metadata', {}).get('files_found', 0)
         
-        st.info(f"""
-        🔍 **DYNAMIC TEST MARKING VERIFICATION**:
-        - Validation Rules Found: {validation_rules_count}
-        - Validation Source: {validation_source}
-        - Files Analyzed: {files_found}
-        - Object: {object_name}
-        """)
-        
         # Mark tests dynamically based on actual validation data
         for test in unit_tests:
             # DYNAMIC GENAI MARKING - Based on actual validation results
@@ -3885,13 +3881,6 @@ def generate_enhanced_unit_tests(sf_conn, object_name: str, test_types: list, te
         # VERIFICATION: Check test marking accuracy
         genai_enhanced_count = len([t for t in unit_tests if t.get('genai_enhanced', False)])
         object_specific_count = len([t for t in unit_tests if t.get('object_specific') == object_name])
-        
-        st.success(f"""
-        ✅ **DYNAMIC MARKING RESULTS**:
-        - GenAI Enhanced Tests: {genai_enhanced_count}/{len(unit_tests)}
-        - Object-Specific Tests: {object_specific_count}/{len(unit_tests)}
-        - Validation-Based Generation: {'Yes' if validation_rules_count > 0 else 'Fallback'}
-        """)
         
         # Calculate enhanced quality metrics
         quality_metrics = calculate_enhanced_quality_metrics(
