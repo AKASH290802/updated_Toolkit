@@ -6,6 +6,7 @@ from . import mapping_operations
 from . import validation_operations
 from . import unit_testing_operations
 from . import logs_reports
+from . import object_comparison
 from . import utils
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     'validation_operations',
     'unit_testing_operations',
     'logs_reports',
+    'object_comparison',
     'utils'
 ]
