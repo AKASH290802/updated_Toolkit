@@ -9,22 +9,13 @@ import re
 from datetime import datetime
 import shutil
 from io import BytesIO
+import streamlit.components.v1 as components
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(project_root)
 
-# Import bulk lookup cache for optimized lookup resolution
-try:
-    from ui_components.bulk_lookup_cache import (
-        resolve_lookups_with_bulk_cache,
-        show_cache_statistics,
-        clear_lookup_cache
-    )
-except ImportError:
-    resolve_lookups_with_bulk_cache = None
-    show_cache_statistics = None
-    clear_lookup_cache = None
+# Lookup resolution functions are imported locally from data_operations when needed
 
 # Import lookup resolution validator for enhanced reference field validation
 try:
@@ -520,6 +511,33 @@ def validate_transformed_data(df: pd.DataFrame, object_name: str, field_mappings
     
     return validation_results
 
+
+def _mark_val_tab(idx):
+    """Mark which validation tab the user is on so it can be restored after rerun."""
+    st.session_state.validation_active_tab = idx
+    st.session_state._val_tab_needs_restore = True
+
+
+def _render_next_tab_btn(next_tab_label, key_suffix=""):
+    """Render a JS-based Next button that clicks the next native Streamlit tab."""
+    escaped = next_tab_label.replace("'", "\\'").replace('"', '\\"')
+    components.html(f"""
+    <div style="display:flex;justify-content:flex-end;padding:10px 0;">
+        <button onclick="
+            var tabs=window.parent.document.querySelectorAll('button[data-baseweb=\\'tab\\']');
+            for(var i=0;i<tabs.length;i++){{if(tabs[i].innerText.includes('{escaped}')){{tabs[i].click();break;}}}}
+        " style="
+            background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;
+            padding:0.55rem 1.4rem;border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;
+            box-shadow:0 2px 8px rgba(102,126,234,0.3);transition:all 0.3s ease;
+        "
+        onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(102,126,234,0.5)'"
+        onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 2px 8px rgba(102,126,234,0.3)'"
+        >Next &#10145;&#65039;</button>
+    </div>
+    """, height=60)
+
+
 def show_validation_operations(credentials: Dict):
     """Display validation operations interface"""
     
@@ -530,6 +548,10 @@ def show_validation_operations(credentials: Dict):
         st.session_state.current_object = None
     if 'show_manual_entry' not in st.session_state:
         st.session_state.show_manual_entry = False
+    if 'validation_active_tab' not in st.session_state:
+        st.session_state.validation_active_tab = 0  # Track which tab is active
+    if '_val_tab_needs_restore' not in st.session_state:
+        st.session_state._val_tab_needs_restore = False
     
     st.title("✅ Data Validation")
     st.markdown("Comprehensive data validation including schema validation and custom business rules")
@@ -541,59 +563,96 @@ def show_validation_operations(credentials: Dict):
         if not sf_conn:
             st.error("❌ Failed to establish Salesforce connection. Please check your credentials.")
     
-    # Main tabs - Object Comparison doesn't need org selection
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🔍 Schema Validation",
-        "⚡ Enhanced Validation", 
-        "🤖 GenAI Validation",
-        "🔄 Object Comparison",
-        "📊 Validation Reports",
-        "📋 Validation Summary",
-        "💾 Saved Mappings"
-    ])
+    # Main tabs
+    tab_list = [
+        ("🔍 Schema Validation", 0),
+        ("⚡ Enhanced Validation", 1),
+        ("✏️ Custom Validation", 2),
+        ("🔧 SF Validation Rules", 3),
+        ("📋 Validation Summary", 4),
+        ("💾 Saved Mappings", 5)
+    ]
+    
+    # Create tabs and track which one is selected
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([label for label, _ in tab_list])
+    tabs_list = [tab1, tab2, tab3, tab4, tab5, tab6]
     
     with tab1:
         if not sf_conn:
             st.warning("⚠️ Please select an organization from the sidebar to continue.")
         else:
             show_schema_validation(sf_conn)
+        _render_next_tab_btn("Enhanced Validation", "val_0")
     
     with tab2:
         if not sf_conn:
             st.warning("⚠️ Please select an organization from the sidebar to continue.")
         else:
             show_enhanced_validation(sf_conn)
+        _render_next_tab_btn("Custom Validation", "val_1")
     
     with tab3:
         if not sf_conn:
             st.warning("⚠️ Please select an organization from the sidebar to continue.")
         else:
-            show_genai_validation(sf_conn)
+            show_custom_validation(sf_conn)
+        _render_next_tab_btn("SF Validation Rules", "val_2")
     
     with tab4:
-        # Object Comparison has its own org selection, doesn't need sidebar org
-        show_object_comparison()
+        if not sf_conn:
+            st.warning("⚠️ Please select an organization from the sidebar to continue.")
+        else:
+            show_genai_validation(sf_conn)
+        _render_next_tab_btn("Validation Summary", "val_3")
     
     with tab5:
         if not sf_conn:
             st.warning("⚠️ Please select an organization from the sidebar to continue.")
         else:
-            show_validation_reports()
+            show_validation_summary()
+        _render_next_tab_btn("Saved Mappings", "val_4")
     
     with tab6:
         if not sf_conn:
             st.warning("⚠️ Please select an organization from the sidebar to continue.")
         else:
-            show_validation_summary()
-    
-    with tab7:
-        if not sf_conn:
-            st.warning("⚠️ Please select an organization from the sidebar to continue.")
-        else:
             show_saved_mappings_manager(st.session_state.get('current_org', 'unknown'))
+        # Last tab - no Next button
+
+    # Restore active tab via JS if a widget interaction triggered a rerun
+    if st.session_state.get('_val_tab_needs_restore', False):
+        active_idx = st.session_state.get('validation_active_tab', 0)
+        if active_idx > 0 and active_idx < len(tab_list):
+            tab_label = tab_list[active_idx][0]
+            escaped = tab_label.replace("'", "\\'").replace('"', '\\"')
+            st.session_state._val_tab_needs_restore = False
+            components.html(f"""
+            <script>
+                (function() {{
+                    var attempts = 0;
+                    function restoreTab() {{
+                        var tabs = window.parent.document.querySelectorAll('button[data-baseweb="tab"]');
+                        for (var i = 0; i < tabs.length; i++) {{
+                            if (tabs[i].innerText.includes('{escaped}') && tabs[i].getAttribute('aria-selected') !== 'true') {{
+                                tabs[i].click();
+                                return;
+                            }}
+                        }}
+                        attempts += 1;
+                        if (attempts < 10) {{
+                            window.setTimeout(restoreTab, 150);
+                        }}
+                    }}
+                    window.setTimeout(restoreTab, 50);
+                }})();
+            </script>
+            """, height=0)
+        else:
+            st.session_state._val_tab_needs_restore = False
 
 def show_schema_validation(sf_conn):
     """Schema validation interface"""
+    
     st.subheader("🔍 Schema Validation")
     st.markdown("Validate data against Salesforce object schema - field types, required fields, formats, etc.")
     
@@ -608,6 +667,7 @@ def show_schema_validation(sf_conn):
                 "Select Salesforce Object for Validation",
                 options=[""] + objects,
                 key="schema_validation_object",
+                on_change=lambda: _mark_val_tab(0),
                 help="Choose the object to validate against"
             )
         else:
@@ -627,7 +687,7 @@ def show_schema_validation(sf_conn):
         
         # Import Data Hub integration functions
         try:
-            from ui_components.data_hub.integration import has_data, get_data_from_hub, show_data_source_info
+            from ui_components.data_hub.integration import has_data, select_dataset_from_hub
             data_hub_available = has_data()
         except ImportError:
             data_hub_available = False
@@ -644,18 +704,29 @@ def show_schema_validation(sf_conn):
             key="schema_validation_source"
         )
         
-        validation_data = None
+        # Initialize session state for schema validation data (PERSISTENCE FIX)
+        if 'schema_validation_data' not in st.session_state:
+            st.session_state.schema_validation_data = None
+        if 'schema_validation_source' not in st.session_state:
+            st.session_state.schema_validation_source = None
+        
+        # Reset data if data source changed
+        if st.session_state.schema_validation_source != data_source:
+            st.session_state.schema_validation_data = None
+            st.session_state.schema_field_mappings = {}
+            st.session_state.schema_validation_source = data_source
+        
+        validation_data = st.session_state.schema_validation_data
         
         if data_source == "Use Data Hub":
-            st.success("📊 Data Hub has an active dataset available!")
-            show_data_source_info()
-            
-            if st.button("✅ Load from Data Hub", use_container_width=True, key="schema_load_from_hub"):
-                validation_data = get_data_from_hub()
-                if validation_data is not None:
-                    st.success(f"✅ Data loaded from Hub: {len(validation_data)} rows, {len(validation_data.columns)} columns")
+            hub_df = select_dataset_from_hub("schema_validation")
+            if hub_df is not None:
+                if st.button("✅ Load Selected Dataset", use_container_width=True, key="schema_load_from_hub"):
+                    st.session_state.schema_validation_data = hub_df
+                    validation_data = hub_df
+                    st.success(f"✅ Data loaded from Hub: {len(hub_df)} rows, {len(hub_df.columns)} columns")
                     with st.expander("📊 Data Preview", expanded=False):
-                        st.dataframe(validation_data.head(10), use_container_width=True)
+                        st.dataframe(hub_df.head(10), use_container_width=True)
         
         elif data_source == "Upload File":
             uploaded_file = st.file_uploader(
@@ -666,7 +737,9 @@ def show_schema_validation(sf_conn):
             )
             
             if uploaded_file and validate_file_upload(uploaded_file):
-                validation_data = load_data_file(uploaded_file)
+                loaded_data = load_data_file(uploaded_file)
+                st.session_state.schema_validation_data = loaded_data
+                validation_data = loaded_data
         
         elif data_source == "Select Existing File":
             existing_files = get_validation_files(selected_object)
@@ -679,13 +752,18 @@ def show_schema_validation(sf_conn):
                 )
                 
                 if selected_file:
-                    validation_data = load_existing_validation_file(selected_file)
+                    loaded_data = load_existing_validation_file(selected_file)
+                    st.session_state.schema_validation_data = loaded_data
+                    validation_data = loaded_data
             else:
                 st.info("No existing files found for validation")
         
         else:
             # Use sample data
-            validation_data = generate_sample_data(sf_conn, selected_object)
+            if validation_data is None:
+                loaded_data = generate_sample_data(sf_conn, selected_object)
+                st.session_state.schema_validation_data = loaded_data
+                validation_data = loaded_data
         
         # Validation configuration
         if validation_data is not None:
@@ -799,6 +877,7 @@ def show_schema_validation(sf_conn):
                         with col_auto2:
                             if st.button("🔄 Reset Mappings", help="Clear all mappings and re-apply auto-mapping"):
                                 st.session_state.schema_field_mappings = suggested_mappings.copy()
+                                _mark_val_tab(0)
                                 st.rerun()
                     else:
                         st.info("ℹ️ No automatic mappings found. Please map columns manually.")
@@ -963,18 +1042,330 @@ def show_schema_validation(sf_conn):
             # Run schema validation
             if field_mappings:
                 if st.button("🚀 Run Schema Validation", type="primary", use_container_width=True):
-                    run_schema_validation(
-                        sf_conn, selected_object, validation_data,
-                        validate_required, validate_datatypes, validate_formats,
-                        validate_lengths, validate_picklists, strict_mode, field_mappings,
-                        st.session_state.get('current_org')
-                    )
+                    # Ensure we have the latest data from session state (PERSISTENCE FIX)
+                    validation_data_to_run = st.session_state.schema_validation_data
+                    if validation_data_to_run is not None:
+                        run_schema_validation(
+                            sf_conn, selected_object, validation_data_to_run,
+                            validate_required, validate_datatypes, validate_formats,
+                            validate_lengths, validate_picklists, strict_mode, field_mappings,
+                            st.session_state.get('current_org')
+                        )
+                    else:
+                        st.error("❌ No validation data available. Please load or upload data first.")
             else:
                 st.warning("⚠️ Configure at least one field mapping to run validation")
                 st.button("🚀 Run Schema Validation", type="primary", use_container_width=True, disabled=True)
 
+def show_custom_validation(sf_conn):
+    """Custom validation interface - allows users to define custom validation rules"""
+    
+    # Track that we're in the Custom Validation tab (prevent accidental tab switches on rerun)
+    st.subheader("✏️ Custom Validation")
+    st.markdown("Define custom validation rules for Salesforce objects - choose fields and write formulas to validate data")
+    
+    # Object selection
+    objects = get_salesforce_objects(sf_conn, filter_custom=False)
+    
+    if not objects:
+        st.error("❌ No Salesforce objects found")
+        return
+    
+    selected_object = st.selectbox(
+        "Select Salesforce Object",
+        options=[""] + objects,
+        key="custom_validation_object",
+        on_change=lambda: _mark_val_tab(2),
+        help="Choose the Salesforce object to create validation rules for"
+    )
+    
+    if not selected_object:
+        st.info("👆 Please select a Salesforce object to continue")
+        return
+    
+    st.session_state.current_object = selected_object
+    
+    # Initialize session state for custom rules
+    if 'custom_validation_rules' not in st.session_state:
+        st.session_state.custom_validation_rules = []
+    
+    # Get object fields
+    try:
+        from .utils import get_object_description
+        sf_object_info = get_object_description(sf_conn, selected_object)
+        
+        if not sf_object_info or 'fields' not in sf_object_info:
+            st.error(f"❌ Could not retrieve fields for {selected_object}")
+            return
+        
+        all_fields = [f['name'] for f in sf_object_info['fields']]
+        
+        # Rule creation section
+        st.write("### 📋 Create Validation Rules")
+        st.markdown("Define custom rules to validate your data against specific conditions")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            rule_name = st.text_input(
+                "Rule Name",
+                placeholder="e.g., Valid Phone Format, Required Email",
+                help="Give your rule a descriptive name"
+            )
+        
+        with col2:
+            rule_severity = st.selectbox(
+                "Severity",
+                options=["⚠️ Warning", "❌ Error"],
+                help="Set the severity level for violations"
+            )
+        
+        # Field selection for the rule
+        target_field = st.selectbox(
+            "Target Field",
+            options=[""] + all_fields,
+            help="Select the field this rule applies to"
+        )
+        
+        # Rule type selection
+        rule_type = st.radio(
+            "Rule Type",
+            options=[
+                "Custom Formula",
+                "Field Comparison",
+                "Pattern Match",
+                "Required Field"
+            ],
+            help="Choose the type of validation rule"
+        )
+        
+        # Rule definition based on type
+        if rule_type == "Custom Formula":
+            formula = st.text_area(
+                "Validation Formula",
+                placeholder="e.g., LEN({Phone}) >= 10\nor {Email} LIKE '%@%.%'\nor {Amount} > 0",
+                height=100,
+                help="Enter a formula to validate. Use {FieldName} for field references. Return TRUE if valid."
+            )
+            rule_description = f"Custom: {formula[:50]}..."
+        
+        elif rule_type == "Field Comparison":
+            compare_field = st.selectbox(
+                "Compare With Field",
+                options=[""] + all_fields,
+                help="Select the field to compare with"
+            )
+            comparison = st.selectbox(
+                "Comparison Type",
+                options=["Equals", "Not Equals", "Greater Than", "Less Than", "Contains"]
+            )
+            formula = f"{{Field: {target_field}}} {comparison} {{Field: {compare_field}}}"
+            rule_description = f"Compare {target_field} {comparison} {compare_field}"
+        
+        elif rule_type == "Pattern Match":
+            pattern = st.text_input(
+                "Regex Pattern",
+                placeholder="e.g., ^[A-Z][0-9]{3}$ for format like A123",
+                help="Enter a regular expression pattern"
+            )
+            formula = f"REGEX({{Field: {target_field}}}, '{pattern}')"
+            rule_description = f"Pattern: {pattern}"
+        
+        elif rule_type == "Required Field":
+            formula = f"NOT_EMPTY({{Field: {target_field}}})"
+            rule_description = f"Field '{target_field}' is required (not empty)"
+        
+        # Error message for the rule
+        error_message = st.text_input(
+            "Error Message",
+            placeholder="e.g., Phone number must be at least 10 digits",
+            help="Message to display when this rule is violated"
+        )
+        
+        # Add rule button
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("➕ Add Rule", use_container_width=True):
+                if not rule_name:
+                    st.error("❌ Please enter a rule name")
+                elif not target_field:
+                    st.error("❌ Please select a target field")
+                elif not formula:
+                    st.error("❌ Please define a formula")
+                else:
+                    new_rule = {
+                        'id': len(st.session_state.custom_validation_rules) + 1,
+                        'name': rule_name,
+                        'severity': rule_severity,
+                        'field': target_field,
+                        'type': rule_type,
+                        'formula': formula,
+                        'description': rule_description,
+                        'error_message': error_message or f"Validation failed for {target_field}"
+                    }
+                    st.session_state.custom_validation_rules.append(new_rule)
+                    st.success(f"✅ Rule '{rule_name}' added successfully!")
+                    _mark_val_tab(2)
+                    st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Clear Form", use_container_width=True):
+                _mark_val_tab(2)
+                st.rerun()
+        
+        with col3:
+            if st.button("💾 Save All Rules", use_container_width=True):
+                if st.session_state.custom_validation_rules:
+                    rules_save_path = os.path.join(
+                        project_root, 'Validation', 'CustomRules',
+                        st.session_state.get('current_org', 'unknown'),
+                        selected_object
+                    )
+                    os.makedirs(rules_save_path, exist_ok=True)
+                    
+                    save_file = os.path.join(rules_save_path, f"custom_rules_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                    with open(save_file, 'w') as f:
+                        json.dump(st.session_state.custom_validation_rules, f, indent=2)
+                    
+                    st.success(f"✅ Rules saved to {save_file}")
+                else:
+                    st.warning("⚠️ No rules to save")
+        
+        # Display existing rules
+        if st.session_state.custom_validation_rules:
+            st.write("### 📝 Defined Rules")
+            
+            for rule in st.session_state.custom_validation_rules:
+                with st.expander(f"{rule['severity']} {rule['name']} ({rule['field']})", expanded=False):
+                    col1, col2, col3 = st.columns([3, 1, 1])
+                    
+                    with col1:
+                        st.write(f"**Type:** {rule['type']}")
+                        st.write(f"**Formula:** `{rule['formula']}`")
+                        st.write(f"**Error Message:** {rule['error_message']}")
+                    
+                    with col2:
+                        if st.button("✏️ Edit", key=f"edit_{rule['id']}"):
+                            st.info("Edit functionality coming soon")
+                    
+                    with col3:
+                        if st.button("🗑️ Delete", key=f"delete_{rule['id']}"):
+                            st.session_state.custom_validation_rules = [r for r in st.session_state.custom_validation_rules if r['id'] != rule['id']]
+                            st.success("Rule deleted")
+                            _mark_val_tab(2)
+                            st.rerun()
+            
+            # Apply rules to data
+            st.divider()
+            st.write("### 🚀 Validate Data Against Rules")
+            
+            # Data source selection
+            try:
+                from ui_components.data_hub.integration import has_data, select_dataset_from_hub
+                data_hub_available = has_data()
+            except ImportError:
+                data_hub_available = False
+            
+            if data_hub_available:
+                source_options = ["Upload File", "Use Data Hub"]
+            else:
+                source_options = ["Upload File"]
+            
+            data_source = st.radio(
+                "Select Data Source",
+                options=source_options,
+                horizontal=True
+            )
+            
+            validation_data = None
+            
+            if data_source == "Upload File":
+                uploaded_file = st.file_uploader(
+                    "Upload data to validate",
+                    type=['csv', 'xlsx', 'xls', 'psv'],
+                    help="CSV, Excel, or PSV files"
+                )
+                
+                if uploaded_file:
+                    try:
+                        if uploaded_file.name.endswith('.csv'):
+                            validation_data = pd.read_csv(uploaded_file, dtype=str)
+                        elif uploaded_file.name.endswith('.psv'):
+                            validation_data = pd.read_csv(uploaded_file, sep='|', dtype=str)
+                        else:
+                            validation_data = pd.read_excel(uploaded_file, dtype=str)
+                        
+                        st.success(f"✅ Loaded {len(validation_data)} rows with {len(validation_data.columns)} columns")
+                    except Exception as e:
+                        st.error(f"❌ Error loading file: {str(e)}")
+            
+            elif data_source == "Use Data Hub":
+                hub_df = select_dataset_from_hub("custom_validation")
+                if hub_df is not None:
+                    validation_data = hub_df
+                    st.success(f"✅ Loaded {len(validation_data)} rows from Data Hub")
+            
+            # Run validation
+            if validation_data is not None:
+                if st.button("✅ Run Validation", type="primary", use_container_width=True):
+                    with st.spinner("🔄 Validating data..."):
+                        # Initialize results
+                        validation_results = {
+                            'total_records': len(validation_data),
+                            'passed_records': 0,
+                            'failed_records': 0,
+                            'validation_errors': [],
+                            'record_errors': {},
+                            'validated_data': validation_data.copy()
+                        }
+                        
+                        # Run each rule against the data
+                        for idx, row in validation_data.iterrows():
+                            row_has_errors = False
+                            
+                            for rule in st.session_state.custom_validation_rules:
+                                try:
+                                    # Simple rule evaluation
+                                    field_value = row.get(rule['field'], '')
+                                    
+                                    # Check rule type
+                                    if rule['type'] == 'Required Field':
+                                        if pd.isna(field_value) or str(field_value).strip() == '':
+                                            validation_results['validation_errors'].append(
+                                                f"Row {idx+1}: {rule['error_message']}"
+                                            )
+                                            row_has_errors = True
+                                    
+                                    elif rule['type'] == 'Pattern Match':
+                                        import re
+                                        pattern = rule['formula'].split("'")[1] if "'" in rule['formula'] else ''
+                                        if pattern and not re.match(pattern, str(field_value)):
+                                            validation_results['validation_errors'].append(
+                                                f"Row {idx+1}: {rule['error_message']}"
+                                            )
+                                            row_has_errors = True
+                                    
+                                    else:
+                                        # Generic formula check
+                                        st.warning(f"⚠️ Complex formula evaluation not yet implemented for '{rule['type']}'")
+                                
+                                except Exception as e:
+                                    st.warning(f"⚠️ Could not evaluate rule '{rule['name']}': {str(e)}")
+                            
+                            if row_has_errors:
+                                validation_results['failed_records'] += 1
+                                validation_results['record_errors'][str(idx)] = True
+                            else:
+                                validation_results['passed_records'] += 1
+                        
+                        # Display results
+                        display_enhanced_validation_results(validation_results, selected_object, "Custom Validation")
+
+    except Exception as e:
+        st.error(f"❌ Error in custom validation: {str(e)}")
+
 def show_genai_validation(sf_conn):
-    """GenAI validation interface"""
+    """SF Validation Rules interface - Extracts Salesforce validation rules and converts to Python"""
     
     # Initialize validation_data to prevent UnboundLocalError
     validation_data = None
@@ -999,11 +1390,11 @@ def show_genai_validation(sf_conn):
     if 'genai_num_functions' not in st.session_state:
         st.session_state.genai_num_functions = 0
     
-    st.subheader("🤖 GenAI Validation")
+    st.subheader("🔧 SF Validation Rules")
     
     # Main description and workflow
     st.markdown("""
-    **GenAI Validation** converts your Salesforce validation rules into Python functions that can validate data outside of Salesforce.
+    **SF Validation Rules** extracts validation rules from your Salesforce organization and converts them into Python functions that can validate data outside of Salesforce.
     
     ### How it works:
     1. **Extract Rules**: Get validation rules from Salesforce or enter them manually
@@ -1026,19 +1417,22 @@ def show_genai_validation(sf_conn):
             "Select Salesforce Object",
             options=["Select an object..."] + objects,
             key="genai_validation_object",
+            on_change=lambda: _mark_val_tab(3),
             help="Choose the Salesforce object to extract validation rules from"
         )
         
         # Clear previous results when object changes
         if hasattr(st.session_state, 'current_genai_object'):
             if st.session_state.current_genai_object != selected_object:
-                # Object changed - clear previous validation results
+                # Object changed - clear previous validation results and data
                 if 'genai_validation_results' in st.session_state:
                     del st.session_state.genai_validation_results
                 if 'genai_validation_completed' in st.session_state:
                     del st.session_state.genai_validation_completed
                 if 'genai_original_data' in st.session_state:
                     del st.session_state.genai_original_data
+                if 'genai_validation_data' in st.session_state:
+                    st.session_state.genai_validation_data = None
                 if 'genai_bundle_generated' in st.session_state:
                     st.session_state.genai_bundle_generated = False
                 if 'genai_bundle_content' in st.session_state:
@@ -1065,10 +1459,10 @@ def show_genai_validation(sf_conn):
     if selected_object and selected_object != "Select an object...":
         st.session_state.current_object = selected_object
         
-        # NEW GENAI VALIDATION WORKFLOW
+        # SF VALIDATION RULES WORKFLOW
         st.markdown("---")
-        st.markdown("## 🤖 **GenAI Validation Workflow**")
-        st.markdown("*Convert Salesforce validation formulas to Python functions using AI*")
+        st.markdown("## 🔧 **SF Validation Rules Workflow**")
+        st.markdown("*Extract and convert Salesforce validation formulas to Python functions*")
         
         # Step 1: Extract Validation Rule Formulas
         st.markdown("### 📋 **Step 1: Extract Validation Rule Formulas**")
@@ -1150,6 +1544,7 @@ def show_genai_validation(sf_conn):
                         with st.expander("View Formula Preview", expanded=True):
                             st.dataframe(df.head(), use_container_width=True)
                         
+                        _mark_val_tab(3)
                         st.rerun()  # Refresh to show download option
                     else:
                         st.warning("⚠️ No validation rules with formulas found for this object")
@@ -1408,6 +1803,7 @@ def show_genai_validation(sf_conn):
                                         
                                         st.info("📋 Detailed conversion logs are available below in Step 2 section")
                                     
+                                    _mark_val_tab(3)
                                     st.rerun()
                                 else:
                                     st.error("❌ Failed to generate AI validation bundle")
@@ -1643,7 +2039,7 @@ def show_genai_validation(sf_conn):
                     # File upload
                     # Import Data Hub integration functions
                     try:
-                        from ui_components.data_hub.integration import has_data, get_data_from_hub, show_data_source_info
+                        from ui_components.data_hub.integration import has_data, select_dataset_from_hub
                         data_hub_available = has_data()
                     except ImportError:
                         data_hub_available = False
@@ -1658,15 +2054,18 @@ def show_genai_validation(sf_conn):
                     else:
                         data_source_option = "Upload File"
                     
-                    df = None
+                    # Initialize session state for SF Validation Rules data
+                    if 'genai_validation_data' not in st.session_state:
+                        st.session_state.genai_validation_data = None
+                    
+                    df = st.session_state.genai_validation_data
                     
                     if data_source_option == "Use Data Hub" and data_hub_available:
-                        st.success("📊 Data Hub has an active dataset available!")
-                        show_data_source_info()
-                        
-                        if st.button("✅ Load from Data Hub", use_container_width=True, key="genai_load_from_hub"):
-                            df = get_data_from_hub()
-                            if df is not None:
+                        hub_df = select_dataset_from_hub("genai_validation")
+                        if hub_df is not None:
+                            if st.button("✅ Load Selected Dataset", use_container_width=True, key="genai_load_from_hub"):
+                                df = hub_df
+                                st.session_state.genai_validation_data = df
                                 st.success(f"✅ Data loaded from Hub: {len(df)} rows, {len(df.columns)} columns")
                                 with st.expander("📊 Data Preview", expanded=False):
                                     st.dataframe(df.head(10), use_container_width=True)
@@ -1681,6 +2080,7 @@ def show_genai_validation(sf_conn):
                         if uploaded_file is not None:
                             df = load_data_file(uploaded_file)
                             if df is not None:
+                                st.session_state.genai_validation_data = df
                                 st.success(f"✅ Successfully loaded {len(df)} records from {uploaded_file.name}")
                                 
                                 # Show data preview
@@ -1802,6 +2202,7 @@ def show_genai_validation(sf_conn):
                                         with col_auto2:
                                             if st.button("🔄 Reset Mappings", help="Clear all mappings and re-apply auto-mapping", key="genai_reset_mapping"):
                                                 st.session_state.genai_field_mappings = suggested_mappings.copy()
+                                                _mark_val_tab(3)
                                                 st.rerun()
                                     else:
                                         st.info("ℹ️ No automatic mappings found. Please map columns manually.")
@@ -1990,6 +2391,7 @@ def show_genai_validation(sf_conn):
                                             st.session_state.genai_validation_results = validation_results
                                             st.session_state.genai_validation_completed = True
                                             st.session_state.genai_original_data = df  # Store original data for results
+                                            _mark_val_tab(3)
                                             st.rerun()
                                         else:
                                             st.error("❌ Validation failed")
@@ -2209,6 +2611,7 @@ def show_object_comparison():
             if comparison_result and comparison_result.get('success'):
                 st.session_state.comparison_result = comparison_result
                 st.success("✅ Comparison completed successfully!")
+                _mark_val_tab(4)
                 st.rerun()
             else:
                 st.error(f"❌ Comparison failed: {comparison_result.get('error', 'Unknown error')}")
@@ -2234,13 +2637,17 @@ def show_validation_reports():
         # Report type selection
         report_type = st.selectbox(
             "Select Report Type",
-            ["All Validations", "Schema Validation", "Custom Validation", "GenAI Validation"],
+            ["All Validations", "Schema Validation", "Custom Validation", "SF Validation Rules"],
             key="validation_report_type"
         )
         
         # Filter results based on report type
         if report_type != "All Validations":
-            filtered_results = [r for r in validation_results if report_type.lower().replace(" ", "_") in r.get('type', '')]
+            report_key = report_type.lower().replace(" ", "_")
+            filtered_results = [
+                r for r in validation_results
+                if report_key in str(r.get('validation_type', '')).lower().replace(" ", "_")
+            ]
         else:
             filtered_results = validation_results
         
@@ -5485,6 +5892,7 @@ def check_objects_with_validation_rules(sf_conn):
                     with col2:
                         if st.button(f"Select {obj_info['object']}", key=f"select_{obj_info['object']}"):
                             st.session_state.genai_validation_object = obj_info['object']
+                            _mark_val_tab(3)
                             st.rerun()
             else:
                 st.warning("⚠️ No validation rules found in the checked objects")
@@ -5754,7 +6162,7 @@ def run_genai_validation(object_name: str, data: pd.DataFrame, fail_fast: bool =
                 return
             
             # Add debugging toggle
-            debug_mode = st.checkbox("🔍 Enable GenAI Validation Debug Mode", value=False)
+            debug_mode = st.checkbox("🔍 Enable SF Validation Rules Debug Mode", value=False)
             
             if debug_mode:
                 st.subheader("🔍 Debug: AI Validation Information")
@@ -6164,36 +6572,526 @@ def generate_sample_data(sf_conn, object_name: str) -> Optional[pd.DataFrame]:
         return None
 
 def get_validation_results() -> List[Dict]:
-    """Get validation results"""
-    return []
+    """Get validation results from Validation folder structure
+    
+    Scans the Validation folder and loads all saved validation results.
+    Returns a list of validation result dictionaries with metadata.
+    """
+    results = []
+    validation_root = os.path.join(project_root, 'Validation')
+    
+    if not os.path.exists(validation_root):
+        return results
+    
+    try:
+        def _normalize_validation_type(value: str) -> str:
+            raw = str(value or '').strip().lower()
+            collapsed = re.sub(r'[^a-z0-9]+', '', raw)
+            mapping = {
+                'schemavalidation': 'schema_validation',
+                'schema_validation': 'schema_validation',
+                'customvalidation': 'custom_validation',
+                'custom_validation': 'custom_validation',
+                'enhancedvalidation': 'enhanced_validation',
+                'enhanced_validation': 'enhanced_validation',
+                'genaivalidation': 'genai_validation',
+                'genai_validation': 'genai_validation',
+                'sfvalidationrules': 'sf_validation_rules',
+                'sf_validation_rules': 'sf_validation_rules',
+                'validationreports': 'validation_reports',
+                'validationsummary': 'validation_summary'
+            }
+            return mapping.get(collapsed, raw.replace(' ', '_'))
+
+        def _infer_validation_type_from_filename(file_name: str) -> str:
+            lower_name = str(file_name or '').lower()
+            if 'schema_validation' in lower_name or 'schemavalidation' in lower_name:
+                return 'schema_validation'
+            if 'enhanced_validation' in lower_name or 'enhancedvalidation' in lower_name:
+                return 'enhanced_validation'
+            if 'custom_validation' in lower_name or 'customvalidation' in lower_name:
+                return 'custom_validation'
+            if 'sf_validation_rules' in lower_name or 'sfvalidationrules' in lower_name or 'validation_rules' in lower_name:
+                return 'sf_validation_rules'
+            if 'genai_validation' in lower_name or 'genaivalidation' in lower_name:
+                return 'genai_validation'
+            return ''
+        
+        # Scan through Validation folder structure.
+        # Current writer format is mostly: Validation/[validation_type]/[org_name]/[object_name]/[date]/[files]
+        # Keep backward compatibility with older layouts.
+        for root, dirs, files in os.walk(validation_root):
+            for file in files:
+                lower_file = file.lower()
+                if (
+                    (
+                        lower_file.endswith('.json') and
+                        ('_results' in lower_file or '_complete_results' in lower_file)
+                    ) or
+                    (
+                        lower_file.endswith('.csv') and
+                        ('_results' in lower_file or '_complete_results' in lower_file)
+                    )
+                ):
+                    file_path = os.path.join(root, file)
+                    try:
+                        # Extract metadata from file path
+                        path_parts = root.replace(validation_root, '').strip(os.sep).split(os.sep)
+                        
+                        result_dict = {
+                            'file_path': file_path,
+                            'file_name': file,
+                            'file_type': 'json' if file.endswith('.json') else 'csv',
+                            'timestamp': datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat()
+                        }
+                        
+                        # Parse path to extract org, object, type
+                        known_types = {
+                            'schema_validation', 'custom_validation', 'genai_validation',
+                            'enhanced_validation', 'sf_validation_rules', 'validation_reports',
+                            'validation_summary'
+                        }
+
+                        inferred_validation_type = _infer_validation_type_from_filename(file)
+                        if inferred_validation_type:
+                            result_dict['validation_type'] = inferred_validation_type
+
+                        if len(path_parts) >= 4 and path_parts[0].lower() in known_types:
+                            # Validation/[type]/[org]/[object]/[date]
+                            if 'validation_type' not in result_dict:
+                                result_dict['validation_type'] = _normalize_validation_type(path_parts[0])
+                            result_dict['org'] = path_parts[1]
+                            result_dict['object'] = path_parts[2]
+                        elif len(path_parts) >= 3:
+                            # Backward compatibility: Validation/[org]/[object]/[type]
+                            result_dict['org'] = path_parts[0]
+                            result_dict['object'] = path_parts[1]
+                            if 'validation_type' not in result_dict:
+                                result_dict['validation_type'] = _normalize_validation_type(path_parts[2])
+                        elif len(path_parts) >= 1:
+                            if 'validation_type' not in result_dict:
+                                result_dict['validation_type'] = _normalize_validation_type(path_parts[0])
+                        
+                        # Load actual results
+                        if file.endswith('.json'):
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                result_dict['total_records'] = data.get('total_records', 0)
+                                result_dict['passed_records'] = data.get('passed_records', 0)
+                                result_dict['failed_records'] = data.get('failed_records', 0)
+                                result_dict['total_errors'] = len(data.get('validation_errors', []))
+                        elif file.endswith('.csv'):
+                            # For CSV results, try to infer from content
+                            df = pd.read_csv(file_path)
+                            result_dict['total_records'] = len(df)
+                            # Try to find relevant columns
+                            if 'Validation_Status' in df.columns:
+                                status_col = df['Validation_Status'].astype(str).str.upper().str.strip()
+                                result_dict['passed_records'] = len(df[status_col.isin(['PASSED', 'VALID'])])
+                                result_dict['failed_records'] = len(df[status_col.isin(['FAILED', 'INVALID'])])
+                                result_dict['total_errors'] = result_dict['failed_records']
+                            else:
+                                result_dict['passed_records'] = 0
+                                result_dict['failed_records'] = 0
+                                result_dict['total_errors'] = 0
+                        
+                        results.append(result_dict)
+                    except Exception as e:
+                        # Skip files that can't be parsed
+                        continue
+        
+        # Sort by timestamp (newest first)
+        results.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+    except Exception as e:
+        st.warning(f"⚠️ Error reading validation results: {str(e)}")
+    
+    return results
 
 def show_validation_results_summary(results: List[Dict]):
-    """Show validation results summary"""
-    st.write("Validation results summary coming soon...")
+    """Show validation results summary in table format"""
+    if not results:
+        st.info("No validation results to display")
+        return
+    
+    # Create summary dataframe
+    summary_data = []
+    for result in results:
+        summary_data.append({
+            'Date': result.get('timestamp', '')[:10],
+            'Time': result.get('timestamp', '')[11:19] if len(result.get('timestamp', '')) > 11 else '',
+            'Organization': result.get('org', 'Unknown'),
+            'Object': result.get('object', 'Unknown'),
+            'Validation Type': result.get('validation_type', 'Unknown'),
+            'Total Records': result.get('total_records', 0),
+            'Passed': result.get('passed_records', 0),
+            'Failed': result.get('failed_records', 0),
+            'Success Rate': f"{(result.get('passed_records', 0) / result.get('total_records', 1) * 100):.1f}%" if result.get('total_records', 0) > 0 else '0%'
+        })
+    
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Display with color coding
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 def show_validation_result_detail(result: Dict):
-    """Show detailed validation result"""
-    st.write("Detailed validation result coming soon...")
+    """Show detailed validation result with expandable details"""
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        st.markdown(f"**{result.get('object', 'Unknown')}** - {result.get('validation_type', 'Unknown')}")
+    
+    with col2:
+        status = '✅ All Passed' if result.get('failed_records', 0) == 0 else f"❌ {result.get('failed_records', 0)} Failed"
+        st.write(status)
+    
+    with col3:
+        st.caption(result.get('timestamp', 'Unknown')[:19])
+    
+    # Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total", result.get('total_records', 0))
+    with col2:
+        st.metric("Passed", result.get('passed_records', 0))
+    with col3:
+        st.metric("Failed", result.get('failed_records', 0))
+    with col4:
+        success_rate = (result.get('passed_records', 0) / result.get('total_records', 1) * 100) if result.get('total_records', 0) > 0 else 0
+        st.metric("Success Rate", f"{success_rate:.1f}%")
+    
+    # Download option
+    if os.path.exists(result.get('file_path', '')):
+        with open(result['file_path'], 'r', encoding='utf-8') as f:
+            file_content = f.read()
+        
+        st.download_button(
+            label="📥 Download Results",
+            data=file_content,
+            file_name=result.get('file_name', 'results.json'),
+            mime='application/json' if result.get('file_type') == 'json' else 'text/csv',
+            key=f"download_{result.get('file_path', '')}"
+        )
+    
+    st.divider()
 
 def get_comprehensive_validation_summary() -> Optional[Dict]:
-    """Get comprehensive validation summary"""
-    return None
+    """Get comprehensive validation summary aggregating all validation results
+    
+    Returns dictionary with:
+    - total_validations
+    - total_records_processed
+    - overall_pass_rate
+    - failed_records_total
+    - validation_types
+    - objects_validated
+    - quality_score
+    - top_issues
+    """
+    results = get_validation_results()
+    
+    if not results:
+        return None
+    
+    # Aggregate metrics
+    summary = {
+        'total_validations': len(results),
+        'total_records_processed': sum(r.get('total_records', 0) for r in results),
+        'total_passed_records': sum(r.get('passed_records', 0) for r in results),
+        'total_failed_records': sum(r.get('failed_records', 0) for r in results),
+        'total_errors': sum(r.get('total_errors', 0) for r in results),
+        'validation_types': {},
+        'objects_validated': set(),
+        'results': results
+    }
+    
+    # Calculate overall pass rate
+    if summary['total_records_processed'] > 0:
+        summary['overall_pass_rate'] = (summary['total_passed_records'] / summary['total_records_processed']) * 100
+    else:
+        summary['overall_pass_rate'] = 0
+    
+    # Aggregate by validation type
+    for result in results:
+        val_type = result.get('validation_type', 'Unknown')
+        if val_type not in summary['validation_types']:
+            summary['validation_types'][val_type] = {
+                'count': 0,
+                'passed': 0,
+                'failed': 0,
+                'total_records': 0
+            }
+        summary['validation_types'][val_type]['count'] += 1
+        summary['validation_types'][val_type]['passed'] += result.get('passed_records', 0)
+        summary['validation_types'][val_type]['failed'] += result.get('failed_records', 0)
+        summary['validation_types'][val_type]['total_records'] += result.get('total_records', 0)
+        
+        # Collect unique objects
+        summary['objects_validated'].add(result.get('object', 'Unknown'))
+    
+    # Convert set to list for JSON serialization
+    summary['objects_validated'] = list(summary['objects_validated'])
+    
+    # Calculate quality score (0-100)
+    # Based on: pass rate (60%), error count (20%), consistency (20%)
+    if summary['total_records_processed'] > 0:
+        pass_rate_score = summary['overall_pass_rate']
+        error_score = max(0, 100 - (summary['total_errors'] / summary['total_records_processed'] * 100))
+        consistency_score = min(100, len(summary['objects_validated']) * 10)  # Encourage validating multiple objects
+        summary['quality_score'] = (pass_rate_score * 0.6 + error_score * 0.2 + consistency_score * 0.2)
+    else:
+        summary['quality_score'] = 0
+    
+    return summary
 
 def show_quality_metrics(summary: Dict):
-    """Show quality metrics"""
-    st.write("Quality metrics coming soon...")
+    """Show quality metrics dashboard"""
+    if not summary:
+        st.info("No validation data available")
+        return
+    
+    # Key metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric("📊 Total Validations", summary['total_validations'])
+    
+    with col2:
+        st.metric("📈 Total Records", summary['total_records_processed'])
+    
+    with col3:
+        pass_rate = summary['overall_pass_rate']
+        if pass_rate >= 95:
+            color = '🟢'
+        elif pass_rate >= 80:
+            color = '🟡'
+        else:
+            color = '🔴'
+        st.metric(f"{color} Pass Rate", f"{pass_rate:.1f}%")
+    
+    with col4:
+        st.metric("❌ Total Failed", summary['total_failed_records'])
+    
+    with col5:
+        quality = summary.get('quality_score', 0)
+        st.metric("⭐ Quality Score", f"{quality:.1f}/100")
+    
+    st.divider()
+    
+    # Quality assessment
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📋 Validation Summary by Type")
+        
+        val_types_data = []
+        for val_type, stats in summary['validation_types'].items():
+            if stats['total_records'] > 0:
+                success_rate = (stats['passed'] / stats['total_records']) * 100
+            else:
+                success_rate = 0
+            
+            val_types_data.append({
+                'Validation Type': val_type,
+                'Runs': stats['count'],
+                'Passed': stats['passed'],
+                'Failed': stats['failed'],
+                'Success Rate': f"{success_rate:.1f}%"
+            })
+        
+        if val_types_data:
+            val_types_df = pd.DataFrame(val_types_data)
+            st.dataframe(val_types_df, use_container_width=True, hide_index=True)
+    
+    with col2:
+        st.subheader("🎯 Objects Validated")
+        
+        if summary['objects_validated']:
+            st.write(f"**Total Unique Objects:** {len(summary['objects_validated'])}")
+            for obj in sorted(summary['objects_validated']):
+                st.write(f"• {obj}")
+        else:
+            st.info("No objects validated yet")
 
 def show_quality_trends(summary: Dict):
-    """Show quality trends"""
-    st.write("Quality trends coming soon...")
+    """Show quality trends over time"""
+    st.subheader("📈 Validation Trends")
+    
+    results = summary.get('results', [])
+    if not results or len(results) < 2:
+        st.info("Not enough data to show trends. Run more validations to see trends.")
+        return
+    
+    # Create trend data (group by date)
+    trend_data = {}
+    for result in results:
+        date = result.get('timestamp', '')[:10]
+        if date not in trend_data:
+            trend_data[date] = {
+                'total': 0,
+                'passed': 0,
+                'failed': 0,
+                'validations': 0
+            }
+        trend_data[date]['total'] += result.get('total_records', 0)
+        trend_data[date]['passed'] += result.get('passed_records', 0)
+        trend_data[date]['failed'] += result.get('failed_records', 0)
+        trend_data[date]['validations'] += 1
+    
+    # Sort by date
+    sorted_dates = sorted(trend_data.keys())
+    
+    # Create dataframe for visualization
+    trend_df = pd.DataFrame([
+        {
+            'Date': date,
+            'Pass Rate %': (trend_data[date]['passed'] / trend_data[date]['total'] * 100) if trend_data[date]['total'] > 0 else 0,
+            'Validations': trend_data[date]['validations'],
+            'Records': trend_data[date]['total']
+        }
+        for date in sorted_dates
+    ])
+    
+    # Display chart
+    if not trend_df.empty:
+        st.line_chart(trend_df.set_index('Date')['Pass Rate %'])
+        st.dataframe(trend_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No trend data available")
 
 def show_issue_breakdown(summary: Dict):
-    """Show issue breakdown"""
-    st.write("Issue breakdown coming soon...")
+    """Show breakdown of issues and problem areas"""
+    st.subheader("⚠️ Issue Breakdown")
+    
+    results = summary.get('results', [])
+    if not results:
+        st.info("No issue data available")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Validation Type Performance**")
+        
+        # Group failures by validation type
+        val_type_failures = {}
+        for result in results:
+            val_type = result.get('validation_type', 'Unknown')
+            failed = result.get('failed_records', 0)
+            if val_type not in val_type_failures:
+                val_type_failures[val_type] = 0
+            val_type_failures[val_type] += failed
+        
+        if val_type_failures:
+            failure_df = pd.DataFrame([
+                {
+                    'Validation Type': val_type,
+                    'Failed Records': count
+                }
+                for val_type, count in sorted(val_type_failures.items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.bar_chart(failure_df.set_index('Validation Type'))
+            st.dataframe(failure_df, use_container_width=True, hide_index=True)
+    
+    with col2:
+        st.write("**Object-wise Failures**")
+        
+        # Group failures by object
+        object_failures = {}
+        for result in results:
+            obj = result.get('object', 'Unknown')
+            failed = result.get('failed_records', 0)
+            if obj not in object_failures:
+                object_failures[obj] = 0
+            object_failures[obj] += failed
+        
+        if object_failures:
+            obj_failure_df = pd.DataFrame([
+                {
+                    'Object': obj,
+                    'Failed Records': count
+                }
+                for obj, count in sorted(object_failures.items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.bar_chart(obj_failure_df.set_index('Object'))
+            st.dataframe(obj_failure_df, use_container_width=True, hide_index=True)
 
 def show_quality_recommendations(summary: Dict):
-    """Show quality recommendations"""
-    st.write("Quality recommendations coming soon...")
+    """Show quality recommendations based on validation data"""
+    st.subheader("💡 Data Quality Recommendations")
+    
+    if not summary:
+        return
+    
+    recommendations = []
+    
+    pass_rate = summary.get('overall_pass_rate', 0)
+    
+    # Recommendation 1: Overall pass rate
+    if pass_rate < 70:
+        recommendations.append({
+            'severity': '🔴 Critical',
+            'title': 'Low Overall Pass Rate',
+            'suggestion': f'Your data has a {pass_rate:.1f}% pass rate. Consider implementing stricter data validation rules before importing data to Salesforce.',
+            'action': 'Review failed records and fix data quality issues'
+        })
+    elif pass_rate < 85:
+        recommendations.append({
+            'severity': '🟡 Warning',
+            'title': 'Pass Rate Below Target',
+            'suggestion': f'Your pass rate is {pass_rate:.1f}%. Aim for 95%+ before data load.',
+            'action': 'Identify common failure patterns and address them'
+        })
+    else:
+        recommendations.append({
+            'severity': '🟢 Good',
+            'title': 'Excellent Data Quality',
+            'suggestion': f'Your data quality is excellent with a {pass_rate:.1f}% pass rate.',
+            'action': 'Continue monitoring data quality'
+        })
+    
+    # Recommendation 2: Validation coverage
+    validations = summary.get('total_validations', 0)
+    if validations < 3:
+        recommendations.append({
+            'severity': '🟡 Info',
+            'title': 'Limited Validation Coverage',
+            'suggestion': f'You have only run {validations} validation(s). Run more validation types to improve data quality assurance.',
+            'action': 'Run Schema, GenAI, and Custom validations'
+        })
+    
+    # Recommendation 3: Objects validated
+    objects = len(summary.get('objects_validated', []))
+    if objects < 2:
+        recommendations.append({
+            'severity': '🟡 Info',
+            'title': 'Limited Object Coverage',
+            'suggestion': f'You have validated only {objects} object(s). Consider validating more objects.',
+            'action': 'Expand validation to other critical objects'
+        })
+    
+    # Recommendation 4: Error trends
+    results = summary.get('results', [])
+    if len(results) > 2:
+        # Check if errors are increasing
+        recent_errors = sum(r.get('failed_records', 0) for r in results[:2])
+        older_errors = sum(r.get('failed_records', 0) for r in results[2:4]) if len(results) > 3 else recent_errors
+        
+        if older_errors > 0 and recent_errors > older_errors * 1.2:
+            recommendations.append({
+                'severity': '🔴 Alert',
+                'title': 'Increasing Error Trend',
+                'suggestion': 'Error rates are increasing. Investigate root causes immediately.',
+                'action': 'Review recent changes to data or validation rules'
+            })
+    
+    # Display recommendations
+    if recommendations:
+        for rec in recommendations:
+            with st.expander(f"{rec['severity']} {rec['title']}", expanded=len(recommendations) == 1):
+                st.write(f"**Suggestion:** {rec['suggestion']}")
+                st.write(f"**Action:** {rec['action']}")
+    else:
+        st.info("No specific recommendations at this time")
 
 def save_validation_results(results: Dict, object_name: str, validation_type: str):
     """Save validation results to file and return file path"""
@@ -6870,20 +7768,99 @@ def run_genai_validation_on_data(df: pd.DataFrame, ai_bundle_result: dict):
                 fixed_code = fixed_code.replace('$ df[', 'df[')
                 fixes_applied.append("Removed invalid '$' symbols")
             
+            # Fix 1b: Remove stray $ before safe_get / function calls (from unhandled $-globals)
+            if '$safe_get(' in fixed_code or '$_' in fixed_code:
+                fixed_code = re.sub(r'\$safe_get\(', 'safe_get(', fixed_code)
+                fixed_code = re.sub(r'\$(_[a-z])', r'\1', fixed_code)
+                fixes_applied.append("Removed stray '$' from global merge field references")
+            
             # Fix 2: Fix incorrect .df[] patterns
             import re
             # Pattern: df['something'].df['field'] -> df['something']['field']
+            _before_fix2 = fixed_code
             fixed_code = re.sub(r"df\['([^']+)'\]\.df\['([^']+)'\]", r"df['\2']", fixed_code)
-            if original_code != fixed_code:
+            if _before_fix2 != fixed_code:
                 fixes_applied.append("Fixed cross-object reference syntax")
             
             # Fix 3: Remove $Permission, $User references (unsupported)
-            if '$Permission' in fixed_code or '$User' in fixed_code:
-                # Replace $Permission.df['field'] with just a fallback value
+            # Strip docstrings and comments to avoid false positives on original formula text
+            _exec_code = re.sub(r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'', '', fixed_code)
+            _exec_code = re.sub(r'#[^\n]*', '', _exec_code)
+            if '$Permission' in _exec_code or '$User' in _exec_code:
+                _before_fix3 = fixed_code
                 fixed_code = re.sub(r"\$Permission\.df\['[^']+'\]", "False", fixed_code)
+                fixed_code = re.sub(r"\$Permission\.\w+", "False", fixed_code)
                 fixed_code = re.sub(r"\$User\.df\['[^']+'\]", "''", fixed_code)
-                fixes_applied.append("Replaced unsupported Permission/User references with default values")
-                syntax_messages.append(("warning", "⚠️ **Note:** This validation rule uses $Permission or $User references which are not supported in offline validation. These have been replaced with default values."))
+                fixed_code = re.sub(r"\$User\.\w+", "''", fixed_code)
+                if _before_fix3 != fixed_code:
+                    fixes_applied.append("Replaced unsupported Permission/User references with default values")
+                    syntax_messages.append(("warning", "⚠️ **Note:** This validation rule uses $Permission or $User references which are not supported in offline validation. These have been replaced with default values."))
+            
+            # Fix 4: Correct old _ischanged/_isnew helper logic in previously generated bundles
+            # Old _ischanged returned True for non-blank fields (caused all records to fail)
+            # Old _isnew returned True always (caused all records to fail)
+            if 'return not _is_blank(field_value)' in fixed_code:
+                _before_fix4 = fixed_code
+                # Replace old _ischanged body: "return not _is_blank(field_value)" → "return False"
+                fixed_code = fixed_code.replace(
+                    '    return not _is_blank(field_value)',
+                    '    return False  # Cannot detect changes offline - safe default'
+                )
+                if _before_fix4 != fixed_code:
+                    fixes_applied.append("Fixed _ischanged() to return False (cannot detect field changes in offline validation)")
+            
+            if re.search(r'def _isnew\(\):\s*\n(?:\s*"""[\s\S]*?"""\s*\n|\s*#[^\n]*\n)*\s*return True', fixed_code):
+                fixed_code = re.sub(
+                    r'(def _isnew\(\):\s*\n(?:\s*"""[\s\S]*?"""\s*\n|\s*#[^\n]*\n)*\s*)return True',
+                    r'\1return False  # Cannot detect record creation context offline - safe default',
+                    fixed_code
+                )
+                fixes_applied.append("Fixed _isnew() to return False (cannot detect creation context in offline validation)")
+            
+            # Fix 5: Inject field-presence skip into old validation functions that lack it
+            # Old bundles evaluate rules even when their required fields aren't in the data
+            if '_required_fields' not in fixed_code and 'def validate_' in fixed_code:
+                # Pattern: match each validate_ function's safe_get helper block
+                # and inject the field-presence guard just before it
+                _fix5_pattern = re.compile(
+                    r'(    # Helper to safely retrieve field values from row data\n'
+                    r'    def safe_get\(field_name\):)'
+                )
+                if _fix5_pattern.search(fixed_code):
+                    _inject = (
+                        '    # Skip this rule if none of its required fields are present in the data\n'
+                        '    # (auto-injected by toolkit)\n'
+                        '    if hasattr(row_data, "keys"):\n'
+                        '        _available = set(row_data.keys())\n'
+                        '    elif hasattr(row_data, "index"):\n'
+                        '        _available = set(row_data.index)\n'
+                        '    else:\n'
+                        '        _available = set()\n'
+                        '\n'
+                        r'\1'
+                    )
+                    _before_fix5 = fixed_code
+                    fixed_code = _fix5_pattern.sub(_inject, fixed_code)
+                    if _before_fix5 != fixed_code:
+                        fixes_applied.append("Added field-presence check to skip rules whose fields are not in the data")
+            
+            # Fix 6: Context-dependent rules with hardcoded True from $Permission/$User
+            # In old bundles, $Permission.X was replaced with True, causing rules to always
+            # fire their error condition. Replace entire error_condition with False for these.
+            import re as _re6
+            _ctx_pattern = _re6.compile(
+                r'(        error_condition = .*)(?:_or\(\s*True\s*,\s*_not\(True\)\s*\)|_and\(\s*True\s*,|_or\(\s*True\s*,\s*True\s*\))(.*)\n'
+            )
+            if _ctx_pattern.search(fixed_code):
+                _before_fix6 = fixed_code
+                # Replace the entire error_condition line with False for context-dependent rules
+                fixed_code = _re6.sub(
+                    r'        error_condition = False  # Context-dependent rule (uses $Permission/$User) - skipped in offline validation\n',
+                    _ctx_pattern,
+                    fixed_code
+                )
+                if _before_fix6 != fixed_code:
+                    fixes_applied.append("Skipped context-dependent rules that use $Permission/$User (cannot evaluate offline)")
             
             # If fixes were applied, save the corrected version
             if fixes_applied:
@@ -7528,6 +8505,7 @@ def show_saved_mappings_manager(org_name: str):
                             success, message = delete_field_mapping(org_name, mapping['object_name'])
                             if success:
                                 st.success(message)
+                                _mark_val_tab(5)
                                 st.rerun()
                             else:
                                 st.error(message)
@@ -7541,6 +8519,7 @@ def show_saved_mappings_manager(org_name: str):
 
 def show_enhanced_validation(sf_conn):
     """Enhanced validation interface with transform validation and comprehensive reporting"""
+    
     st.subheader("⚡ Enhanced Transform Validation")
     st.markdown("Advanced data transformation validation with success/failure categorization, lookup validation, and comprehensive reporting")
     
@@ -7561,9 +8540,8 @@ def show_enhanced_validation(sf_conn):
     # Import Data Hub integration functions
     try:
         from ui_components.data_hub.integration import (
-            get_data_from_hub,
             has_data,
-            show_data_source_info
+            select_dataset_from_hub
         )
     except ImportError as e:
         st.error(f"❌ Could not import Data Hub integration functions: {e}")
@@ -7573,38 +8551,54 @@ def show_enhanced_validation(sf_conn):
     # Step 1: Data Source Selection
     st.write("#### 📁 Step 1: Data Source")
     
-    df_original = None
-    data_source = "none"
+    # Initialize session state for enhanced validation data (PERSISTENCE FIX)
+    if 'enhanced_validation_data' not in st.session_state:
+        st.session_state.enhanced_validation_data = None
+    if 'enhanced_validation_source' not in st.session_state:
+        st.session_state.enhanced_validation_source = None
+    if 'enhanced_validation_object' not in st.session_state:
+        st.session_state.enhanced_validation_object = None
     
-    # Check if Data Hub has active dataset
-    if has_data():
-        st.success("📊 Data Hub has an active dataset available!")
+    data_source = "none"
+    data_hub_available = has_data()
+    
+    # Choose between Data Hub and Upload
+    if data_hub_available:
+        source_choice = st.radio(
+            "📊 **Data Source:**",
+            ["Use Data Hub", "Upload File"],
+            key="enhanced_validation_source_choice",
+            horizontal=True
+        )
+    else:
+        source_choice = "Upload File"
+        st.info("💡 No data in Data Hub. Upload a file below or load data in the 📊 Data Hub tab first.")
+    
+    if source_choice == "Use Data Hub":
+        hub_df = select_dataset_from_hub("enhanced_validation")
+        if hub_df is not None:
+            if st.button("✅ Load Selected Dataset", use_container_width=True, key="enhanced_load_from_hub"):
+                st.session_state.enhanced_validation_data = hub_df
+                st.session_state.enhanced_validation_source = "hub"
+                st.session_state.enhanced_validation_object = None
+                st.success(f"✅ **Data loaded from Hub!** {len(hub_df)} rows, {len(hub_df.columns)} columns")
+                with st.expander("📊 Data Preview", expanded=False):
+                    st.dataframe(hub_df.head(10), use_container_width=True)
         
-        # Show data source info
-        show_data_source_info()
-        
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("✅ Use Data Hub Dataset", use_container_width=True):
-                df_original = get_data_from_hub()
-                data_source = "hub"
-                if df_original is not None:
-                    st.success(f"✅ **Data loaded from Hub!** {len(df_original)} rows, {len(df_original.columns)} columns")
-                    with st.expander("📊 Data Preview", expanded=False):
-                        st.dataframe(df_original.head(10), use_container_width=True)
-        
-        with col2:
-            if st.button("📤 Upload Different File", use_container_width=True):
-                data_source = "upload"
-        
-        if data_source == "none":
+        # Use data from session state if previously loaded
+        if st.session_state.enhanced_validation_data is not None:
+            data_source = st.session_state.enhanced_validation_source
+            df_original = st.session_state.enhanced_validation_data
+        else:
             return
     else:
-        st.info("💡 No data in Data Hub. Upload a file below or load data in the 📊 Data Hub tab first.")
         data_source = "upload"
+        if st.session_state.enhanced_validation_data is not None and st.session_state.enhanced_validation_source == "upload":
+            data_source = "upload"
+            df_original = st.session_state.enhanced_validation_data
     
-    # File upload (if user chooses or Data Hub is empty)
-    if data_source == "upload" or df_original is None:
+    # File upload (if user chooses or no data yet)
+    if data_source == "upload" or st.session_state.enhanced_validation_data is None:
         st.write("**Upload a File:**")
         uploaded_file = st.file_uploader(
             "Choose a CSV, Excel, or PSV file",
@@ -7621,25 +8615,35 @@ def show_enhanced_validation(sf_conn):
         # Load data
         try:
             if uploaded_file.name.endswith('.csv'):
-                df_original = pd.read_csv(uploaded_file, dtype=str)
+                loaded_data = pd.read_csv(uploaded_file, dtype=str)
             elif uploaded_file.name.endswith('.psv'):
-                df_original = pd.read_csv(uploaded_file, sep='|', dtype=str)
+                loaded_data = pd.read_csv(uploaded_file, sep='|', dtype=str)
             else:
-                df_original = pd.read_excel(uploaded_file, dtype=str)
+                loaded_data = pd.read_excel(uploaded_file, dtype=str)
             
-            if df_original.empty:
+            if loaded_data.empty:
                 st.error("❌ The uploaded file is empty. Please upload a file with data.")
                 return
-                
-            st.success(f"✅ **Data loaded successfully!** {len(df_original)} rows, {len(df_original.columns)} columns")
+            
+            # Store in session state (PERSISTENCE FIX)
+            st.session_state.enhanced_validation_data = loaded_data
+            st.session_state.enhanced_validation_source = "upload"
+            st.session_state.enhanced_validation_object = None  # Reset object selection
+            df_original = loaded_data
+            data_source = "upload"
+            
+            st.success(f"✅ **Data loaded successfully!** {len(loaded_data)} rows, {len(loaded_data.columns)} columns")
             
             # Show data preview
             with st.expander("📊 Data Preview", expanded=False):
-                st.dataframe(df_original.head(10), use_container_width=True)
+                st.dataframe(loaded_data.head(10), use_container_width=True)
                 
         except Exception as e:
             st.error(f"❌ Error loading file: {str(e)}")
             return
+    
+    # Retrieve data from session state
+    df_original = st.session_state.enhanced_validation_data
     
     # If we don't have data at this point, stop
     if df_original is None:
@@ -7657,13 +8661,27 @@ def show_enhanced_validation(sf_conn):
         if not objects:
             st.error("❌ No Salesforce objects found")
             return
-            
+        
+        # Retrieve selected object from session state if available
+        current_selected = st.session_state.enhanced_validation_object
+        current_index = 0
+        if current_selected and current_selected in objects:
+            current_index = objects.index(current_selected) + 1
+        
         selected_object = st.selectbox(
             "Select Salesforce Object",
             options=[""] + objects,
-            key="enhanced_validation_object",
+            index=current_index,
+            key="enhanced_validation_object_selectbox",
+            on_change=lambda: _mark_val_tab(1),
             help="Choose the Salesforce object to validate against"
         )
+        
+        # Store in session state (PERSISTENCE FIX)
+        if selected_object:
+            st.session_state.enhanced_validation_object = selected_object
+        else:
+            st.session_state.enhanced_validation_object = None
         
         if not selected_object:
             st.info("👆 Please select a Salesforce object to continue")
@@ -8005,146 +9023,151 @@ def show_enhanced_validation(sf_conn):
     
     if enable_lookup_resolution:
         try:
-            with st.spinner("⚡ Resolving lookup fields with optimized bulk caching..."):
-                if field_mappings and resolve_lookups_with_bulk_cache:
-                    # ✅ Use optimized bulk caching approach
-                    st.info("🚀 Using high-performance bulk lookup caching...")
+            from ui_components.data_operations import (
+                resolve_lookup_fields_with_config,
+                resolve_lookup_fields_with_mapping,
+                resolve_lookup_fields
+            )
+            
+            # Detect lookup fields for configuration UI
+            sf_object_desc = getattr(sf_conn, selected_object).describe()
+            
+            # Build reverse mapping: SF field name → CSV column name
+            active_mappings = {}
+            if field_mappings:
+                active_mappings = {v: k for k, v in field_mappings.items()
+                                  if v and v != "-- Skip Field --" and v != "RecordTypeId"}
+            
+            detected_lookup_fields = {}
+            system_lookups = {'OwnerId', 'CreatedById', 'LastModifiedById', 'RecordTypeId', 'MasterRecordId'}
+            
+            for field in sf_object_desc['fields']:
+                field_name = field['name']
+                if field['type'] != 'reference' or field_name in system_lookups:
+                    continue
+                referenced_objects = field.get('referenceTo', [])
+                if not referenced_objects:
+                    continue
+                
+                csv_col = None
+                if field_name in df_original.columns:
+                    csv_col = field_name
+                elif field_name in active_mappings:
+                    csv_col = active_mappings[field_name]
+                    if csv_col not in df_original.columns:
+                        csv_col = None
+                
+                if csv_col is None:
+                    continue
+                
+                # Skip columns that already look like Salesforce IDs
+                sample_vals = df_original[csv_col].dropna().head(5).astype(str).tolist()
+                all_look_like_ids = all(
+                    (len(v) in [15, 18] and v[:3].isalnum())
+                    for v in sample_vals if v.strip()
+                ) if sample_vals else False
+                
+                if all_look_like_ids:
+                    continue
+                
+                detected_lookup_fields[field_name] = {
+                    'csv_column': csv_col,
+                    'referenced_object': referenced_objects[0],
+                    'label': field.get('label', field_name)
+                }
+            
+            if detected_lookup_fields:
+                st.success(f"✅ Found {len(detected_lookup_fields)} lookup field(s) that need resolution")
+                st.session_state['enhanced_unresolved_lookup_indices'] = []
+                
+                # Lookup configuration UI — same as Data Loading
+                lookup_configs = {}
+                config_key = f"enhanced_lookup_configs_{selected_object}"
+                if config_key not in st.session_state:
+                    st.session_state[config_key] = {}
+                
+                for sf_field_name, info in detected_lookup_fields.items():
+                    parent_obj = info['referenced_object']
+                    csv_col = info['csv_column']
                     
-                    # Get object metadata to identify lookup fields
-                    object_desc = getattr(sf_conn, selected_object).describe()
-                    
-                    # Create reverse mapping (Salesforce field -> CSV column)
-                    reverse_mappings = {sf_field: csv_col for csv_col, sf_field in field_mappings.items()}
-                    
-                    # Find lookup fields in the mappings
-                    lookup_fields_to_resolve = {}
-                    all_mapped_fields_info = {}  # For diagnostics
-                    
-                    for field in object_desc['fields']:
-                        field_name = field['name']
+                    with st.expander(f"🔗 {csv_col} → {parent_obj} ({info['label']})", expanded=False):
+                        # Get parent object fields for strategy selection
+                        try:
+                            parent_desc = getattr(sf_conn, parent_obj).describe()
+                            parent_field_names = [f['name'] for f in parent_desc['fields']]
+                            external_id_fields = [f['name'] for f in parent_desc['fields'] if f.get('externalId', False)]
+                            name_fields = [f['name'] for f in parent_desc['fields'] if f['name'] == 'Name' or f.get('nameField', False)]
+                        except Exception:
+                            parent_field_names = ['Name', 'Id']
+                            external_id_fields = []
+                            name_fields = ['Name']
                         
-                        if field_name in reverse_mappings:
-                            csv_column = reverse_mappings[field_name]
-                            field_type = field.get('type', 'unknown')
-                            
-                            # Store diagnostic info for ALL mapped fields
-                            all_mapped_fields_info[csv_column] = {
-                                'sf_field_name': field_name,
-                                'field_type': field_type,
-                                'is_reference': field_type == 'reference',
-                                'referenced_objects': field.get('referenceTo', [])
+                        strategy = st.radio(
+                            f"Matching strategy for {csv_col}:",
+                            options=["external_id", "unique_field", "field_combination"],
+                            format_func=lambda x: {"external_id": "External ID Field", "unique_field": "Unique/Name Field", "field_combination": "Field Combination"}[x],
+                            key=f"enhanced_lookup_strategy_{sf_field_name}",
+                            horizontal=True
+                        )
+                        
+                        match_fields = []
+                        if strategy == "external_id":
+                            if external_id_fields:
+                                sel = st.selectbox(f"External ID field on {parent_obj}:", external_id_fields, key=f"enhanced_ext_id_{sf_field_name}")
+                                match_fields = [sel]
+                            else:
+                                st.warning(f"No External ID fields found on {parent_obj}. Use 'Unique/Name Field' instead.")
+                        elif strategy == "unique_field":
+                            default_opts = name_fields + [f for f in parent_field_names if f not in name_fields]
+                            sel = st.selectbox(f"Match field on {parent_obj}:", default_opts, key=f"enhanced_uniq_{sf_field_name}")
+                            match_fields = [sel]
+                        elif strategy == "field_combination":
+                            sel = st.multiselect(f"Match fields on {parent_obj}:", parent_field_names, default=name_fields[:1], key=f"enhanced_combo_{sf_field_name}")
+                            match_fields = sel
+                        
+                        if match_fields:
+                            lookup_configs[sf_field_name] = {
+                                'parent_object': parent_obj,
+                                'csv_column': csv_col,
+                                'match_strategy': strategy,
+                                'match_fields': match_fields
                             }
-                            
-                            # Only add TRUE reference fields (lookups)
-                            if field_type == 'reference':
-                                referenced_objects = field.get('referenceTo', [])
-                                if referenced_objects:
-                                    lookup_fields_to_resolve[csv_column] = {
-                                        'sf_field_name': field_name,
-                                        'referenced_object': referenced_objects[0],
-                                        'label': field.get('label', field_name)
-                                    }
-                    
-                    # === DIAGNOSTIC: Show all mapped fields and their types ===
-                    with st.expander(f"🔍 DEBUG: Field Mapping Details ({len(all_mapped_fields_info)} mapped fields)", expanded=False):
-                        st.info("**All Mapped Fields and Their Types:**")
-                        for csv_col, info in all_mapped_fields_info.items():
-                            is_ref = "🔗 REFERENCE (Lookup)" if info['is_reference'] else f"📋 {info['field_type'].upper()}"
-                            st.write(f"• **{csv_col}** → {info['sf_field_name']} ({is_ref})")
-                            if info['referenced_objects']:
-                                st.write(f"  └─ References: {', '.join(info['referenced_objects'])}")
+                            st.success(f"✅ Will match on: {', '.join(match_fields)}")
+                
+                st.session_state[config_key] = lookup_configs
+                
+                # Run resolution
+                if lookup_configs:
+                    with st.spinner("🔄 Resolving lookup fields..."):
+                        lookup_result = resolve_lookup_fields_with_config(
+                            sf_conn, df_transformed, selected_object, lookup_configs, field_mappings,
+                            return_stats=True,
+                            unresolved_indices_session_key='enhanced_unresolved_lookup_indices'
+                        )
                         
-                        if lookup_fields_to_resolve:
-                            st.success(f"\n✅ **Lookup Fields to Resolve:** {len(lookup_fields_to_resolve)}")
-                            for csv_col in lookup_fields_to_resolve:
-                                st.write(f"  • {csv_col}")
+                        if isinstance(lookup_result, tuple):
+                            df_transformed, lookup_fields, lookup_count_summary = lookup_result
                         else:
-                            st.info(f"\n📝 **No lookup fields found** - All {len(all_mapped_fields_info)} mapped fields are non-reference types (picklist, text, etc.)")
-                    
-                    # Process each lookup field with bulk caching
-                    if lookup_fields_to_resolve:
-                        st.success(f"🔗 Found {len(lookup_fields_to_resolve)} lookup field(s)")
-                        
-                        total_unresolved_records = set()
-                        
-                        for csv_column, field_info in lookup_fields_to_resolve.items():
-                            parent_object = field_info['referenced_object']
-                            sf_field_name = field_info['sf_field_name']
-                            
-                            st.write(f"**Processing:** {csv_column} → {parent_object}")
-                            
-                            try:
-                                # ✅ Use optimized bulk caching for this lookup field
-                                # Note: sf_field_name is the field ON THE CHILD object, not parent
-                                # We pass None to trigger auto-detection of correct parent field
-                                df_transformed, mapping, unresolved_idx, unresolved_vals = resolve_lookups_with_bulk_cache(
-                                    sf_conn,
-                                    df_transformed,
-                                    csv_column,
-                                    parent_object,
-                                    lookup_field=None,  # Auto-detect correct field on parent object
-                                    show_progress=False  # Reduce UI clutter
-                                )
-                                
-                                # Track resolved values
-                                lookup_fields[csv_column] = parent_object
-                                lookup_count_summary[csv_column] = len(mapping)
-                                unresolved_records_summary[csv_column] = len(unresolved_idx)
-                                
-                                # Track all unresolved records
-                                total_unresolved_records.update(unresolved_idx)
-                                
-                                st.success(f"✅ Resolved {len(mapping)} unique values for {csv_column}")
-                                
-                            except Exception as field_error:
-                                st.warning(f"⚠️ Could not resolve {csv_column}: {str(field_error)}")
-                                continue
-                        
-                        # Store unresolved records for later reporting
-                        st.session_state['unresolved_lookup_indices'] = list(total_unresolved_records)
-                        st.session_state['unresolved_lookup_summary'] = unresolved_records_summary
-                        
-                        # Remove records with unresolved lookups
-                        if total_unresolved_records:
-                            records_before = len(df_transformed)
-                            df_transformed = df_transformed.drop(list(total_unresolved_records))
-                            records_skipped = records_before - len(df_transformed)
-                            
-                            st.warning(f"⏭️ Skipped {records_skipped} records with unresolved lookup values")
-                            st.info(f"✅ Ready to validate: {len(df_transformed)} records with fully resolved lookups")
-                        
-                        # Show cache statistics
-                        st.divider()
-                        show_cache_statistics()
-                    
-                    else:
-                        st.info("📝 No lookup fields detected in your field mappings")
-                        st.info("💡 Configure field mappings to lookup/reference fields for lookup resolution")
-                        
-                elif field_mappings and not resolve_lookups_with_bulk_cache:
-                    st.warning("⚠️ Bulk caching module not available - using standard approach...")
-                    from ui_components.data_operations import resolve_lookup_fields_with_mapping
-                    
-                    lookup_result = resolve_lookup_fields_with_mapping(
-                        sf_conn, df_original, selected_object, field_mappings, return_stats=True
-                    )
-                    
-                    if isinstance(lookup_result, tuple):
-                        df_transformed, lookup_fields, lookup_count_summary = lookup_result
-                    
-                elif not field_mappings:
-                    st.info("📝 No field mappings configured - skipping lookup resolution")
-                    st.info("💡 Configure field mappings in Step 3 to enable automatic lookup resolution")
-                    
+                            df_transformed = lookup_result
+                else:
+                    st.info("💡 Configure at least one lookup field above to enable resolution")
+            
+            elif field_mappings:
+                st.info("📝 No lookup fields detected in your field mappings — skipping resolution")
+            else:
+                st.info("📝 No field mappings configured — skipping lookup resolution")
+                
+        except ImportError as ie:
+            st.warning(f"⚠️ Could not import lookup resolution functions: {str(ie)}")
+            st.info("📝 Continuing with original data...")
         except Exception as e:
             st.warning(f"⚠️ Lookup resolution encountered an error: {str(e)}")
-            st.error(f"Details: {str(e)}")
             st.info("📝 Continuing with original data...")
             df_transformed = df_original.copy()
             lookup_fields = {}
             lookup_count_summary = {}
     else:
-        st.info("📝 Lookup resolution skipped - using original data")
+        st.info("📝 Lookup resolution skipped — using original data")
     
     # Step 6: Enhanced Transform Validation
     st.write("#### ⚡ Step 6: Enhanced Transform Validation")
@@ -8158,9 +9181,10 @@ def show_enhanced_validation(sf_conn):
                 )
                 
                 # Add unresolved lookup records to failure category
-                unresolved_indices = st.session_state.get('unresolved_lookup_indices', [])
+                unresolved_indices = st.session_state.get('enhanced_unresolved_lookup_indices', [])
                 if unresolved_indices:
-                    df_unresolved = df_original.iloc[unresolved_indices].copy()
+                    valid_unresolved_indices = [idx for idx in unresolved_indices if idx in df_original.index]
+                    df_unresolved = df_original.loc[valid_unresolved_indices].copy()
                     df_unresolved['_validation_failure_reason'] = 'Unresolved Lookup - No matching parent record found'
                     df_failure = pd.concat([df_failure, df_unresolved], ignore_index=False)
                     
@@ -8378,143 +9402,7 @@ def show_enhanced_validation(sf_conn):
         except Exception as e:
             st.error(f"❌ Enhanced validation failed: {str(e)}")
             st.exception(e)
-    
-    # Step 9: Transformation Export
-    st.write("---")
-    st.write("#### 🔄 Step 9: Export for Transformation")
-    
-    if 'df_clean' in locals() and not df_clean.empty:
-        st.success(f"✅ **{len(df_clean)} records** ready for transformation export")
-        
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            # Export mapped data for transformation
-            mapped_data_csv = df_clean.to_csv(index=False)
-            st.download_button(
-                "📤 Export Mapped Data",
-                mapped_data_csv,
-                get_timestamped_filename(f"{selected_object}_mapped_for_transformation"),
-                "text/csv",
-                help="Export validated and mapped data for external transformation processing"
-            )
-            
-        with col2:
-            # Generate transformation template
-            if st.button("🔧 Generate Transformation Template", key="gen_transform_template"):
-                template_content = generate_transformation_template(selected_object, df_clean.columns.tolist(), field_mappings)
-                st.download_button(
-                    "📥 Download Transformation Template",
-                    template_content,
-                    f"{selected_object}_transformation_template.py",
-                    "text/python",
-                    help="Python template with transformation skeleton for your object"
-                )
-        
-        # Instructions for transformation workflow
-        with st.expander("📋 Transformation Workflow Instructions", expanded=False):
-            st.markdown(f"""
-            ### 🔄 **Transformation Workflow Steps**
-            
-            1. **📤 Export Mapped Data**: Download the validated and mapped CSV data
-            2. **🔧 Generate Template**: Download the Python transformation template
-            3. **✏️ Implement Logic**: Add your transformation logic to the template
-            4. **🚀 Run Transformation**: Execute your script: `python {selected_object}_transformation_template.py`
-            5. **📥 Import Results**: Upload the transformed data back in Step 7
-            
-            ### 🛠️ **Template Features**
-            - Object-specific transformation skeleton
-            - Field mapping integration
-            - Error handling framework
-            - Data validation helpers
-            - Output formatting for Salesforce
-            
-            ### 💡 **Transformation Examples**
-            - Field combinations: `Full_Name = First_Name + ' ' + Last_Name`
-            - Date formatting: `Date_Field = format_date(Date_Field)`
-            - Conditional logic: `Priority = calculate_priority(Type, Value)`
-            - Data cleaning: `Phone = clean_phone_number(Phone)`
-            """)
-    else:
-        st.info("💡 Complete validation steps above to enable transformation export")
-    
-    # Step 10: Import Transformed Data
-    st.write("---")
-    st.write("#### 📥 Step 10: Import Transformed Data")
-    
-    transformed_file = st.file_uploader(
-        "📁 Upload Transformed Data",
-        type=['csv', 'xlsx', 'xls', 'psv'],
-        key="transformed_data_upload",
-        help="Upload the data after applying your transformation logic"
-    )
-    
-    if transformed_file:
-        try:
-            # Read transformed data
-            if transformed_file.name.endswith('.csv'):
-                df_transformed_import = pd.read_csv(transformed_file)
-            elif transformed_file.name.endswith('.psv'):
-                df_transformed_import = pd.read_csv(transformed_file, sep='|')
-            else:
-                df_transformed_import = pd.read_excel(transformed_file)
-            
-            st.success(f"✅ **Transformed data loaded!** {len(df_transformed_import)} rows, {len(df_transformed_import.columns)} columns")
-            
-            # Preview transformed data
-            with st.expander("📊 Transformed Data Preview", expanded=True):
-                st.dataframe(df_transformed_import.head(10), use_container_width=True)
-            
-            # Validation of transformed data
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                if st.button("🔍 Validate Transformed Data", key="validate_transformed"):
-                    validation_results = validate_transformed_data(df_transformed_import, selected_object, field_mappings)
-                    
-                    if validation_results['is_valid']:
-                        st.success("✅ **Transformed data passed validation!**")
-                        st.balloons()
-                        
-                        # Show validation summary
-                        st.markdown("**Validation Summary:**")
-                        for check, result in validation_results['checks'].items():
-                            status = "✅" if result else "❌"
-                            st.write(f"{status} {check}")
-                    else:
-                        st.error("❌ **Validation issues found:**")
-                        for issue in validation_results['issues']:
-                            st.write(f"• {issue}")
-            
-            with col2:
-                # Export validated transformed data
-                transformed_csv = df_transformed_import.to_csv(index=False)
-                st.download_button(
-                    "📥 Export Final Data",
-                    transformed_csv,
-                    get_timestamped_filename(f"{selected_object}_final_transformed"),
-                    "text/csv",
-                    help="Download final transformed data ready for Salesforce loading"
-                )
-        
-        except Exception as e:
-            st.error(f"❌ Error loading transformed data: {str(e)}")
-    else:
-        st.info("💡 Upload your transformed data to validate and prepare for Salesforce loading")
-    
-    # Final workflow summary
-    if transformed_file and 'validation_results' in locals() and validation_results.get('is_valid'):
-        st.write("---")
-        st.write("#### ✅ Transformation Workflow Complete")
-        
-        st.success("""
-        **🎉 Your data transformation workflow is complete!**
-        
-        **Next Steps:**
-        1. Use the 'Export Final Data' to get your Salesforce-ready file
-        2. Load the data using DM Toolkit's Data Operations
-        3. Monitor the loading process and results
-        """)
+
         
         # Quick action buttons
         col1, col2 = st.columns([1, 1])

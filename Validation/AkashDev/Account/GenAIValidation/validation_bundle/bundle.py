@@ -139,186 +139,217 @@ def _floor(number):
         return number.apply(math.floor)
     return math.floor(number) if number else 0
 
+def _mod(dividend, divisor):
+    """Salesforce MOD function"""
+    if hasattr(dividend, 'apply'):
+        return dividend.apply(lambda x: x % divisor if divisor else 0)
+    return int(dividend) % int(divisor) if dividend and divisor else 0
 
-def validate_Name_is_null(df):
+def _regex(text, pattern):
+    """Salesforce REGEX function - checks if text matches pattern"""
+    import re as regex_module
+    if hasattr(text, 'str'):
+        return text.str.contains(pattern, regex=True, na=False)
+    return bool(regex_module.search(pattern, str(text))) if text else False
+
+def _substitute(text, search_text, replace_text):
+    """Salesforce SUBSTITUTE function - replaces text"""
+    if hasattr(text, 'str'):
+        return text.str.replace(search_text, replace_text)
+    return str(text).replace(search_text, replace_text) if text else ''
+
+def _concatenate(*args):
+    """Salesforce CONCATENATE function - joins strings"""
+    return ''.join(str(arg) for arg in args if arg is not None)
+
+def _datevalue(date_string):
+    """Salesforce DATEVALUE function - converts string to date"""
+    try:
+        return pd.to_datetime(date_string)
+    except:
+        return None
+
+def _includes(field_value, search_value):
+    """Salesforce INCLUDES function for multi-select picklists"""
+    if hasattr(field_value, 'str'):
+        return field_value.str.contains(search_value, na=False)
+    return search_value in str(field_value) if field_value else False
+
+def _excludes(field_value, search_value):
+    """Salesforce EXCLUDES function for multi-select picklists"""
+    if hasattr(field_value, 'str'):
+        return ~field_value.str.contains(search_value, na=True)
+    return search_value not in str(field_value) if field_value else True
+
+def _ispickval(field_value, compare_value):
+    """Salesforce ISPICKVAL function - check if field equals specific picklist value"""
+    if hasattr(field_value, 'str'):
+        # DataFrame Series - element-wise comparison
+        return field_value.astype(str).str.strip() == str(compare_value).strip()
+    # Scalar comparison
+    field_str = str(field_value).strip() if field_value is not None and not pd.isna(field_value) else ''
+    compare_str = str(compare_value).strip() if compare_value is not None else ''
+    return field_str == compare_str
+
+def _case(expression, *args):
+    """Salesforce CASE function - CASE(expr, val1, result1, val2, result2, ..., else_result)"""
+    if hasattr(expression, 'map'):
+        # DataFrame Series - build mapping
+        mapping = {}
+        i = 0
+        while i < len(args) - 1:
+            mapping[args[i]] = args[i + 1]
+            i += 2
+        default = args[-1] if len(args) % 2 == 1 else None
+        return expression.map(mapping).fillna(default)
+    # Scalar
+    i = 0
+    while i < len(args) - 1:
+        if expression == args[i]:
+            return args[i + 1]
+        i += 2
+    return args[-1] if len(args) % 2 == 1 else None
+
+def _trim(text):
+    """Salesforce TRIM function"""
+    if hasattr(text, 'str'):
+        return text.str.strip()
+    return str(text).strip() if text is not None and not pd.isna(text) else ''
+
+
+def validate_Name_is_null(row_data):
     """
     Validation Rule: Name_is_null
     Salesforce Object: Account
-    Primary Field: Id
+    Primary Field: Name
     
     
     Original Apex Formula:
     ISBLANK(Name)
     
     Args:
-        df (pandas.DataFrame): Input DataFrame to validate
+        row_data: Dictionary or pandas Series containing the row data to validate
     Returns:
-        pandas.Series: Boolean mask indicating validation results (True = valid, False = invalid)
+        bool: True if record is valid, False if invalid
     """
-    # Primary Field: Id
+    # Primary Field: Name
     
-    # Import required modules
     import pandas as pd
-    import numpy as np
-    from datetime import datetime, date
-    import math
+    
+    # Helper to safely retrieve field values from row data
+    def safe_get(field_name):
+        try:
+            if hasattr(row_data, 'get'):
+                value = row_data.get(field_name, '')
+            elif hasattr(row_data, '__getitem__'):
+                try:
+                    value = row_data[field_name]
+                except (KeyError, IndexError):
+                    value = ''
+            else:
+                value = ''
+            if pd.isna(value):
+                return ''
+            return value
+        except:
+            return ''
     
     try:
-        # Ensure all required columns exist
-        required_columns = []
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            print(f"Warning: Missing columns for validation rule 'Name_is_null': {missing_columns}")
-            return pd.Series([False] * len(df))  # Mark all as invalid if columns missing
+        # Evaluate the error condition (converted from Salesforce formula)
+        # Salesforce: formula True = Error condition = Record is INVALID
+        # Salesforce: formula False = No error = Record is VALID
+        error_condition = _is_blank(safe_get('Name'))
         
-        # Fill NaN values to avoid errors
-        df_clean = df.fillna('')
+        # Invert: return True when valid (no error), False when invalid (error)
+        return not bool(error_condition)
         
-        # Apply validation logic
-        validation_result = _is_blank(df['Name'])
-        
-        # Ensure result is a boolean Series
-        if not isinstance(validation_result, pd.Series):
-            validation_result = pd.Series([bool(validation_result)] * len(df))
-        
-        # Salesforce validation rules define ERROR conditions (when validation should FAIL)
-        # If the formula evaluates to True = Error condition = Record is INVALID
-        # If the formula evaluates to False = No error = Record is VALID
-        # So we need to invert: True becomes False (invalid), False becomes True (valid)
-        
-        # Debug: Print sample of validation logic for troubleshooting
-        if len(df) > 0:
-            sample_value = validation_result.iloc[0] if hasattr(validation_result, 'iloc') else validation_result
-            print(f"DEBUG - Rule 'Name_is_null': Formula result for first record = {sample_value} (True=Error/Invalid, False=NoError/Valid)")
-            
-            # Additional debugging for ISBLANK scenarios
-            if '_is_blank' in str(validation_result):
-                sample_field_value = df_clean.iloc[0].get('Id', 'COLUMN_NOT_FOUND') if len(df_clean) > 0 else 'NO_DATA'
-                print(f"DEBUG - Rule 'Name_is_null': Field 'Id' value for first record = '{sample_field_value}'")
-                print(f"DEBUG - Rule 'Name_is_null': Available columns = {list(df.columns)}")
-                if 'Id' not in df.columns:
-                    print(f"WARNING - Rule 'Name_is_null': Column 'Id' not found in data! This will cause validation to fail.")
-        
-        return ~validation_result
-        
-    except KeyError as e:
-        print(f"Warning: Column {e} not found in DataFrame for validation rule 'Name_is_null'")
-        return pd.Series([False] * len(df))  # Mark all as invalid if column missing
     except Exception as e:
-        print(f"Warning: Error in validation rule 'Name_is_null': {e}")
-        return pd.Series([False] * len(df))  # Mark all as invalid on error
+        print(f"Warning: Error in validation rule \'Name_is_null\': {e}")
+        return False  # Mark as invalid on error
 
-def validate_PhoneRule(df):
+def validate_PhoneRule(row_data):
     """
     Validation Rule: PhoneRule
     Salesforce Object: Account
-    Primary Field: Id
+    Primary Field: Phone
     
     
     Original Apex Formula:
     ISBLANK(Phone)
     
     Args:
-        df (pandas.DataFrame): Input DataFrame to validate
+        row_data: Dictionary or pandas Series containing the row data to validate
     Returns:
-        pandas.Series: Boolean mask indicating validation results (True = valid, False = invalid)
+        bool: True if record is valid, False if invalid
     """
-    # Primary Field: Id
+    # Primary Field: Phone
     
-    # Import required modules
     import pandas as pd
-    import numpy as np
-    from datetime import datetime, date
-    import math
+    
+    # Helper to safely retrieve field values from row data
+    def safe_get(field_name):
+        try:
+            if hasattr(row_data, 'get'):
+                value = row_data.get(field_name, '')
+            elif hasattr(row_data, '__getitem__'):
+                try:
+                    value = row_data[field_name]
+                except (KeyError, IndexError):
+                    value = ''
+            else:
+                value = ''
+            if pd.isna(value):
+                return ''
+            return value
+        except:
+            return ''
     
     try:
-        # Ensure all required columns exist
-        required_columns = []
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            print(f"Warning: Missing columns for validation rule 'PhoneRule': {missing_columns}")
-            return pd.Series([False] * len(df))  # Mark all as invalid if columns missing
+        # Evaluate the error condition (converted from Salesforce formula)
+        # Salesforce: formula True = Error condition = Record is INVALID
+        # Salesforce: formula False = No error = Record is VALID
+        error_condition = _is_blank(safe_get('Phone'))
         
-        # Fill NaN values to avoid errors
-        df_clean = df.fillna('')
+        # Invert: return True when valid (no error), False when invalid (error)
+        return not bool(error_condition)
         
-        # Apply validation logic
-        validation_result = _is_blank(df['Phone'])
-        
-        # Ensure result is a boolean Series
-        if not isinstance(validation_result, pd.Series):
-            validation_result = pd.Series([bool(validation_result)] * len(df))
-        
-        # Salesforce validation rules define ERROR conditions (when validation should FAIL)
-        # If the formula evaluates to True = Error condition = Record is INVALID
-        # If the formula evaluates to False = No error = Record is VALID
-        # So we need to invert: True becomes False (invalid), False becomes True (valid)
-        
-        # Debug: Print sample of validation logic for troubleshooting
-        if len(df) > 0:
-            sample_value = validation_result.iloc[0] if hasattr(validation_result, 'iloc') else validation_result
-            print(f"DEBUG - Rule 'PhoneRule': Formula result for first record = {sample_value} (True=Error/Invalid, False=NoError/Valid)")
-            
-            # Additional debugging for ISBLANK scenarios
-            if '_is_blank' in str(validation_result):
-                sample_field_value = df_clean.iloc[0].get('Id', 'COLUMN_NOT_FOUND') if len(df_clean) > 0 else 'NO_DATA'
-                print(f"DEBUG - Rule 'PhoneRule': Field 'Id' value for first record = '{sample_field_value}'")
-                print(f"DEBUG - Rule 'PhoneRule': Available columns = {list(df.columns)}")
-                if 'Id' not in df.columns:
-                    print(f"WARNING - Rule 'PhoneRule': Column 'Id' not found in data! This will cause validation to fail.")
-        
-        return ~validation_result
-        
-    except KeyError as e:
-        print(f"Warning: Column {e} not found in DataFrame for validation rule 'PhoneRule'")
-        return pd.Series([False] * len(df))  # Mark all as invalid if column missing
     except Exception as e:
-        print(f"Warning: Error in validation rule 'PhoneRule': {e}")
-        return pd.Series([False] * len(df))  # Mark all as invalid on error
+        print(f"Warning: Error in validation rule \'PhoneRule\': {e}")
+        return False  # Mark as invalid on error
 
 def validate_record(row):
-    '''Validate a single record (row) and return result dict'''
+    '''Validate a single record (row) and return result dict.
+    
+    Each validation function receives a dict/Series and returns True (valid) or False (invalid).
+    '''
     import pandas as pd
-    df = pd.DataFrame([row])
+    # Convert to dict for consistent field access
+    if hasattr(row, 'to_dict'):
+        row_dict = row.to_dict()
+    elif isinstance(row, dict):
+        row_dict = row
+    else:
+        row_dict = dict(row)
+    
     rule_results = {}
     errors = []
     is_valid = True
     try:
-        print(f"DEBUG validate_record: Calling validate_Name_is_null on row data")
-        func_result = validate_Name_is_null(df)
-        if hasattr(func_result, 'iloc'):
-            rule_results['validate_Name_is_null'] = bool(func_result.iloc[0])
-        else:
-            rule_results['validate_Name_is_null'] = bool(func_result)
-        print(f"DEBUG validate_record: validate_Name_is_null returned {rule_results['validate_Name_is_null']}")
+        rule_results['validate_Name_is_null'] = bool(validate_Name_is_null(row_dict))
         if not rule_results['validate_Name_is_null']:
             errors.append('validate_Name_is_null')
-            print(f"DEBUG validate_record: Added validate_Name_is_null to errors list")
     except Exception as e:
-        print(f"ERROR validate_record: validate_Name_is_null failed with error: {str(e)}")
         rule_results['validate_Name_is_null'] = False
         errors.append(f'validate_Name_is_null (error: {str(e)})')
     try:
-        print(f"DEBUG validate_record: Calling validate_PhoneRule on row data")
-        func_result = validate_PhoneRule(df)
-        if hasattr(func_result, 'iloc'):
-            rule_results['validate_PhoneRule'] = bool(func_result.iloc[0])
-        else:
-            rule_results['validate_PhoneRule'] = bool(func_result)
-        print(f"DEBUG validate_record: validate_PhoneRule returned {rule_results['validate_PhoneRule']}")
+        rule_results['validate_PhoneRule'] = bool(validate_PhoneRule(row_dict))
         if not rule_results['validate_PhoneRule']:
             errors.append('validate_PhoneRule')
-            print(f"DEBUG validate_record: Added validate_PhoneRule to errors list")
     except Exception as e:
-        print(f"ERROR validate_record: validate_PhoneRule failed with error: {str(e)}")
         rule_results['validate_PhoneRule'] = False
         errors.append(f'validate_PhoneRule (error: {str(e)})')
     if errors:
         is_valid = False
-        print(f"DEBUG validate_record: Record INVALID due to errors: {errors}")
-    else:
-        print(f"DEBUG validate_record: Record VALID - all rules passed")
-    print(f"DEBUG validate_record: Final result - is_valid: {is_valid}, errors: {errors}")
     return {'is_valid': is_valid, 'errors': errors, 'rule_results': rule_results}
 
 def validate_dataframe(df):

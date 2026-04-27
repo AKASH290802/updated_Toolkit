@@ -8,16 +8,161 @@ import pandas as pd
 import json
 import os
 import io
+import csv
 import time
 from datetime import datetime
 from pathlib import Path
 from simple_salesforce import Salesforce
 from typing import Dict, List, Tuple, Optional, Any
+import streamlit.components.v1 as components
 from ui_components.soql_lookup_discovery import show_soql_lookup_discovery_ui
 from dataload.lookup_resolver import get_candidate_fields_for_lookup
 from ui_components.org_migration_rules import validate_business_rules, display_rules_validation_report, apply_rule_fixes_suggestions
 from ui_components.org_migration_validation_rules import validate_data_against_validation_rules, display_validation_rules_report
 from ui_components.org_migration_salesforce_validation_rules import validate_data_against_salesforce_rules, display_salesforce_validation_rules_report
+from ui_components.data_hub.operation_tracker import (
+    track_validation_check,
+    track_migration_execution,
+    track_lookup_resolution
+)
+from ui_components.org_migration_related_objects import (
+    discover_child_objects,
+    display_child_objects_selection,
+    build_parent_child_mapping,
+    display_migration_summary,
+    validate_child_records
+)
+from ui_components.org_migration_related_objects_loader import (
+    execute_parent_child_migration,
+    display_migration_results
+)
+from ui_components.org_migration_child_lookup_resolver import (
+    build_child_lookup_metadata,
+    auto_configure_child_lookup_strategies,
+    resolve_child_object_lookups_optimized,
+    remap_child_parent_ids,
+    get_parent_id_mapping_from_results
+)
+
+# ============================================================================
+# BULK API 2.0 HELPER — wraps bulk2 calls and returns bulk1-compatible results
+# ============================================================================
+
+def _bulk2_execute(sf_conn, object_name: str, operation: str, records: list,
+                   ext_id_field: str = None) -> dict:
+    """
+    Execute a Salesforce Bulk API 2.0 operation.
+
+    Returns a dict:
+      {
+        'success_count':  int,   # records successfully processed (from job summary)
+        'error_count':    int,   # records that failed (from job summary)
+        'total':          int,   # total records submitted
+        'failed_records': [      # only the truly failed records
+            {'row_number':   int,   # 1-based display number
+             'error':        str,   # exact Salesforce error message
+             'record_data':  dict}  # the ACTUAL failed record's field values
+        ]
+      }
+
+    Counts come from the job summary (numberRecordsFailed / numberRecordsProcessed)
+    — the only authoritative source in Bulk API 2.0.
+
+    record_data for each failure comes directly from the failed-records CSV,
+    which Salesforce populates with every original submitted field value.
+    This means we NEVER do positional guessing — the CSV row IS the failed record.
+    """
+    bulk2_type = getattr(sf_conn.bulk2, object_name)
+
+    # ── Bulk API 2.0 null-value fix ────────────────────────────────────────
+    # In Bulk API 2.0 CSV, an empty cell ("") tells Salesforce to set the field
+    # to an empty string — which is rejected by restricted picklist fields with
+    # INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST.  The correct sentinel is "#N/A",
+    # which Salesforce interprets as "clear/null this field" and works for all
+    # field types (picklist, text, number, lookup, etc.).
+    # We apply this here rather than in the caller so it covers every code path.
+    import math as _math
+    cleaned_records = []
+    for rec in records:
+        clean_rec = {}
+        for k, v in rec.items():
+            if v is None or v == '':
+                clean_rec[k] = '#N/A'
+            elif isinstance(v, float) and (_math.isnan(v) or _math.isinf(v)):
+                clean_rec[k] = '#N/A'
+            else:
+                clean_rec[k] = v
+        cleaned_records.append(clean_rec)
+    records = cleaned_records
+    # ──────────────────────────────────────────────────────────────────────
+
+    if operation == 'insert':
+        job_results = bulk2_type.insert(records=records)
+    elif operation == 'upsert':
+        job_results = bulk2_type.upsert(records=records,
+                                        external_id_field=ext_id_field)
+    elif operation == 'update':
+        job_results = bulk2_type.update(records=records)
+    else:
+        raise ValueError(f"Unsupported operation: {operation}")
+
+    total_success  = 0
+    total_failed   = 0
+    failed_records = []
+    global_row     = 0  # running count of records across all jobs (for display row numbers)
+
+    for job in job_results:
+        job_id      = job['job_id']
+        n_failed    = int(job.get('numberRecordsFailed', 0))
+        n_processed = int(job.get('numberRecordsProcessed', 0))
+        n_total_job = int(job.get('numberRecordsTotal', n_processed))
+
+        # ── Authoritative counts from the job summary ──────────────────────
+        n_success      = n_processed - n_failed
+        total_success += n_success
+        total_failed  += n_failed
+
+        # ── Extract failed-record details from Salesforce's own CSV ────────
+        # The failed-records CSV contains:
+        #   sf__Id    — empty for failed inserts, populated for failed updates
+        #   sf__Error — exact error message from Salesforce
+        #   <all original submitted fields> — the actual record that was rejected
+        # We read record_data straight from these fields — no positional guessing.
+        if n_failed > 0:
+            failed_csv = bulk2_type.get_failed_records(job_id)
+            if failed_csv and failed_csv.strip():
+                reader = csv.DictReader(io.StringIO(failed_csv))
+                for row in reader:
+                    global_row += 1
+                    error_msg = row.get('sf__Error', 'Unknown error')
+                    # Strip Salesforce-added metadata columns; keep only data fields
+                    record_data = {k: v for k, v in row.items()
+                                   if not k.startswith('sf__')}
+                    failed_records.append({
+                        'row_number':  global_row,   # sequential display number
+                        'error':       error_msg,
+                        'record_data': record_data   # exact data Salesforce rejected
+                    })
+            # If CSV is empty despite n_failed > 0 (rare timing edge-case),
+            # at least report the count with a generic message
+            elif n_failed > 0 and not failed_records:
+                for _ in range(n_failed):
+                    global_row += 1
+                    failed_records.append({
+                        'row_number':  global_row,
+                        'error':       'Failed — Salesforce did not return error details',
+                        'record_data': {}
+                    })
+        else:
+            global_row += n_total_job   # advance counter even for all-success jobs
+
+    return {
+        'success_count':  total_success,
+        'error_count':    total_failed,
+        'total':          len(records),
+        'failed_records': failed_records
+    }
+
 
 def extract_detailed_error_message(error_obj: Any) -> str:
     """
@@ -162,6 +307,89 @@ def get_object_fields(sf_conn: Salesforce, object_name: str) -> Dict[str, Any]:
         return fields_info
     except Exception as e:
         st.error(f"Error retrieving fields for {object_name}: {str(e)}")
+        return {}
+
+
+def get_object_fields_with_relationships(sf_conn: Salesforce, object_name: str, include_relationship_fields: bool = True) -> Dict[str, Any]:
+    """
+    Get all fields for a Salesforce object including relationship fields with dot notation
+    
+    Args:
+        sf_conn: Salesforce connection
+        object_name: Name of the Salesforce object
+        include_relationship_fields: If True, includes fields from related objects (e.g., ProductCategory.Name)
+    
+    Returns:
+        Dictionary of field metadata including relationship fields
+        Example: {
+            'Name': {...},
+            'ProductCategoryId': {...},
+            'ProductCategory.Name': {...},  ← Relationship field
+            'ProductCategory.Description': {...}  ← Relationship field
+        }
+    """
+    try:
+        # Get direct fields first
+        fields_info = get_object_fields(sf_conn, object_name)
+        
+        if not include_relationship_fields:
+            return fields_info
+        
+        # Add relationship fields
+        try:
+            describe_result = getattr(sf_conn, object_name).describe()
+            
+            # Get all lookup/reference fields
+            for field in describe_result['fields']:
+                reference_to = field.get('referenceTo', [])
+                
+                # Skip if not a reference field or if it's a system field
+                if not reference_to or field['name'] in ['OwnerId', 'RecordTypeId', 'CreatedById', 'LastModifiedById']:
+                    continue
+                
+                parent_object = reference_to[0]
+                relationship_name = field.get('relationshipName', field['name'].replace('Id', ''))
+                
+                # Query parent object fields
+                try:
+                    parent_fields = get_object_fields(sf_conn, parent_object)
+                    
+                    # For each parent field, create a relationship field entry
+                    for parent_field_name, parent_field_meta in parent_fields.items():
+                        # Skip system fields from parent
+                        if parent_field_name in ['Id', 'CreatedById', 'LastModifiedById']:
+                            continue
+                        
+                        # Create dot notation field name
+                        relationship_field_name = f"{relationship_name}.{parent_field_name}"
+                        
+                        # Add to fields info with marker that it's a relationship field
+                        fields_info[relationship_field_name] = {
+                            'label': f"{relationship_name} → {parent_field_meta.get('label', parent_field_name)}",
+                            'type': parent_field_meta.get('type', 'reference'),
+                            'referenceTo': parent_field_meta.get('referenceTo', []),
+                            'externalId': parent_field_meta.get('externalId', False),
+                            'unique': parent_field_meta.get('unique', False),
+                            'createable': False,  # Relationship fields are not directly creatable
+                            'updateable': False,
+                            'nillable': parent_field_meta.get('nillable', True),
+                            'is_relationship_field': True,  # Mark as relationship field
+                            'parent_object': parent_object,
+                            'relationship_name': relationship_name,
+                            'parent_field_name': parent_field_name,
+                            'picklistValues': parent_field_meta.get('picklistValues', [])
+                        }
+                except Exception as e:
+                    # Skip if we can't get parent object fields
+                    pass
+        
+        except Exception as e:
+            # If relationship extraction fails, just return direct fields
+            pass
+        
+        return fields_info
+    except Exception as e:
+        st.error(f"Error retrieving fields with relationships for {object_name}: {str(e)}")
         return {}
 
 
@@ -335,18 +563,36 @@ def validate_master_detail_parents_exist(
         missing_parents = []
         errors = []
         
-        for parent_value in unique_parents:
-            try:
-                # Query target org for parent
-                query = f"SELECT Id FROM {parent_object} WHERE Id = '{parent_value}' LIMIT 1"
+        # Batch query: check all parent IDs at once using IN clause
+        parent_ids = [str(p) for p in unique_parents]
+        found_ids = set()
+        
+        try:
+            chunk_size = 200
+            for chunk_start in range(0, len(parent_ids), chunk_size):
+                chunk = parent_ids[chunk_start:chunk_start + chunk_size]
+                in_clause = ', '.join([f"'{pid.replace(chr(39), chr(39)*2)}'" for pid in chunk])
+                query = f"SELECT Id FROM {parent_object} WHERE Id IN ({in_clause})"
                 result = target_sf.query(query)
                 
-                if result['totalSize'] > 0:
-                    found_count += 1
-                else:
-                    missing_parents.append(str(parent_value))
-            except Exception as e:
-                errors.append(str(e))
+                for rec in result.get('records', []):
+                    found_ids.add(str(rec['Id']))
+                
+                # Handle query_more for large results
+                while not result.get('done', True) and 'nextRecordsUrl' in result:
+                    result = target_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                    for rec in result.get('records', []):
+                        found_ids.add(str(rec['Id']))
+        except Exception as e:
+            errors.append(f"Batch query failed: {str(e)}")
+        
+        # Determine found vs missing
+        for pid in parent_ids:
+            # Salesforce IDs can be 15 or 18 chars; check both prefixes
+            if pid in found_ids or any(fid.startswith(pid[:15]) for fid in found_ids):
+                found_count += 1
+            else:
+                missing_parents.append(pid)
         
         field_validation = {
             'parent_object': parent_object,
@@ -462,21 +708,76 @@ def resolve_master_detail_relationships_for_migration(
         unresolved_records = []
         target_ids = []
         
+        # Batch approach: collect unique match value sets, query SOURCE org in bulk
+        concat_separator = config.get('concat_separator', '_')
+        
+        # Build unique match keys and their values
+        unique_match_map = {}  # match_key -> match_values dict
+        row_to_key = {}  # row_index -> match_key
+        
         for idx, row in resolved_df.iterrows():
             match_values = {field: row.get(field) for field in match_fields}
+            # Create a hashable key from match values
+            if match_strategy in ['external_id', 'unique_field']:
+                key = str(match_values.get(match_fields[0], ''))
+            else:
+                key = concat_separator.join([str(match_values.get(f, '')) for f in match_fields])
+            row_to_key[idx] = key
+            if key and key.strip():
+                unique_match_map[key] = match_values
+        
+        # Batch query SOURCE org for all unique match value sets
+        key_to_parent_id = {}
+        
+        if unique_match_map:
+            try:
+                if match_strategy in ['external_id', 'unique_field']:
+                    # Single field — use IN clause
+                    field_name = match_fields[0]
+                    all_values = list(unique_match_map.keys())
+                    chunk_size = 200
+                    
+                    for chunk_start in range(0, len(all_values), chunk_size):
+                        chunk = all_values[chunk_start:chunk_start + chunk_size]
+                        in_clause = ', '.join([f"'{v.replace(chr(39), chr(39)*2)}'" for v in chunk])
+                        soql = f"SELECT Id, {field_name} FROM {parent_object} WHERE {field_name} IN ({in_clause})"
+                        result = source_sf.query(soql)
+                        
+                        for rec in result.get('records', []):
+                            val = str(rec.get(field_name, ''))
+                            key_to_parent_id[val] = rec['Id']
+                        
+                        while not result.get('done', True) and 'nextRecordsUrl' in result:
+                            result = source_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                            for rec in result.get('records', []):
+                                val = str(rec.get(field_name, ''))
+                                key_to_parent_id[val] = rec['Id']
+                
+                elif match_strategy in ['field_combination', 'field_concatenation']:
+                    # Multiple fields — query all records with those fields, build in-memory map
+                    fields_str = ', '.join(['Id'] + match_fields)
+                    soql = f"SELECT {fields_str} FROM {parent_object}"
+                    result = source_sf.query(soql)
+                    
+                    all_records = result.get('records', [])
+                    while not result.get('done', True) and 'nextRecordsUrl' in result:
+                        result = source_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                        all_records.extend(result.get('records', []))
+                    
+                    for rec in all_records:
+                        combined_key = concat_separator.join([str(rec.get(f, '')) for f in match_fields])
+                        key_to_parent_id[combined_key] = rec['Id']
+                        
+            except Exception as e:
+                resolution_stats['errors'].append(f"Batch query failed for {md_field}: {str(e)}")
+        
+        # Apply resolution from the batch map
+        for idx, row in resolved_df.iterrows():
+            key = row_to_key.get(idx, '')
+            parent_id = key_to_parent_id.get(key)
             
-            # Query SOURCE org for parent ID
-            source_parent_id = query_source_org_for_parent_id(
-                source_sf=source_sf,
-                parent_object=parent_object,
-                match_strategy=match_strategy,
-                match_fields=match_fields,
-                match_values=match_values,
-                concat_separator=config.get('concat_separator', '_')
-            )
-            
-            if source_parent_id:
-                target_ids.append(source_parent_id)
+            if parent_id:
+                target_ids.append(parent_id)
                 resolved_count += 1
             else:
                 target_ids.append(None)
@@ -623,6 +924,8 @@ def validate_existing_records_in_target(
     """
     Validate how many source records already exist in target org
     
+    **OPTIMIZED FOR SPEED**: Batches records and minimizes Salesforce API calls
+    
     **CRITICAL**: This shows users which records will be INSERTED (new) vs
     UPDATED (existing) based on the matching strategy
     
@@ -650,9 +953,14 @@ def validate_existing_records_in_target(
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # OPTIMIZED: Batch processing with efficient SOQL queries
+    # Step 1: Filter invalid records and collect unique match values
+    status_text.info(f"📋 Preparing batch validation for {len(source_data)} records...")
+    
+    record_batch = []  # List of (idx, match_values) tuples
+    existing_matches = {}  # Will store: match_value -> sf_id
+    
     for idx, row in source_data.iterrows():
-        status_text.info(f"🔍 Validating record {idx + 1}/{len(source_data)}...")
-        
         # Extract match values
         match_values = {field: row.get(field) for field in match_fields}
         
@@ -672,16 +980,110 @@ def validate_existing_records_in_target(
             })
             results['invalid_count'] += 1
         else:
-            # Check if exists in target
-            exists, sf_id = check_record_exists_in_target(
-                target_sf, object_name, match_strategy, 
-                match_fields, match_values, concat_separator
-            )
+            # Valid record - add to batch
+            record_batch.append((idx, match_values))
+    
+    # Step 2: Build batch SOQL query to find all existing records at once
+    if record_batch:
+        status_text.info(f"🔍 Querying target org for existing records (batch mode)...")
+        
+        if match_strategy == 'external_id' or match_strategy == 'unique_field':
+            # Single field match - use IN clause for efficiency
+            field_name = match_fields[0]
+            match_values_list = [str(mv[field_name]) for _, mv in record_batch]
+            match_values_list = list(set(match_values_list))  # Remove duplicates
             
-            if exists:
+            if len(match_values_list) > 0:
+                # Build IN clause in chunks of 200 to stay within SOQL limits
+                chunk_size = 200
+                try:
+                    for chunk_start in range(0, len(match_values_list), chunk_size):
+                        chunk = match_values_list[chunk_start:chunk_start + chunk_size]
+                        values_for_query = [f"'{v.replace(chr(39), chr(39)*2)}'" if isinstance(v, str) else str(v) for v in chunk]
+                        in_clause = ', '.join(values_for_query)
+                        
+                        soql = f"SELECT Id, {field_name} FROM {object_name} WHERE {field_name} IN ({in_clause})"
+                        result = target_sf.query(soql)
+                        
+                        # Build lookup map: match_value -> sf_id
+                        for record in result['records']:
+                            field_value = record.get(field_name)
+                            if field_value:
+                                existing_matches[str(field_value)] = record['Id']
+                        
+                        # Handle query_more for large results
+                        while not result.get('done', True) and 'nextRecordsUrl' in result:
+                            result = target_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                            for record in result['records']:
+                                field_value = record.get(field_name)
+                                if field_value:
+                                    existing_matches[str(field_value)] = record['Id']
+                                    
+                except Exception as e:
+                    st.warning(f"⚠️ Batch query failed, falling back to individual checks: {str(e)}")
+                    # Fallback: query individually for unresolved values
+                    for val in match_values_list:
+                        if str(val) not in existing_matches:
+                            try:
+                                escaped = str(val).replace("'", "\\'")
+                                soql = f"SELECT Id FROM {object_name} WHERE {field_name} = '{escaped}' LIMIT 1"
+                                r = target_sf.query(soql)
+                                if r['totalSize'] > 0:
+                                    existing_matches[str(val)] = r['records'][0]['Id']
+                            except:
+                                pass
+        
+        elif match_strategy in ['field_combination', 'field_concatenation']:
+            # Multiple field match - query all records, handle pagination
+            try:
+                field_names_str = ', '.join(match_fields)
+                soql = f"SELECT Id, {field_names_str} FROM {object_name}"
+                result = target_sf.query(soql)
+                
+                # Build map of combined values -> sf_id
+                for record in result['records']:
+                    combined_key = concat_separator.join([str(record.get(f, '')) for f in match_fields])
+                    existing_matches[combined_key] = record['Id']
+                
+                # Handle query_more for large result sets (>2000 records)
+                while not result.get('done', True) and 'nextRecordsUrl' in result:
+                    result = target_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                    for record in result['records']:
+                        combined_key = concat_separator.join([str(record.get(f, '')) for f in match_fields])
+                        existing_matches[combined_key] = record['Id']
+                    
+            except Exception as e:
+                st.warning(f"⚠️ Batch query failed for field combination, falling back to individual checks: {str(e)}")
+                # Fallback: query individually for each unique combination
+                for _, mv in record_batch:
+                    combo_key = concat_separator.join([str(mv.get(f, '')) for f in match_fields])
+                    if combo_key not in existing_matches:
+                        try:
+                            conditions = []
+                            for f in match_fields:
+                                v = mv.get(f, '')
+                                escaped = str(v).replace("'", "\\'")
+                                conditions.append(f"{f} = '{escaped}'")
+                            where_clause = ' AND '.join(conditions)
+                            soql = f"SELECT Id FROM {object_name} WHERE {where_clause} LIMIT 1"
+                            r = target_sf.query(soql)
+                            if r['totalSize'] > 0:
+                                existing_matches[combo_key] = r['records'][0]['Id']
+                        except:
+                            pass
+        
+        # Step 3: Match records against the batch results (all in-memory, no API calls)
+        status_text.info(f"🔍 Matching {len(record_batch)} records against Salesforce results...")
+        for progress_count, (idx, match_values) in enumerate(record_batch):
+            if match_strategy == 'external_id' or match_strategy == 'unique_field':
+                match_key = str(match_values[match_fields[0]])
+            else:
+                match_key = concat_separator.join([str(match_values.get(f, '')) for f in match_fields])
+            
+            if match_key in existing_matches:
                 results['existing_records'].append({
                     'index': idx,
-                    'salesforce_id': sf_id,
+                    'salesforce_id': existing_matches[match_key],
                     'match_values': match_values
                 })
                 results['existing_count'] += 1
@@ -692,7 +1094,8 @@ def validate_existing_records_in_target(
                 })
                 results['new_count'] += 1
         
-        progress_bar.progress((idx + 1) / len(source_data))
+        # Single progress update after all records are processed
+        progress_bar.progress(1.0)
     
     status_text.empty()
     progress_bar.empty()
@@ -716,11 +1119,13 @@ def query_source_org_for_parent_id(
     These IDs are then used in TARGET org to establish lookup references in child records.
     Same lookup resolution logic as data loading.
     
+    Supports relationship fields with dot notation (e.g., ProductCategory.Name)
+    
     Args:
         source_sf: Source Salesforce connection
         parent_object: Parent object name (e.g., 'Account', 'Dealer')
         match_strategy: 'external_id' | 'field_combination' | 'field_concatenation' | 'field_mapping'
-        match_fields: List of field names to match on
+        match_fields: List of field names to match on (can include relationship fields like "Category.Name")
         match_values: Dictionary of field values from source record
         concat_separator: Separator for concatenation strategy
     
@@ -735,13 +1140,23 @@ def query_source_org_for_parent_id(
             object_fields = {}
         
         def format_value_for_soql(field_name: str, value: Any) -> str:
-            """Format value based on field type for SOQL query"""
+            """Format value based on field type for SOQL query
+            
+            Supports both direct fields and relationship fields (dot notation)
+            Example: 'Name' or 'ProductCategory.Name'
+            """
             if not value or (isinstance(value, str) and value.strip() == ''):
                 return None
             
             # Check field type from metadata
             field_meta = object_fields.get(field_name, {})
             field_type = field_meta.get('type', 'string').lower()
+            
+            # For relationship fields (with dots), treat as string by default
+            if '.' in field_name:
+                # Relationship field - default to string formatting
+                escaped = str(value).replace("'", "\\'")
+                return f"'{escaped}'"
             
             # Convert value to proper SOQL format
             if field_type in ['number', 'double', 'integer', 'percent', 'currency']:
@@ -766,7 +1181,7 @@ def query_source_org_for_parent_id(
             if not match_value or (isinstance(match_value, str) and match_value.strip() == ''):
                 return None
             
-            # Query SOURCE org with configured external ID field
+            # Query SOURCE org with configured external ID field (can be relationship field)
             formatted_value = format_value_for_soql(external_id_field, match_value)
             soql_query = f"SELECT Id FROM {parent_object} WHERE {external_id_field} = {formatted_value} LIMIT 1"
             
@@ -775,29 +1190,49 @@ def query_source_org_for_parent_id(
                 if result['totalSize'] > 0:
                     return result['records'][0]['Id']
             except Exception as e:
-                # Field doesn't exist or query failed - fall back to candidate fields
-                pass
-            
-            # FALLBACK: Try intelligent candidate field selection from metadata
-            try:
-                candidate_fields = get_candidate_fields_for_lookup(
-                    sf_conn=source_sf,
-                    parent_object=parent_object
-                )
-                
-                for candidate_field in candidate_fields:
-                    if candidate_field == external_id_field:
-                        continue  # Already tried
-                    
+                # Field doesn't exist or query failed - fall back to candidate fields (only non-relationship fields)
+                if '.' not in external_id_field:
                     try:
-                        formatted_value = format_value_for_soql(candidate_field, match_value)
-                        query = f"SELECT Id FROM {parent_object} WHERE {candidate_field} = {formatted_value} LIMIT 1"
-                        result = source_sf.query(query)
-                        if result['totalSize'] > 0:
-                            return result['records'][0]['Id']
+                        candidate_fields = get_candidate_fields_for_lookup(
+                            sf_conn=source_sf,
+                            parent_object=parent_object
+                        )
+                        
+                        for candidate_field in candidate_fields:
+                            if candidate_field == external_id_field:
+                                continue  # Already tried
+                            
+                            try:
+                                formatted_value = format_value_for_soql(candidate_field, match_value)
+                                query = f"SELECT Id FROM {parent_object} WHERE {candidate_field} = {formatted_value} LIMIT 1"
+                                result = source_sf.query(query)
+                                if result['totalSize'] > 0:
+                                    return result['records'][0]['Id']
+                            except:
+                                continue
                     except:
-                        continue
-            except:
+                        pass
+            
+            return None
+        
+        elif match_strategy == 'unique_field':
+            # Single unique field matching - same logic as external_id
+            unique_field = match_fields[0]
+            match_value = match_values.get(unique_field)
+            
+            if not match_value or (isinstance(match_value, str) and match_value.strip() == ''):
+                return None
+            
+            # Query SOURCE org with unique field
+            formatted_value = format_value_for_soql(unique_field, match_value)
+            soql_query = f"SELECT Id FROM {parent_object} WHERE {unique_field} = {formatted_value} LIMIT 1"
+            
+            try:
+                result = source_sf.query(soql_query)
+                if result['totalSize'] > 0:
+                    return result['records'][0]['Id']
+            except Exception as e:
+                # Field doesn't exist or query failed
                 pass
             
             return None
@@ -897,17 +1332,23 @@ def resolve_lookup_relationships_for_migration(
     """
     Resolve lookup relationships for ORG-TO-ORG MIGRATION using 2-step process
     
-    **ORG-TO-ORG MIGRATION FLOW**:
+    **OPTIMIZED FOR SPEED**: Uses batch SOQL queries instead of row-by-row lookups.
+    For 1000 records with 9 lookup fields, this reduces API calls from ~18,000 to ~18.
     
-    For each child record with lookup field:
-    1. Read the SOURCE org Salesforce ID from the lookup field (e.g., WOD_2__Dealer__c = "001xx000003DHP1")
-    2. Query SOURCE org: Get the unique identifier using that ID
-       - SELECT Dealer_Number__c FROM Account WHERE Id = "001xx000003DHP1"
-       - Result: Dealer_Number__c = "914021"
-    3. Query TARGET org: Find matching parent record using the unique identifier
-       - SELECT Id FROM Account WHERE Dealer_Number__c = "914021"
-       - Result: Id = "002yy000001ABCD2" (new ID in target org)
-    4. Use TARGET org ID in the migrated data
+    **ORG-TO-ORG MIGRATION FLOW** (per lookup field, batched):
+    
+    1. Collect all unique SOURCE parent IDs from the lookup column
+    2. Batch query SOURCE org: SELECT match_field FROM Parent WHERE Id IN (all_ids)
+       → Builds a map: source_id → match_value
+    3. Batch query TARGET org: SELECT Id, match_field FROM Parent WHERE match_field IN (all_values)
+       → Builds a map: match_value → target_id
+    4. For each record: source_id → match_value → target_id (instant memory lookups)
+    
+    **Supports Relationship Fields**: Fields can be direct (ProductCategoryId) or relationship fields 
+    with dot notation (ProductCategory.Name). Examples:
+    - match_fields: ['Dealer_Number__c']  # Direct field
+    - match_fields: ['ProductCategory.Name']  # Relationship field
+    - match_fields: ['Account.Industry', 'Region__c']  # Mixed
     
     Args:
         source_df: DataFrame with child records (contains lookup field IDs from source org)
@@ -916,9 +1357,9 @@ def resolve_lookup_relationships_for_migration(
         lookup_configs: Dictionary mapping lookup fields to resolution config
             Format: {
                 'WOD_2__Dealer__c': {
-                    'parent_object': 'Account',  # Parent object name
-                    'match_strategy': 'external_id' | 'field_combination' | 'field_concatenation',
-                    'match_fields': ['Dealer_Number__c']  # Unique identifier field(s) in parent
+                    'parent_object': 'Account',
+                    'match_strategy': 'external_id' | 'unique_field' | 'field_combination' | 'field_concatenation',
+                    'match_fields': ['Dealer_Number__c']
                 }
             }
         progress_callback: Optional callback for progress updates
@@ -936,23 +1377,235 @@ def resolve_lookup_relationships_for_migration(
         'errors': []
     }
     
+    def _batch_query_all(sf_conn, soql_query):
+        """Execute a SOQL query and handle query_more for large result sets."""
+        result = sf_conn.query(soql_query)
+        records = result['records']
+        while not result['done']:
+            result = sf_conn.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+            records.extend(result['records'])
+        return records
+    
+    def _chunk_list(lst, chunk_size):
+        """Split a list into chunks of given size."""
+        for i in range(0, len(lst), chunk_size):
+            yield lst[i:i + chunk_size]
+    
     for lookup_field, config in lookup_configs.items():
         parent_object = config['parent_object']
         match_strategy = config['match_strategy']
-        match_fields = config['match_fields']  # These are the UNIQUE IDENTIFIER fields in parent
+        match_fields = config['match_fields']
         concat_separator = config.get('concat_separator', '_')
         
         if progress_callback:
-            progress_callback(f"Resolving {lookup_field} → {parent_object}...")
+            progress_callback(f"Resolving {lookup_field} → {parent_object} (batch mode)...")
         
         resolved_count = 0
         unresolved_count = 0
         
-        # Create new column for target org IDs
+        # =====================================================================
+        # STEP 1: Collect all unique source parent IDs from this lookup column
+        # =====================================================================
+        source_parent_ids = []
+        null_indices = []  # Track rows with null lookup values
+        
+        for idx, row in resolved_df.iterrows():
+            source_parent_id = row.get(lookup_field)
+            if pd.isna(source_parent_id) or str(source_parent_id).strip() == '':
+                null_indices.append(idx)
+            else:
+                source_parent_ids.append(str(source_parent_id).strip())
+        
+        unique_source_ids = list(set(source_parent_ids))
+        
+        if progress_callback:
+            progress_callback(f"  → {len(unique_source_ids)} unique parent IDs to resolve for {lookup_field}")
+        
+        if not unique_source_ids:
+            # All values are null - nothing to resolve
+            unresolved_count = len(resolved_df)
+            resolution_stats['resolved'][lookup_field] = 0
+            resolution_stats['unresolved'][lookup_field] = unresolved_count
+            continue
+        
+        # =====================================================================
+        # STEP 2: Batch query SOURCE org to get match field values for all IDs
+        # Map: source_id → {match_field: value, ...}
+        # =====================================================================
+        source_id_to_match_values = {}  # source_id → dict of match field values
+        
+        try:
+            match_fields_str = ', '.join(match_fields)
+            
+            # Process in chunks of 200 IDs (SOQL IN clause limit)
+            for id_chunk in _chunk_list(unique_source_ids, 200):
+                id_list_str = ', '.join([f"'{sid}'" for sid in id_chunk])
+                source_query = f"SELECT Id, {match_fields_str} FROM {parent_object} WHERE Id IN ({id_list_str})"
+                
+                try:
+                    source_records = _batch_query_all(source_sf, source_query)
+                    
+                    for record in source_records:
+                        record_id = record.get('Id')
+                        if record_id:
+                            values = {}
+                            for field in match_fields:
+                                # Handle relationship fields (dot notation) - nested dict access
+                                if '.' in field:
+                                    parts = field.split('.')
+                                    val = record
+                                    for part in parts:
+                                        if isinstance(val, dict):
+                                            val = val.get(part)
+                                        else:
+                                            val = None
+                                            break
+                                    values[field] = val
+                                else:
+                                    values[field] = record.get(field)
+                            source_id_to_match_values[record_id] = values
+                except Exception as e:
+                    error_msg = f"Error querying source org for {lookup_field} batch: {str(e)}"
+                    resolution_stats['errors'].append(error_msg)
+                    if progress_callback:
+                        progress_callback(f"❌ {error_msg}")
+        
+        except Exception as e:
+            error_msg = f"Error building source batch query for {lookup_field}: {str(e)}"
+            resolution_stats['errors'].append(error_msg)
+            if progress_callback:
+                progress_callback(f"❌ {error_msg}")
+        
+        if progress_callback:
+            progress_callback(f"  → Found {len(source_id_to_match_values)} parent records in source org")
+        
+        # =====================================================================
+        # STEP 3: Batch query TARGET org to find matching parent records
+        # Map: match_value → target_id
+        # =====================================================================
+        match_value_to_target_id = {}  # match_key → target_id
+        
+        try:
+            if match_strategy in ['external_id', 'unique_field']:
+                # Single field match - use IN clause
+                match_field_name = match_fields[0]
+                
+                # Collect all unique match values from source lookups
+                unique_match_values = set()
+                for values_dict in source_id_to_match_values.values():
+                    val = values_dict.get(match_field_name)
+                    if val is not None and str(val).strip() != '':
+                        unique_match_values.add(str(val))
+                
+                unique_match_values = list(unique_match_values)
+                
+                if unique_match_values:
+                    # Process in chunks of 200 values
+                    for val_chunk in _chunk_list(unique_match_values, 200):
+                        values_str = ', '.join([f"'{v.replace(chr(39), chr(39)*2)}'" for v in val_chunk])
+                        target_query = f"SELECT Id, {match_field_name} FROM {parent_object} WHERE {match_field_name} IN ({values_str})"
+                        
+                        try:
+                            target_records = _batch_query_all(target_sf, target_query)
+                            
+                            for record in target_records:
+                                field_val = record.get(match_field_name)
+                                if field_val:
+                                    match_value_to_target_id[str(field_val)] = record['Id']
+                        except Exception as e:
+                            error_msg = f"Error querying target org for {lookup_field} batch: {str(e)}"
+                            resolution_stats['errors'].append(error_msg)
+                            if progress_callback:
+                                progress_callback(f"❌ {error_msg}")
+            
+            elif match_strategy in ['field_combination', 'field_concatenation']:
+                # Multiple fields - use SOURCE-DRIVEN WHERE filtering (not full SELECT)
+                # Collect unique match value combinations from source data
+                unique_match_combinations = set()
+                for values_dict in source_id_to_match_values.values():
+                    # Build tuple of field values for this source record
+                    field_values = []
+                    for field in match_fields:
+                        val = values_dict.get(field, '')
+                        # Escape single quotes for SOQL
+                        val_str = str(val or '').replace(chr(39), chr(39)*2)
+                        field_values.append(val_str)
+                    unique_match_combinations.add(tuple(field_values))
+                
+                if unique_match_combinations:
+                    field_names_str = ', '.join(match_fields)
+                    
+                    try:
+                        # Process combinations in chunks (100 at a time)
+                        for combo_chunk in _chunk_list(list(unique_match_combinations), 100):
+                            # Build OR-of-AND conditions: (f1='v1' AND f2='v2') OR (f1='v3' AND f2='v4') ...
+                            where_conditions = []
+                            for combo in combo_chunk:
+                                and_parts = []
+                                for i, field in enumerate(match_fields):
+                                    field_val = combo[i]
+                                    if field_val.strip() == '':
+                                        # Skip empty values in WHERE clause
+                                        continue
+                                    # Properly escape field values
+                                    and_parts.append(f"{field} = '{field_val}'")
+                                
+                                if and_parts:  # Only add condition if there are non-empty values
+                                    where_conditions.append(f"({' AND '.join(and_parts)})")
+                            
+                            if where_conditions:
+                                where_clause = " OR ".join(where_conditions)
+                                target_query = f"SELECT Id, {field_names_str} FROM {parent_object} WHERE {where_clause}"
+                                
+                                try:
+                                    target_records = _batch_query_all(target_sf, target_query)
+                                    
+                                    for record in target_records:
+                                        # Handle both direct fields and relationship fields (dot notation)
+                                        field_values = []
+                                        for field in match_fields:
+                                            if '.' in field:
+                                                # Relationship field - navigate nested dict
+                                                parts = field.split('.')
+                                                val = record
+                                                for part in parts:
+                                                    if isinstance(val, dict):
+                                                        val = val.get(part)
+                                                    else:
+                                                        val = None
+                                                        break
+                                                field_values.append(str(val or ''))
+                                            else:
+                                                # Direct field
+                                                field_values.append(str(record.get(field, '') or ''))
+                                        
+                                        combined_key = concat_separator.join(field_values)
+                                        match_value_to_target_id[combined_key] = record['Id']
+                                except Exception as e:
+                                    error_msg = f"Error querying target org for {lookup_field} multi-field batch: {str(e)}"
+                                    resolution_stats['errors'].append(error_msg)
+                                    if progress_callback:
+                                        progress_callback(f"❌ {error_msg}")
+                    except Exception as e:
+                        error_msg = f"Error building source-driven WHERE clause for {lookup_field}: {str(e)}"
+                        resolution_stats['errors'].append(error_msg)
+                        if progress_callback:
+                            progress_callback(f"❌ {error_msg}")
+        
+        except Exception as e:
+            error_msg = f"Error building target batch query for {lookup_field}: {str(e)}"
+            resolution_stats['errors'].append(error_msg)
+        
+        if progress_callback:
+            progress_callback(f"  → Found {len(match_value_to_target_id)} matching records in target org")
+        
+        # =====================================================================
+        # STEP 4: Map each record: source_id → match_value → target_id
+        # (All in-memory lookups, no API calls)
+        # =====================================================================
         target_ids = []
         
         for idx, row in resolved_df.iterrows():
-            # STEP 1: Get the SOURCE org parent ID from the lookup field
             source_parent_id = row.get(lookup_field)
             
             if pd.isna(source_parent_id) or str(source_parent_id).strip() == '':
@@ -962,84 +1615,28 @@ def resolve_lookup_relationships_for_migration(
             
             source_parent_id = str(source_parent_id).strip()
             
-            try:
-                # STEP 2: Query SOURCE org to get unique identifier values
-                # Example: SELECT Dealer_Number__c FROM Account WHERE Id = "001xx000003DHP1"
-                match_fields_str = ', '.join(match_fields)
-                source_query = f"SELECT {match_fields_str} FROM {parent_object} WHERE Id = '{source_parent_id}' LIMIT 1"
-                
-                source_result = source_sf.query(source_query)
-                
-                if source_result['totalSize'] == 0:
-                    target_ids.append(None)
-                    unresolved_count += 1
-                    if progress_callback:
-                        progress_callback(f"⚠️ Parent record {source_parent_id} not found in source org")
-                    continue
-                
-                source_record = source_result['records'][0]
-                
-                # Extract unique identifier values from source parent record
-                match_values = {}
-                for field in match_fields:
-                    match_values[field] = source_record.get(field)
-                
-                # STEP 3: Query TARGET org to find matching parent record
-                # Build query based on matching strategy
-                if match_strategy == 'external_id':
-                    # Single field match
-                    ext_id_field = match_fields[0]
-                    ext_id_value = match_values[ext_id_field]
-                    
-                    if pd.isna(ext_id_value) or str(ext_id_value).strip() == '':
-                        target_ids.append(None)
-                        unresolved_count += 1
-                        continue
-                    
-                    ext_id_value = str(ext_id_value).replace("'", "\\'")
-                    target_query = f"SELECT Id FROM {parent_object} WHERE {ext_id_field} = '{ext_id_value}' LIMIT 1"
-                    
-                elif match_strategy in ['field_combination', 'field_concatenation']:
-                    # Multiple field match (both strategies use AND condition)
-                    conditions = []
-                    all_values_present = True
-                    
-                    for field in match_fields:
-                        value = match_values.get(field)
-                        if pd.isna(value) or str(value).strip() == '':
-                            all_values_present = False
-                            break
-                        value_str = str(value).replace("'", "\\'")
-                        conditions.append(f"{field} = '{value_str}'")
-                    
-                    if not all_values_present:
-                        target_ids.append(None)
-                        unresolved_count += 1
-                        continue
-                    
-                    where_clause = ' AND '.join(conditions)
-                    target_query = f"SELECT Id FROM {parent_object} WHERE {where_clause} LIMIT 1"
-                
-                # Execute query against TARGET org
-                target_result = target_sf.query(target_query)
-                
-                if target_result['totalSize'] > 0:
-                    target_parent_id = target_result['records'][0]['Id']
-                    target_ids.append(target_parent_id)
-                    resolved_count += 1
-                else:
-                    target_ids.append(None)
-                    unresolved_count += 1
-                    if progress_callback:
-                        progress_callback(f"⚠️ Matching record not found in target org for {lookup_field}")
+            # Lookup 1: source_id → match_values (from cache)
+            match_values = source_id_to_match_values.get(source_parent_id)
             
-            except Exception as e:
+            if not match_values:
                 target_ids.append(None)
                 unresolved_count += 1
-                error_msg = f"Error resolving {lookup_field}: {str(e)}"
-                resolution_stats['errors'].append(error_msg)
-                if progress_callback:
-                    progress_callback(f"❌ {error_msg}")
+                continue
+            
+            # Lookup 2: match_value → target_id (from cache)
+            if match_strategy in ['external_id', 'unique_field']:
+                match_key = str(match_values.get(match_fields[0], '') or '')
+            else:
+                match_key = concat_separator.join([str(match_values.get(f, '') or '') for f in match_fields])
+            
+            target_id = match_value_to_target_id.get(match_key)
+            
+            if target_id:
+                target_ids.append(target_id)
+                resolved_count += 1
+            else:
+                target_ids.append(None)
+                unresolved_count += 1
         
         # Update DataFrame with target org IDs
         resolved_df[lookup_field] = target_ids
@@ -1047,6 +1644,9 @@ def resolve_lookup_relationships_for_migration(
         # Track statistics
         resolution_stats['resolved'][lookup_field] = resolved_count
         resolution_stats['unresolved'][lookup_field] = unresolved_count
+        
+        if progress_callback:
+            progress_callback(f"  ✅ {lookup_field}: {resolved_count} resolved, {unresolved_count} unresolved")
     
     return resolved_df, resolution_stats
 
@@ -1224,10 +1824,30 @@ def show_org_migration(credentials: dict):
     if 'migration_lookup_configs' not in st.session_state:
         st.session_state.migration_lookup_configs = {}
     
+    def _mig_next_btn(next_label, key_id):
+        """Render a JS-based Next button for org migration tabs."""
+        esc = next_label.replace("'", "\\'")
+        components.html(f"""
+        <div style="display:flex;justify-content:flex-end;padding:10px 0;">
+            <button onclick="
+                var tabs=window.parent.document.querySelectorAll('button[data-baseweb=\\'tab\\']');
+                for(var i=0;i<tabs.length;i++){{if(tabs[i].innerText.includes('{esc}')){{tabs[i].click();break;}}}}
+            " style="
+                background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;
+                padding:0.55rem 1.4rem;border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;
+                box-shadow:0 2px 8px rgba(102,126,234,0.3);transition:all 0.3s ease;
+            "
+            onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(102,126,234,0.5)'"
+            onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 2px 8px rgba(102,126,234,0.3)'"
+            >Next &#10145;&#65039;</button>
+        </div>
+        """, height=60)
+    
     # Create tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab2a, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "1️⃣ Configuration",
         "2️⃣ Field Mapping",
+        "📦 Related Objects",
         "3️⃣ Pre-Migration Validation",
         "4️⃣ Business Rules",
         "5️⃣ Data Quality",
@@ -1281,8 +1901,9 @@ def show_org_migration(credentials: dict):
             st.markdown("#### 📥 Target Organization")
             target_org = st.selectbox(
                 "Select Target Org (Load TO)",
-                options=["-- Select Target Org --"] + [org for org in available_orgs if org != source_org],
-                key='migration_target_selector'
+                options=["-- Select Target Org --"] + available_orgs,
+                key='migration_target_selector',
+                help="You can select the same org as source if you want to migrate within the same organization"
             )
             
             if target_org != "-- Select Target Org --":
@@ -1335,6 +1956,7 @@ def show_org_migration(credentials: dict):
                 
                 except Exception as e:
                     st.error(f"Error retrieving objects: {str(e)}")
+        _mig_next_btn("Field Mapping", "mig_0")
     
     # ============================================================================
     # TAB 2: FIELD MAPPING
@@ -1364,9 +1986,9 @@ def show_org_migration(credentials: dict):
                 
                 field_selection_mode = st.radio(
                     "Choose how to select source fields for mapping:",
-                    options=["📋 Select from All Fields", "✍️ Use SOQL Query"],
+                    options=["📋 Select from All Fields", "✍️ Use SOQL Query", "📤 Upload File"],
                     horizontal=True,
-                    help="Select all fields or specify fields via SOQL query"
+                    help="Select all fields, specify via SOQL query, or upload a CSV/Excel file"
                 )
                 
                 # Initialize filtered source fields
@@ -1440,10 +2062,16 @@ def show_org_migration(credentials: dict):
                                 where_match = re.search(where_pattern, soql_query, re.IGNORECASE | re.DOTALL)
                                 where_clause = where_match.group(1).strip() if where_match else None
                                 
+                                # Extract LIMIT if present
+                                limit_pattern = r'LIMIT\s+(\d+)'
+                                limit_match = re.search(limit_pattern, soql_query, re.IGNORECASE)
+                                soql_limit = int(limit_match.group(1)) if limit_match else None
+                                
                                 if filtered_source_fields:
                                     st.session_state.migration_soql_query = soql_query
                                     st.session_state.migration_filtered_fields = filtered_source_fields
                                     st.session_state.migration_where_clause = where_clause  # Store WHERE clause
+                                    st.session_state.migration_soql_limit = soql_limit  # Store LIMIT from SOQL
                                     st.session_state.migration_using_soql_mode = True  # Flag to indicate SOQL mode
                                     st.session_state.migration_relationship_fields = relationship_fields_map  # Track relationship fields
                                     
@@ -1464,6 +2092,10 @@ def show_org_migration(credentials: dict):
                                         st.info("💡 This WHERE clause will be applied during migration to filter source records")
                                     else:
                                         st.info("ℹ️ No WHERE clause found - all records will be extracted")
+                                    
+                                    if soql_limit:
+                                        st.success(f"✅ LIMIT detected: {soql_limit} records")
+                                        st.info("💡 This limit will be used as default in the Migration Execution tab")
                                 else:
                                     st.error("❌ No valid fields found in query")
                             else:
@@ -1480,13 +2112,112 @@ def show_org_migration(credentials: dict):
                     else:
                         st.warning("⚠️ Click 'Parse Fields from Query' to extract fields")
                 
+                elif field_selection_mode == "📤 Upload File":
+                    st.markdown("#### 📤 Upload Data File")
+                    st.info("💡 Upload a CSV or Excel file. All columns in the file will be considered as fields to migrate.")
+                    
+                    uploaded_file = st.file_uploader(
+                        "Choose a file (CSV or Excel)",
+                        type=['csv', 'xlsx', 'xls'],
+                        key="migration_file_upload"
+                    )
+                    
+                    if uploaded_file is not None:
+                        try:
+                            # Read file based on type
+                            if uploaded_file.name.endswith('.csv'):
+                                df_file = pd.read_csv(uploaded_file)
+                            else:
+                                df_file = pd.read_excel(uploaded_file)
+                            
+                            # Extract field names from file columns
+                            file_field_names = list(df_file.columns)
+                            
+                            st.success(f"✅ Loaded file: **{uploaded_file.name}**")
+                            st.info(f"📊 File contains **{len(file_field_names)}** columns and **{len(df_file)}** rows")
+                            
+                            # Build label-to-API-name lookup (case-insensitive) for fallback matching
+                            label_to_api = {}
+                            for api_name, meta in source_fields.items():
+                                label = meta.get('label', '')
+                                if label:
+                                    label_to_api[label.strip().lower()] = api_name
+                            
+                            # Track column renames (file label → API name) for DataFrame rename
+                            col_rename_map = {}
+                            # Track match info for display
+                            field_match_info = {}  # col_name → (matched_api_name, match_type)
+                            
+                            # Map file columns to source fields
+                            for col_name in file_field_names:
+                                # 1. Try exact API name match
+                                if col_name in source_fields:
+                                    filtered_source_fields[col_name] = source_fields[col_name]
+                                    field_match_info[col_name] = (col_name, 'api')
+                                # 2. Try label match (case-insensitive)
+                                elif col_name.strip().lower() in label_to_api:
+                                    api_name = label_to_api[col_name.strip().lower()]
+                                    filtered_source_fields[api_name] = source_fields[api_name]
+                                    col_rename_map[col_name] = api_name
+                                    field_match_info[col_name] = (api_name, 'label')
+                                else:
+                                    # If not found, create a placeholder field
+                                    filtered_source_fields[col_name] = {
+                                        'name': col_name,
+                                        'type': 'string',
+                                        'label': col_name,
+                                        'createable': True,
+                                        'updateable': True,
+                                        'nillable': True
+                                    }
+                                    field_match_info[col_name] = (col_name, 'unmatched')
+                            
+                            # Rename DataFrame columns from labels to API names
+                            if col_rename_map:
+                                df_file = df_file.rename(columns=col_rename_map)
+                            
+                            # Store file-based mode info
+                            st.session_state.migration_using_file_mode = True
+                            st.session_state.migration_uploaded_file = uploaded_file.name
+                            st.session_state.migration_file_data = df_file
+                            st.session_state.migration_using_soql_mode = False
+                            st.session_state.migration_where_clause = None
+                            
+                            # Show fields from file
+                            st.write("**Fields in uploaded file:**")
+                            col_list = st.columns([2, 3])
+                            with col_list[0]:
+                                st.write(f"🏷️ **Field Name**")
+                            with col_list[1]:
+                                st.write(f"📋 **Status**")
+                            
+                            for col_name in file_field_names:
+                                matched_api, match_type = field_match_info[col_name]
+                                col_list = st.columns([2, 3])
+                                with col_list[0]:
+                                    if match_type == 'label':
+                                        st.write(f"• {col_name} → `{matched_api}`")
+                                    else:
+                                        st.write(f"• {col_name}")
+                                with col_list[1]:
+                                    if match_type == 'api':
+                                        st.write(f"✅ Matched with {object_name}")
+                                    elif match_type == 'label':
+                                        st.write(f"✅ Matched by label with {object_name}")
+                                    else:
+                                        st.write(f"⚠️ Not in {object_name} schema (will try to map)")
+                        
+                        except Exception as e:
+                            st.error(f"❌ Error reading file: {str(e)}")
+                            st.info("💡 Ensure the file is a valid CSV or Excel file")
+                
                 else:
+
                     # Use all fields mode
                     filtered_source_fields = source_fields
                     st.session_state.migration_using_soql_mode = False  # Not using SOQL mode
                     st.session_state.migration_where_clause = None  # Clear WHERE clause
                     st.info(f"📋 Using all {len(source_fields)} available fields from {object_name}")
-                
                 st.markdown("---")
                 
                 # Only show mapping interface if we have fields to map
@@ -1757,6 +2488,145 @@ def show_org_migration(credentials: dict):
                     st.metric("📊 Total Source Fields", total_selected)
             else:
                 st.info("💡 Please select fields using one of the methods above to start mapping")
+        _mig_next_btn("Related Objects", "mig_1")
+    
+    # ============================================================================
+    # TAB 2A: SELECT RELATED OBJECTS TO MIGRATE
+    # ============================================================================
+    with tab2a:
+        st.subheader("📦 Related Objects & Child Records")
+        
+        # Make it clear this is OPTIONAL
+        st.info(
+            "📌 **This tab is OPTIONAL** \n\n"
+            "You can choose to:\n"
+            "• 🟢 Select related child objects to migrate them along with the parent\n"
+            "• 🟠 Skip this and just migrate the parent object only\n\n"
+            "If you skip child selection, only the parent records will be migrated.",
+            icon="ℹ️"
+        )
+        
+        st.markdown("""
+        **What are Related Objects?**
+        
+        Related objects are child records linked to the parent object. Examples:
+        - Account → Contacts, Opportunities, Assets
+        - Questionnaire → Sections, Questions, Answers
+        """)
+        
+        if not st.session_state.migration_object:
+            st.warning("⚠️ Please select an object in Configuration tab first")
+        else:
+            parent_object = st.session_state.migration_object
+            
+            if 'source_sf_conn' not in st.session_state:
+                st.error("❌ Source org connection not available")
+            else:
+                source_sf = st.session_state.source_sf_conn
+                
+                # Button to discover child objects
+                if st.button("🔍 Discover Related Objects", type="primary", use_container_width=True):
+                    # Clear any cached global object info so filters always run on fresh data
+                    st.session_state.pop('sf_global_object_info', None)
+                    with st.spinner(f"Discovering related objects for {parent_object}..."):
+                        child_objects = discover_child_objects(source_sf, parent_object)
+                    st.session_state.migration_child_objects = child_objects
+                
+                # Display child objects and let user select
+                if 'migration_child_objects' in st.session_state:
+                    child_objects = st.session_state.migration_child_objects
+                    
+                    if not child_objects:
+                        st.info(
+                            f"ℹ️ No child objects found for {parent_object}. "
+                            "You can proceed to Tab 8 to migrate just the parent object.",
+                            icon="ℹ️"
+                        )
+                    else:
+                        st.success(f"✅ Found {len(child_objects)} related object(s)")
+                        
+                        # Allow user to select which children to include
+                        selected_children = display_child_objects_selection(child_objects)
+                        
+                        # Store selected children
+                        st.session_state.migration_selected_children = selected_children
+                        
+                        # ========== AUTO-DETECT CHILD OBJECT LOOKUP FIELDS ==========
+                        if selected_children:
+                            # Only re-run when selection actually changes (avoid re-running on every render)
+                            lookup_cache_key = f"child_lookup_meta_{tuple(sorted(selected_children))}"
+                            if lookup_cache_key not in st.session_state:
+                                with st.spinner("🔍 Detecting lookup fields in selected child objects..."):
+                                    child_lookup_metadata = build_child_lookup_metadata(
+                                        source_sf, selected_children
+                                    )
+                                st.session_state[lookup_cache_key] = child_lookup_metadata
+                                st.session_state.migration_child_lookup_metadata = child_lookup_metadata
+                            else:
+                                child_lookup_metadata = st.session_state[lookup_cache_key]
+                            
+                            if child_lookup_metadata:
+                                # Display detected lookups (lookup_field_list is List[Dict])
+                                st.markdown("**✅ Lookup Fields Detected in Child Objects:**")
+                                for child, lookup_field_list in child_lookup_metadata.items():
+                                    # Support both List[Dict] and legacy List[str]
+                                    if lookup_field_list and isinstance(lookup_field_list[0], dict):
+                                        names = [lf['field_name'] for lf in lookup_field_list]
+                                    else:
+                                        names = lookup_field_list
+                                    st.info(f"📋 {child}: {len(names)} lookup field(s) → {', '.join(names[:3])}{'...' if len(names) > 3 else ''}")
+                                st.caption("ℹ️ Map these lookup fields in the **Lookup Resolution** tab (Tab 6) before executing migration.")
+                            else:
+                                st.info("ℹ️ No lookup fields detected in selected child objects (direct object references only)")
+                        
+                        if selected_children:
+                            st.success(f"✅ Selected {len(selected_children)} object(s) to include in migration")
+                            
+                            # Show configuration for selected children
+                            st.markdown("### 🔧 Selected Related Objects Configuration")
+                            
+                            for child_obj in selected_children:
+                                config = child_objects[child_obj]
+                                
+                                with st.expander(f"📋 {child_obj} ({config['child_object_label']})"):
+                                    col1, col2, col3 = st.columns(3)
+                                    
+                                    with col1:
+                                        st.write(f"**Type:** {config['relationship_type'].upper()}")
+                                    with col2:
+                                        st.write(f"**Required:** {'Yes' if config['is_required'] else 'No'}")
+                                    with col3:
+                                        st.write(f"**Cascading Delete:** {'Yes' if config['is_cascading_delete'] else 'No'}")
+                                    
+                                    st.write(f"**Parent Field:** {config['field_label']} ({config['field_name']})")
+                                    st.write(f"**Creatable:** {'Yes' if config.get('creatable', True) else 'No'}")
+                        else:
+                            st.info("ℹ️ No child objects selected. Only the parent object will be migrated in Tab 8.")
+                        
+                        # Information section
+                        st.markdown("---")
+                        st.markdown("### ℹ️ About Related Objects Migration")
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.markdown("""
+                            #### Master-Detail Relationships
+                            - 🔴 **MANDATORY** - Child cannot exist without parent
+                            - Deleting parent deletes all children (cascading delete)
+                            - Child inherits parent's Record Type
+                            - **Recommendation:** Always include
+                            """)
+                        
+                        with col2:
+                            st.markdown("""
+                            #### Lookup Relationships
+                            - 🟢 **OPTIONAL** - Child can exist independently
+                            - Deleting parent does NOT delete children
+                            - No cascading constraints
+                            - **Recommendation:** Include if you need to preserve these relationships
+                            """)
+        _mig_next_btn("Pre-Migration Validation", "mig_2a")
     
     # ============================================================================
     # TAB 3: PRE-MIGRATION VALIDATION (NEW)
@@ -1802,57 +2672,135 @@ def show_org_migration(credentials: dict):
             # Step 1: Load data for validation
             st.markdown("### Step 1️⃣: Load Data for Validation")
             
-            try:
-                from ui_components.data_hub.integration import has_data, get_data_from_hub, show_data_source_info
-                data_hub_available = has_data()
-            except ImportError:
-                data_hub_available = False
-            
-            data_source = "none"
             validation_data = None
+            data_source = "none"
             
-            if data_hub_available:
-                data_source_option = st.radio(
-                    "Data Source:",
-                    ["Use Data Hub", "Upload File"],
-                    key="migration_validation_source",
-                    horizontal=True
-                )
-            else:
-                data_source_option = "Upload File"
+            # === PRIORITY 1: Check if file was uploaded in Tab 2 ===
+            if st.session_state.get('migration_using_file_mode', False) and st.session_state.get('migration_file_data') is not None:
+                validation_data = st.session_state.migration_file_data
+                st.success(f"✅ Using uploaded file from Tab 2: {st.session_state.get('migration_uploaded_file')}")
+                st.info(f"📊 **Data Source:** Uploaded file ({len(validation_data)} records)")
+                st.caption(f"💡 This is the same file you uploaded in Field Mapping tab. Re-upload in Tab 2 if you need different data.")
             
-            if data_source_option == "Use Data Hub" and data_hub_available:
-                st.success("📊 Data Hub has an active dataset available!")
-                show_data_source_info()
-                
-                if st.button("✅ Load from Data Hub", use_container_width=True, key="migration_load_from_hub"):
-                    validation_data = get_data_from_hub()
-                    if validation_data is not None:
-                        st.success(f"✅ Data loaded from Hub: {len(validation_data)} rows")
-                        data_source = "hub"
-                        st.session_state.migration_validation_data = validation_data
+            # === PRIORITY 2: Check if data already extracted from source org ===
+            elif 'migration_extracted_data' in st.session_state:
+                validation_data = st.session_state.migration_extracted_data
+                data_source = "source_org"
+                st.success(f"✅ Using data extracted from Source Org: {len(validation_data)} records")
+                st.info(f"📊 **Data Source:** {st.session_state.migration_source_org} → {st.session_state.migration_object}")
+                st.caption(f"💡 This is the same data that will be migrated. No upload needed.")
             
             else:
-                uploaded_file = st.file_uploader(
-                    "Upload data file for validation",
-                    type=['csv', 'xlsx', 'xls', 'psv'],
-                    key="migration_validation_upload"
+                # Fallback: Offer to extract from source org
+                try:
+                    from ui_components.data_hub.integration import has_data, select_dataset_from_hub
+                    data_hub_available = has_data()
+                except ImportError:
+                    data_hub_available = False
+                
+                st.info("ℹ️ No data extracted from source org yet.")
+                
+                # Check if we have the necessary connections and config to extract
+                can_extract_from_source = (
+                    st.session_state.get('source_sf_conn') is not None and
+                    st.session_state.get('migration_object') is not None and
+                    st.session_state.get('migration_field_mappings') is not None and
+                    len(st.session_state.get('migration_field_mappings', {})) > 0
                 )
                 
-                if uploaded_file:
-                    try:
-                        # Import load function
-                        from .utils import load_data_file
-                        validation_data = load_data_file(uploaded_file)
-                        
-                        if validation_data is not None:
-                            st.success(f"✅ Loaded {len(validation_data)} records with {len(validation_data.columns)} columns")
-                            data_source = "upload"
-                            st.session_state.migration_validation_data = validation_data
+                col1, col2 = st.columns([1, 2])
+                
+                with col1:
+                    if can_extract_from_source:
+                        if st.button("🚀 Extract from Source Org", key="extract_for_validation", use_container_width=True, type="secondary"):
+                            with st.spinner("📤 Extracting data from source org..."):
+                                try:
+                                    source_sf = st.session_state.source_sf_conn
+                                    object_name = st.session_state.migration_object
+                                    field_mappings = st.session_state.migration_field_mappings
+                                    
+                                    # Build field list from mappings
+                                    field_list = [src for src, tgt in field_mappings.items() if tgt != "-- Skip --"]
+                                    
+                                    soql = f"SELECT {', '.join(field_list)} FROM {object_name} LIMIT 10000"
+                                    result = source_sf.query(soql)
+                                    validation_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
+                                    
+                                    # Store for other tabs
+                                    st.session_state.migration_extracted_data = validation_data
+                                    data_source = "source_org"
+                                    
+                                    st.success(f"✅ Extracted {len(validation_data)} records from {object_name}")
+                                    st.rerun()  # Rerun to refresh the display
+                                    
+                                except Exception as e:
+                                    st.error(f"❌ Extraction failed: {str(e)}")
+                    else:
+                        st.warning("⚠️ Please complete Configuration (TAB 1) first to extract data")
+                
+                with col2:
+                    if data_hub_available or not can_extract_from_source:
+                        if data_hub_available:
+                            st.write("**OR**")
                         else:
-                            st.error("❌ Could not load file")
-                    except Exception as e:
-                        st.error(f"❌ Error loading file: {str(e)}")
+                            st.write("")
+                
+                st.divider()
+                
+                # Fallback to Data Hub or File Upload
+                # If file mode is already active, skip file upload option
+                if st.session_state.get('migration_using_file_mode', False):
+                    st.info("ℹ️ Using file from Tab 2. Your data has been loaded in Tab 2 (Field Mapping).")
+                    if data_hub_available:
+                        st.write("Or use Data Hub:")
+                        hub_df = select_dataset_from_hub("migration_val_alt")
+                        if hub_df is not None:
+                            if st.button("✅ Load Selected Dataset", use_container_width=True, key="migration_load_from_hub_val"):
+                                validation_data = hub_df
+                                st.success(f"✅ Data loaded from Hub: {len(validation_data)} rows")
+                                st.session_state.migration_validation_data = validation_data
+                else:
+                    # File mode not active, show normal options
+                    if data_hub_available:
+                        data_source_option = st.radio(
+                            "Alternative Data Sources:",
+                            ["Use Data Hub", "Upload File"],
+                            key="migration_validation_source",
+                            horizontal=True
+                        )
+                    else:
+                        data_source_option = "Upload File"
+                    
+                    if data_source_option == "Use Data Hub" and data_hub_available:
+                        hub_df = select_dataset_from_hub("migration_val")
+                        if hub_df is not None:
+                            if st.button("✅ Load Selected Dataset", use_container_width=True, key="migration_load_from_hub"):
+                                validation_data = hub_df
+                                st.success(f"✅ Data loaded from Hub: {len(validation_data)} rows")
+                                data_source = "hub"
+                                st.session_state.migration_validation_data = validation_data
+                    
+                    else:
+                        uploaded_file = st.file_uploader(
+                            "Upload data file for validation",
+                            type=['csv', 'xlsx', 'xls', 'psv'],
+                            key="migration_validation_upload"
+                        )
+                        
+                        if uploaded_file:
+                            try:
+                                # Import load function
+                                from .utils import load_data_file
+                                validation_data = load_data_file(uploaded_file)
+                                
+                                if validation_data is not None:
+                                    st.success(f"✅ Loaded {len(validation_data)} records with {len(validation_data.columns)} columns")
+                                    data_source = "upload"
+                                    st.session_state.migration_validation_data = validation_data
+                                else:
+                                    st.error("❌ Could not load file")
+                            except Exception as e:
+                                st.error(f"❌ Error loading file: {str(e)}")
             
             # Step 2: Review validation settings
             if validation_data is not None or 'migration_validation_data' in st.session_state:
@@ -2008,10 +2956,42 @@ def show_org_migration(credentials: dict):
                         else:
                             st.warning("⚠️ **Review and fix issues before proceeding**")
                             st.info("After fixing issues, re-upload data and run validation again")
+                        
+                        # Track validation operation
+                        try:
+                            # Build summary statistics
+                            passed_count = sum(1 for r in validation_results.values() if r.get('passed', False))
+                            total_checks = len(validation_results)
+                            failed_count = total_checks - passed_count
+                            
+                            # Count passed/failed records based on validation results
+                            total_records_checked = len(validation_data)
+                            # If all validations passed, all records passed; if any failed, count failures
+                            failed_records = 0 if all_passed else total_records_checked
+                            passed_records = total_records_checked if all_passed else 0
+                            
+                            track_validation_check(
+                                data=validation_data,
+                                object_name=object_name,
+                                source_org=st.session_state.migration_target_org,
+                                validation_type='Schema',
+                                total_records=total_records_checked,
+                                passed_records=passed_records,
+                                failed_records=failed_records,
+                                validation_details={
+                                    'validation_options': validation_options,
+                                    'checks_performed': list(validation_results.keys()),
+                                    'source_org': st.session_state.migration_source_org
+                                }
+                            )
+                        except Exception as tracking_error:
+                            # Log tracking error but don't interrupt the workflow
+                            st.warning(f"⚠️ Failed to track validation operation: {str(tracking_error)}")
                     
                     except Exception as e:
                         st.error(f"❌ Error running validation: {str(e)}")
                         st.exception(e)
+        _mig_next_btn("Business Rules", "mig_3")
     
     # ============================================================================
     # TAB 4: BUSINESS RULES VALIDATION
@@ -2024,55 +3004,132 @@ def show_org_migration(credentials: dict):
         """)
         
         try:
-            from ui_components.data_hub.integration import has_data, get_data_from_hub, show_data_source_info
+            from ui_components.data_hub.integration import has_data, select_dataset_from_hub
             data_hub_available = has_data()
         except ImportError:
             data_hub_available = False
         
         # Step 1: Load data for validation
-        st.markdown("### Step 1️⃣: Load Data for Rules Validation")
+        st.markdown("### Step 1\ufe0f\u20e3: Load Data for Rules Validation")
         
         rules_data = None
         
-        if data_hub_available:
-            rules_source = st.radio(
-                "Data Source:",
-                ["Use Data Hub", "Upload File"],
-                key="rules_validation_source",
-                horizontal=True
-            )
+        # === PRIORITY 1: Check if file was uploaded in Tab 2 ===
+        if st.session_state.get('migration_using_file_mode', False) and st.session_state.get('migration_file_data') is not None:
+            rules_data = st.session_state.migration_file_data
+            st.success(f"✅ Using uploaded file from Tab 2: {st.session_state.get('migration_uploaded_file')}")
+            st.info(f"📊 **Data Source:** Uploaded file ({len(rules_data)} records)")
+            st.caption(f"💡 This is the same file you uploaded in Field Mapping tab. Re-upload in Tab 2 if you need different data.")
+        
+        # === PRIORITY 2: Check if data already extracted from source org ===
+        elif 'migration_extracted_data' in st.session_state:
+            rules_data = st.session_state.migration_extracted_data
+            st.success(f"✅ Using data extracted from Source Org: {len(rules_data)} records")
+            st.info(f"📊 **Data Source:** {st.session_state.migration_source_org} → {st.session_state.migration_object}")
+            st.caption(f"💡 This is the same data that will be migrated. No upload needed.")
+        
         else:
-            rules_source = "Upload File"
-        
-        if rules_source == "Use Data Hub" and data_hub_available:
-            if st.button("✅ Load from Data Hub", key="rules_load_hub"):
-                try:
-                    rules_data = get_data_from_hub()
-                    st.session_state.rules_validation_data = rules_data
-                    st.success(f"✅ Loaded {len(rules_data)} records from Data Hub")
-                except Exception as e:
-                    st.error(f"❌ Error loading from Data Hub: {str(e)}")
-        
-        elif rules_source == "Upload File":
-            uploaded_file = st.file_uploader(
-                "Upload data file for rules validation:",
-                type=['csv', 'xlsx', 'xls', 'psv'],
-                key="rules_validation_file"
+            # Fallback: Offer to extract from source org
+            st.info("ℹ️ No data extracted from source org yet.")
+            
+            # Check if we have the necessary connections and config to extract
+            can_extract_from_source = (
+                st.session_state.get('source_sf_conn') is not None and
+                st.session_state.get('migration_object') is not None and
+                st.session_state.get('migration_field_mappings') is not None and
+                len(st.session_state.get('migration_field_mappings', {})) > 0
             )
             
-            if uploaded_file:
-                try:
-                    from .utils import load_data_file
-                    rules_data = load_data_file(uploaded_file)
-                    st.session_state.rules_validation_data = rules_data
-                    st.success(f"✅ Loaded {len(rules_data)} records from file")
-                except Exception as e:
-                    st.error(f"❌ Error reading file: {str(e)}")
-        
-        # Use previously loaded data if available
-        if rules_data is None and 'rules_validation_data' in st.session_state:
-            rules_data = st.session_state.rules_validation_data
-            st.info(f"ℹ️ Using previously loaded data ({len(rules_data)} records)")
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                if can_extract_from_source:
+                    if st.button("🚀 Extract from Source Org", key="extract_rules_for_validation", use_container_width=True, type="secondary"):
+                        with st.spinner("📤 Extracting data from source org..."):
+                            try:
+                                source_sf = st.session_state.source_sf_conn
+                                object_name = st.session_state.migration_object
+                                field_mappings = st.session_state.migration_field_mappings
+                                
+                                # Build field list from mappings
+                                field_list = [src for src, tgt in field_mappings.items() if tgt != "-- Skip --"]
+                                
+                                soql = f"SELECT {', '.join(field_list)} FROM {object_name} LIMIT 10000"
+                                result = source_sf.query(soql)
+                                rules_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
+                                
+                                # Store for other tabs
+                                st.session_state.migration_extracted_data = rules_data
+                                
+                                st.success(f"✅ Extracted {len(rules_data)} records from {object_name}")
+                                st.rerun()  # Rerun to refresh the display
+                                
+                            except Exception as e:
+                                st.error(f"❌ Extraction failed: {str(e)}")
+                else:
+                    st.warning("⚠️ Please complete Configuration (TAB 1) first to extract data")
+            
+            with col2:
+                if data_hub_available or not can_extract_from_source:
+                    if data_hub_available:
+                        st.write("**OR**")
+                    else:
+                        st.write("")
+            
+            st.divider()
+            
+            # Fallback to Data Hub or File Upload
+            # If file mode is already active, skip file upload option
+            if st.session_state.get('migration_using_file_mode', False):
+                st.info("ℹ️ Using file from Tab 2. Your data has been loaded in Tab 2 (Field Mapping).")
+                if data_hub_available:
+                    st.write("Or use Data Hub:")
+                    hub_df = select_dataset_from_hub("rules_val_alt")
+                    if hub_df is not None:
+                        if st.button("✅ Load Selected Dataset", use_container_width=True, key="rules_load_from_hub_alt"):
+                            rules_data = hub_df
+                            st.success(f"✅ Data loaded from Hub: {len(rules_data)} rows")
+                            st.session_state.rules_validation_data = rules_data
+            else:
+                # File mode not active, show normal options
+                if data_hub_available:
+                    rules_source = st.radio(
+                        "Alternative Data Sources:",
+                        ["Use Data Hub", "Upload File"],
+                        key="rules_validation_source",
+                        horizontal=True
+                    )
+                else:
+                    rules_source = "Upload File"
+                
+                if rules_source == "Use Data Hub" and data_hub_available:
+                    hub_df = select_dataset_from_hub("rules_val")
+                    if hub_df is not None:
+                        if st.button("✅ Load Selected Dataset", use_container_width=True, key="rules_load_hub"):
+                            rules_data = hub_df
+                            st.session_state.rules_validation_data = rules_data
+                            st.success(f"✅ Loaded {len(rules_data)} records from Data Hub")
+                
+                elif rules_source == "Upload File":
+                    uploaded_file = st.file_uploader(
+                        "Upload data file for rules validation:",
+                        type=['csv', 'xlsx', 'xls', 'psv'],
+                        key="rules_validation_file"
+                    )
+                    
+                    if uploaded_file:
+                        try:
+                            from .utils import load_data_file
+                            rules_data = load_data_file(uploaded_file)
+                            st.session_state.rules_validation_data = rules_data
+                            st.success(f"✅ Loaded {len(rules_data)} records from file")
+                        except Exception as e:
+                            st.error(f"❌ Error reading file: {str(e)}")
+            
+            # Use previously loaded data if available
+            if rules_data is None and 'rules_validation_data' in st.session_state:
+                rules_data = st.session_state.rules_validation_data
+                st.info(f"ℹ️ Using previously loaded data ({len(rules_data)} records)")
         
         if rules_data is not None:
             st.success(f"✅ Data loaded: {rules_data.shape[0]} rows × {rules_data.shape[1]} columns")
@@ -2206,6 +3263,37 @@ def show_org_migration(credentials: dict):
                                     st.markdown("### 💡 Suggested Fixes")
                                     for suggestion in suggestions:
                                         st.write(suggestion)
+                            
+                            # Track validation operation
+                            try:
+                                # Build summary statistics
+                                custom_passed = validation_results['custom_rules'].get('passed', 0)
+                                custom_failed = validation_results['custom_rules'].get('failed', 0)
+                                
+                                # Count passed/failed records
+                                total_records_checked = len(rules_data)
+                                failed_records = custom_failed if custom_failed > 0 else 0
+                                passed_records = total_records_checked - failed_records
+                                
+                                track_validation_check(
+                                    data=rules_data,
+                                    object_name=object_name,
+                                    source_org=st.session_state.migration_target_org,
+                                    validation_type='Business_Rules',
+                                    total_records=total_records_checked,
+                                    passed_records=passed_records,
+                                    failed_records=failed_records,
+                                    validation_details={
+                                        'custom_rules_passed': custom_passed,
+                                        'custom_rules_failed': custom_failed,
+                                        'salesforce_rules_checked': enable_validation_rules,
+                                        'source_org': st.session_state.migration_source_org,
+                                        'rules_config': rules_config
+                                    }
+                                )
+                            except Exception as tracking_error:
+                                # Log tracking error but don't interrupt the workflow
+                                st.warning(f"⚠️ Failed to track validation operation: {str(tracking_error)}")
                     
                     except Exception as e:
                         st.error(f"❌ Error running validation: {str(e)}")
@@ -2229,6 +3317,7 @@ def show_org_migration(credentials: dict):
         
         else:
             st.info("📤 Please load data in Step 1 to proceed with business rules validation")
+        _mig_next_btn("Data Quality", "mig_4")
     
     # ============================================================================
     # TAB 5: DATA QUALITY CHECKS
@@ -2241,7 +3330,7 @@ def show_org_migration(credentials: dict):
         """)
         
         try:
-            from ui_components.data_hub.integration import has_data, get_data_from_hub, show_data_source_info
+            from ui_components.data_hub.integration import has_data, select_dataset_from_hub
             data_hub_available = has_data()
         except ImportError:
             data_hub_available = False
@@ -2251,44 +3340,121 @@ def show_org_migration(credentials: dict):
         
         quality_data = None
         
-        if data_hub_available:
-            quality_source = st.radio(
-                "Data Source:",
-                ["Use Data Hub", "Upload File"],
-                key="quality_check_source",
-                horizontal=True
-            )
+        # === PRIORITY 1: Check if file was uploaded in Tab 2 ===
+        if st.session_state.get('migration_using_file_mode', False) and st.session_state.get('migration_file_data') is not None:
+            quality_data = st.session_state.migration_file_data
+            st.success(f"✅ Using uploaded file from Tab 2: {st.session_state.get('migration_uploaded_file')}")
+            st.info(f"📊 **Data Source:** Uploaded file ({len(quality_data)} records)")
+            st.caption(f"💡 This is the same file you uploaded in Field Mapping tab. Re-upload in Tab 2 if you need different data.")
+        
+        # === PRIORITY 2: Check if data already extracted from source org ===
+        elif 'migration_extracted_data' in st.session_state:
+            quality_data = st.session_state.migration_extracted_data
+            st.success(f"✅ Using data extracted from Source Org: {len(quality_data)} records")
+            st.info(f"📊 **Data Source:** {st.session_state.migration_source_org} → {st.session_state.migration_object}")
+            st.caption(f"💡 This is the same data that will be migrated. No upload needed.")
+        
         else:
-            quality_source = "Upload File"
-        
-        if quality_source == "Use Data Hub" and data_hub_available:
-            if st.button("✅ Load from Data Hub", key="quality_load_hub"):
-                try:
-                    quality_data = get_data_from_hub()
-                    st.session_state.quality_check_data = quality_data
-                    st.success(f"✅ Loaded {len(quality_data)} records from Data Hub")
-                except Exception as e:
-                    st.error(f"❌ Error loading from Data Hub: {str(e)}")
-        
-        elif quality_source == "Upload File":
-            quality_file = st.file_uploader(
-                "Upload CSV, XLSX, XLS, or PSV file for quality checks:",
-                type=['csv', 'xlsx', 'xls', 'psv'],
-                key="quality_check_file"
+            # Fallback: Offer to extract from source org
+            st.info("ℹ️ No data extracted from source org yet.")
+            
+            # Check if we have the necessary connections and config to extract
+            can_extract_from_source = (
+                st.session_state.get('source_sf_conn') is not None and
+                st.session_state.get('migration_object') is not None and
+                st.session_state.get('migration_field_mappings') is not None and
+                len(st.session_state.get('migration_field_mappings', {})) > 0
             )
             
-            if quality_file:
-                try:
-                    quality_data = pd.read_csv(quality_file)
-                    st.session_state.quality_check_data = quality_data
-                    st.success(f"✅ Loaded {len(quality_data)} records from file")
-                except Exception as e:
-                    st.error(f"❌ Error reading file: {str(e)}")
-        
-        # Use previously loaded data if available
-        if quality_data is None and 'quality_check_data' in st.session_state:
-            quality_data = st.session_state.quality_check_data
-            st.info(f"ℹ️ Using previously loaded data ({len(quality_data)} records)")
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                if can_extract_from_source:
+                    if st.button("🚀 Extract from Source Org", key="extract_quality_for_validation", use_container_width=True, type="secondary"):
+                        with st.spinner("📤 Extracting data from source org..."):
+                            try:
+                                source_sf = st.session_state.source_sf_conn
+                                object_name = st.session_state.migration_object
+                                field_mappings = st.session_state.migration_field_mappings
+                                
+                                # Build field list from mappings
+                                field_list = [src for src, tgt in field_mappings.items() if tgt != "-- Skip --"]
+                                
+                                soql = f"SELECT {', '.join(field_list)} FROM {object_name} LIMIT 10000"
+                                result = source_sf.query(soql)
+                                quality_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
+                                
+                                # Store for other tabs
+                                st.session_state.migration_extracted_data = quality_data
+                                
+                                st.success(f"✅ Extracted {len(quality_data)} records from {object_name}")
+                                st.rerun()  # Rerun to refresh the display
+                                
+                            except Exception as e:
+                                st.error(f"❌ Extraction failed: {str(e)}")
+                else:
+                    st.warning("⚠️ Please complete Configuration (TAB 1) first to extract data")
+            
+            with col2:
+                if data_hub_available or not can_extract_from_source:
+                    if data_hub_available:
+                        st.write("**OR**")
+                    else:
+                        st.write("")
+            
+            st.divider()
+            
+            # Fallback to Data Hub or File Upload
+            # If file mode is already active, skip file upload option
+            if st.session_state.get('migration_using_file_mode', False):
+                st.info("ℹ️ Using file from Tab 2. Your data has been loaded in Tab 2 (Field Mapping).")
+                if data_hub_available:
+                    st.write("Or use Data Hub:")
+                    hub_df = select_dataset_from_hub("quality_alt")
+                    if hub_df is not None:
+                        if st.button("✅ Load Selected Dataset", use_container_width=True, key="quality_load_from_hub_alt"):
+                            quality_data = hub_df
+                            st.success(f"✅ Data loaded from Hub: {len(quality_data)} rows")
+                            st.session_state.quality_check_data = quality_data
+            else:
+                # File mode not active, show normal options
+                if data_hub_available:
+                    quality_source = st.radio(
+                        "Alternative Data Sources:",
+                        ["Use Data Hub", "Upload File"],
+                        key="quality_check_source",
+                        horizontal=True
+                    )
+                else:
+                    quality_source = "Upload File"
+                
+                if quality_source == "Use Data Hub" and data_hub_available:
+                    hub_df = select_dataset_from_hub("quality_val")
+                    if hub_df is not None:
+                        if st.button("✅ Load Selected Dataset", use_container_width=True, key="quality_load_hub"):
+                            quality_data = hub_df
+                            st.session_state.quality_check_data = quality_data
+                            st.success(f"✅ Loaded {len(quality_data)} records from Data Hub")
+                
+                elif quality_source == "Upload File":
+                    quality_file = st.file_uploader(
+                        "Upload CSV, XLSX, XLS, or PSV file for quality checks:",
+                        type=['csv', 'xlsx', 'xls', 'psv'],
+                        key="quality_check_file"
+                    )
+                    
+                    if quality_file:
+                        try:
+                            quality_data = pd.read_csv(quality_file)
+                            st.session_state.quality_check_data = quality_data
+                            st.success(f"✅ Loaded {len(quality_data)} records from file")
+                        except Exception as e:
+                            st.error(f"❌ Error reading file: {str(e)}")
+            
+            # Use previously loaded data if available
+            if quality_data is None and 'quality_check_data' in st.session_state:
+                quality_data = st.session_state.quality_check_data
+                st.info(f"ℹ️ Using previously loaded data ({len(quality_data)} records)")
         
         if quality_data is not None:
             st.success(f"✅ Data loaded: {quality_data.shape[0]} rows × {quality_data.shape[1]} columns")
@@ -2440,6 +3606,34 @@ def show_org_migration(credentials: dict):
                                     st.markdown("### 💡 Recommendations")
                                     for rec in recommendations:
                                         st.write(rec)
+                            
+                            # Track validation operation
+                            try:
+                                # Build summary statistics
+                                issues_count = quality_results.get('issues_count', 0)
+                                total_records_checked = len(quality_data)
+                                failed_records = issues_count if issues_count > 0 else 0
+                                passed_records = total_records_checked - failed_records
+                                
+                                track_validation_check(
+                                    data=quality_data,
+                                    object_name=st.session_state.migration_object,
+                                    source_org=st.session_state.migration_target_org,
+                                    validation_type='Data_Quality',
+                                    total_records=total_records_checked,
+                                    passed_records=passed_records,
+                                    failed_records=failed_records,
+                                    validation_details={
+                                        'checks_performed': list(quality_config.keys()),
+                                        'all_passed': quality_results.get('pass', False),
+                                        'issues_found': issues_count,
+                                        'source_org': st.session_state.migration_source_org,
+                                        'quality_config': quality_config
+                                    }
+                                )
+                            except Exception as tracking_error:
+                                # Log tracking error but don't interrupt the workflow
+                                st.warning(f"⚠️ Failed to track validation operation: {str(tracking_error)}")
                     
                     except Exception as e:
                         st.error(f"❌ Error running quality checks: {str(e)}")
@@ -2456,6 +3650,7 @@ def show_org_migration(credentials: dict):
         
         else:
             st.info("📤 Please load data in Step 1 to proceed with quality checks")
+        _mig_next_btn("Lookup Resolution", "mig_5")
     
     # ============================================================================
     # TAB 6: LOOKUP RESOLUTION & RECORD MATCHING
@@ -2686,78 +3881,140 @@ def show_org_migration(credentials: dict):
             if system_lookup_count > 0 and not show_system_fields:
                 st.info(f"💡 {system_lookup_count} system lookup field(s) hidden. These are typically auto-handled by Salesforce.")
             
+            # FILTER: Only show lookup fields that are in the user's selection (SOQL mode or File mode)
+            selected_field_names = []
+            data_source_info = ""
+            
+            # PRIORITY 1: Check if using FILE MODE
+            if st.session_state.get('migration_using_file_mode', False) and st.session_state.get('migration_file_data') is not None:
+                file_df = st.session_state.get('migration_file_data')
+                selected_field_names = list(file_df.columns)
+                data_source_info = f"📤 **File Mode** ({st.session_state.get('migration_uploaded_file')})"
+            
+            # PRIORITY 2: Check if using SOQL MODE
+            elif st.session_state.get('migration_using_soql_mode', False) and st.session_state.get('migration_filtered_fields'):
+                selected_field_names = list(st.session_state.get('migration_filtered_fields', {}).keys())
+                data_source_info = "🔍 **SOQL Mode**"
+            
+            # Apply filtering if we have selected fields
+            if selected_field_names:
+                # Filter lookup_fields to only include those in selected fields
+                filtered_lookup_fields = []
+                for lookup_field_info in lookup_fields:
+                    field_name = lookup_field_info.get('field_name')
+                    if field_name in selected_field_names:
+                        filtered_lookup_fields.append(lookup_field_info)
+                
+                if filtered_lookup_fields:
+                    lookup_fields = filtered_lookup_fields
+                    st.info(f"{data_source_info}: Showing {len(lookup_fields)} lookup field(s) from your selection")
+                else:
+                    st.info(f"ℹ️ {data_source_info}: Your selection doesn't include any lookup fields, so no lookup resolution needed")
+                    lookup_fields = []
+            
             if not lookup_fields:
                 st.info("ℹ️ No lookup fields found in this object.")
-                return
-            
-            st.success(f"✅ Found {len(lookup_fields)} lookup field(s)")
-            
-            # Configure each lookup field
-            for i, lookup_info in enumerate(lookup_fields):
-                lookup_field = lookup_info['field_name']
-                parent_objects = lookup_info['reference_to']
-                parent_object = parent_objects[0] if parent_objects else "Unknown"
-                is_system_field = lookup_info.get('is_system', False)
+            else:
+                st.success(f"✅ Found {len(lookup_fields)} lookup field(s) to configure")
                 
-                # Build expander title with system field indicator
-                expander_title = f"🔗 {lookup_field} → {parent_object}"
-                if is_system_field:
-                    expander_title += " ⚙️ (System Field)"
-                
-                with st.expander(expander_title, expanded=not is_system_field):
-                    st.markdown(f"**Lookup Type**: {lookup_info['type']}")
-                    st.markdown(f"**Parent Object**: {parent_object}")
+                # Configure each lookup field
+                for i, lookup_info in enumerate(lookup_fields):
+                    lookup_field = lookup_info['field_name']
+                    parent_objects = lookup_info['reference_to']
+                    parent_object = parent_objects[0] if parent_objects else "Unknown"
+                    is_system_field = lookup_info.get('is_system', False)
                     
-                    # Show special guidance for system fields
+                    # Build expander title with system field indicator
+                    expander_title = f"🔗 {lookup_field} → {parent_object}"
                     if is_system_field:
-                        if lookup_field in ['CreatedById', 'LastModifiedById']:
-                            st.warning("⚠️ **System-Managed Field**: This field is automatically set by Salesforce and **cannot be modified** during migration.")
-                            st.info("💡 **Action**: Skip configuration - Salesforce will set this automatically")
-                            continue  # Skip configuration for these fields
-                        
-                        elif lookup_field == 'OwnerId':
-                            st.info("💡 **Default Behavior**: If not configured, records will be owned by the user running the migration")
-                            st.markdown("**Options**:")
-                            st.markdown("- Configure matching to preserve original owner (e.g., match by Email)")
-                            st.markdown("- Skip configuration to use default (current user)")
-                        
-                        elif lookup_field == 'RecordTypeId':
-                            st.info("💡 **Default Behavior**: Uses the default Record Type if not specified")
-                            st.markdown("**Options**:")
-                            st.markdown("- Configure matching by DeveloperName or Name")
-                            st.markdown("- Skip configuration to use default Record Type")
-                        
-                        elif lookup_field == 'MasterRecordId':
-                            st.warning("⚠️ **Not Applicable for Migration**: This field tracks merged records and should not be migrated")
-                            st.info("💡 **Action**: Skip configuration")
-                            continue  # Skip configuration
+                        expander_title += " ⚙️ (System Field)"
                     
-                    # Add skip option
-                    col1, col2 = st.columns([3, 1])
-                    with col2:
-                        skip_field = st.checkbox(f"Skip {lookup_field}", value=is_system_field, key=f"skip_lookup_{i}")
+                    with st.expander(expander_title, expanded=not is_system_field):
+                        st.markdown(f"**Lookup Type**: {lookup_info['type']}")
+                        st.markdown(f"**Parent Object**: {parent_object}")
+                        
+                        # Show special guidance for system fields
+                        if is_system_field:
+                            if lookup_field in ['CreatedById', 'LastModifiedById']:
+                                st.warning("⚠️ **System-Managed Field**: This field is automatically set by Salesforce and **cannot be modified** during migration.")
+                                st.info("💡 **Action**: Skip configuration - Salesforce will set this automatically")
+                            
+                            elif lookup_field == 'OwnerId':
+                                st.info("💡 **Default Behavior**: If not configured, records will be owned by the user running the migration")
+                                st.markdown("**Options**:")
+                                st.markdown("- Configure matching to preserve original owner (e.g., match by Email)")
+                                st.markdown("- Skip configuration to use default (current user)")
+                            
+                            elif lookup_field == 'RecordTypeId':
+                                st.info("💡 **Default Behavior**: Uses the default Record Type if not specified")
+                                st.markdown("**Options**:")
+                                st.markdown("- Configure matching by DeveloperName or Name")
+                                st.markdown("- Skip configuration to use default Record Type")
+                            
+                            elif lookup_field == 'MasterRecordId':
+                                st.warning("⚠️ **Not Applicable for Migration**: This field tracks merged records and should not be migrated")
+                                st.info("💡 **Action**: Skip configuration")
+                        
+                        # Add skip option
+                        col1, col2 = st.columns([3, 1])
+                        with col2:
+                            skip_field = st.checkbox(f"Skip {lookup_field}", value=is_system_field, key=f"skip_lookup_{i}")
+                        
+                        if skip_field:
+                            st.info(f"⏭️ {lookup_field} will be skipped during migration")
+                            # Remove from config if exists
+                            if lookup_field in st.session_state.migration_lookup_configs:
+                                del st.session_state.migration_lookup_configs[lookup_field]
+                            continue
                     
-                    if skip_field:
-                        st.info(f"⏭️ {lookup_field} will be skipped during migration")
-                        # Remove from config if exists
-                        if lookup_field in st.session_state.migration_lookup_configs:
-                            del st.session_state.migration_lookup_configs[lookup_field]
+                    # Skip MasterRecordId as it cannot be migrated
+                    if lookup_field == 'MasterRecordId':
                         continue
                     
-                    # Get parent object fields from TARGET org
+                    # Get parent object fields from TARGET org (including relationship fields)
                     try:
-                        parent_fields = get_object_fields(target_sf, parent_object)
+                        parent_fields = get_object_fields_with_relationships(target_sf, parent_object, include_relationship_fields=True)
                         external_id_fields = identify_external_id_fields(parent_fields)
                         unique_fields = identify_unique_fields(parent_fields)
                         all_fields = list(parent_fields.keys())
                         
-                        st.markdown(f"✅ Parent object has {len(external_id_fields)} External ID field(s), {len(unique_fields)} unique field(s)")
+                        # Count relationship fields
+                        relationship_fields = [f for f in parent_fields.values() if f.get('is_relationship_field', False)]
+                        direct_fields = [f for f in parent_fields.values() if not f.get('is_relationship_field', False)]
+                        
+                        # Debug: Show available fields
+                        with st.expander("🔍 Debug - Show Available Fields"):
+                            st.write(f"**Total Fields**: {len(all_fields)}")
+                            st.write(f"**Direct Fields**: {len([f for f in all_fields if not parent_fields[f].get('is_relationship_field', False)])}")
+                            st.write(f"**Relationship Fields**: {len([f for f in all_fields if parent_fields[f].get('is_relationship_field', False)])}")
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write("**Direct Fields:**")
+                                direct_field_names = [f for f in all_fields if not parent_fields[f].get('is_relationship_field', False)]
+                                for f in sorted(direct_field_names)[:20]:
+                                    st.write(f"🏷️ {f}")
+                                if len(direct_field_names) > 20:
+                                    st.write(f"... and {len(direct_field_names) - 20} more")
+                            
+                            with col2:
+                                if relationship_fields:
+                                    st.write("**Relationship Fields:**")
+                                    rel_field_names = [f for f in all_fields if parent_fields[f].get('is_relationship_field', False)]
+                                    for f in sorted(rel_field_names)[:20]:
+                                        st.write(f"🔗 {f}")
+                                    if len(rel_field_names) > 20:
+                                        st.write(f"... and {len(rel_field_names) - 20} more")
+                                else:
+                                    st.write("**Relationship Fields:**")
+                                    st.write("None found")
                         
                         # Matching strategy selection
                         matching_strategy = st.radio(
                             f"Matching Strategy for {lookup_field}:",
                             options=[
                                 "external_id - Single External ID Field",
+                                "unique_field - Single Unique Field",
                                 "field_combination - Multiple Fields (AND)",
                                 "field_concatenation - Concatenated Fields"
                             ],
@@ -2769,11 +4026,29 @@ def show_org_migration(credentials: dict):
                         
                         if strategy_key == "external_id":
                             # Single External ID
-                            if external_id_fields:
+                            # Prepare field options with icons to distinguish relationship fields
+                            field_options = []
+                            field_labels = []
+                            
+                            # Add direct external ID fields first
+                            for field in external_id_fields:
+                                field_options.append(field)
+                                field_labels.append(f"🏷️ {field} (Direct Field)")
+                            
+                            # Add ALL relationship fields (user can choose any for matching)
+                            for field_name, field_meta in parent_fields.items():
+                                if field_meta.get('is_relationship_field'):
+                                    field_options.append(field_name)
+                                    field_labels.append(f"🔗 {field_name} (Relationship Field)")
+                            
+                            if field_options:
+                                
                                 selected_ext_id = st.selectbox(
-                                    "Select External ID Field:",
-                                    options=external_id_fields,
-                                    key=f"lookup_extid_{i}"
+                                    "Select External ID Field (or any Relationship Field):",
+                                    options=field_options,
+                                    format_func=lambda x: field_labels[field_options.index(x)] if x in field_options else x,
+                                    key=f"lookup_extid_{i}",
+                                    help="You can select from direct External ID fields or relationship fields (e.g., ProductCategory.Name)"
                                 )
                                 
                                 st.session_state.migration_lookup_configs[lookup_field] = {
@@ -2782,23 +4057,104 @@ def show_org_migration(credentials: dict):
                                     'match_fields': [selected_ext_id]
                                 }
                                 
-                                st.info(f"""
-                                💡 **Lookup Resolution Process:**
-                                1. Read SOURCE ID: `{lookup_field} = <SOURCE_ORG_ID>`
-                                2. Query SOURCE: `SELECT {selected_ext_id} FROM {parent_object} WHERE Id = <SOURCE_ORG_ID>`
-                                3. Query TARGET: `SELECT Id FROM {parent_object} WHERE {selected_ext_id} = <value>`
-                                4. Use TARGET ID in migrated data
-                                """)
+                                # Show explanation
+                                if '.' in selected_ext_id:
+                                    # Relationship field selected
+                                    st.info(f"""
+                                    💡 **Lookup Resolution with Relationship Field:**
+                                    1. Read SOURCE ID: `{lookup_field} = <SOURCE_ORG_ID>`
+                                    2. Query SOURCE: `SELECT {selected_ext_id} FROM {parent_object} WHERE Id = <SOURCE_ORG_ID>`
+                                    3. Query TARGET: `SELECT Id FROM {parent_object} WHERE {selected_ext_id} = <value>`
+                                    4. Use TARGET ID in migrated data
+                                    """)
+                                else:
+                                    # Direct field selected
+                                    st.info(f"""
+                                    💡 **Lookup Resolution Process:**
+                                    1. Read SOURCE ID: `{lookup_field} = <SOURCE_ORG_ID>`
+                                    2. Query SOURCE: `SELECT {selected_ext_id} FROM {parent_object} WHERE Id = <SOURCE_ORG_ID>`
+                                    3. Query TARGET: `SELECT Id FROM {parent_object} WHERE {selected_ext_id} = <value>`
+                                    4. Use TARGET ID in migrated data
+                                    """)
                             else:
-                                st.warning(f"⚠️ No External ID fields found in {parent_object}. Use field combination or concatenation.")
+                                st.warning(f"⚠️ No fields available in {parent_object}. Ensure parent object has details.")
+                        
+                        elif strategy_key == "unique_field":
+                            # Single Unique Field
+                            # Prepare field options with icons to distinguish relationship fields
+                            field_options = []
+                            field_labels = []
+                            
+                            # Add direct unique fields first
+                            for field in unique_fields:
+                                field_options.append(field)
+                                field_labels.append(f"🏷️ {field} (Direct Field)")
+                            
+                            # Add ALL relationship fields (user can choose any for matching)
+                            for field_name, field_meta in parent_fields.items():
+                                if field_meta.get('is_relationship_field'):
+                                    field_options.append(field_name)
+                                    field_labels.append(f"🔗 {field_name} (Relationship Field)")
+                            
+                            if field_options:
+                                
+                                selected_unique = st.selectbox(
+                                    "Select a Field (or any Relationship Field):",
+                                    options=field_options,
+                                    format_func=lambda x: field_labels[field_options.index(x)] if x in field_options else x,
+                                    key=f"lookup_unique_{i}",
+                                    help="You can select from direct fields or relationship fields (e.g., ProductCategory.Name). The field should contain unique values to match records."
+                                )
+                                
+                                st.session_state.migration_lookup_configs[lookup_field] = {
+                                    'parent_object': parent_object,
+                                    'match_strategy': 'unique_field',
+                                    'match_fields': [selected_unique]
+                                }
+                                
+                                # Show explanation
+                                if '.' in selected_unique:
+                                    # Relationship field selected
+                                    st.info(f"""
+                                    💡 **Lookup Resolution with Relationship Field:**
+                                    1. Read SOURCE ID: `{lookup_field} = <SOURCE_ORG_ID>`
+                                    2. Query SOURCE: `SELECT {selected_unique} FROM {parent_object} WHERE Id = <SOURCE_ORG_ID>`
+                                    3. Query TARGET: `SELECT Id FROM {parent_object} WHERE {selected_unique} = <value>`
+                                    4. Use TARGET ID in migrated data
+                                    """)
+                                else:
+                                    # Direct field selected
+                                    st.info(f"""
+                                    💡 **Lookup Resolution with Unique Field:**
+                                    1. Read SOURCE ID: `{lookup_field} = <SOURCE_ORG_ID>`
+                                    2. Query SOURCE: `SELECT {selected_unique} FROM {parent_object} WHERE Id = <SOURCE_ORG_ID>`
+                                    3. Query TARGET: `SELECT Id FROM {parent_object} WHERE {selected_unique} = <value>`
+                                    4. Use TARGET ID in migrated data
+                                    """)
+                            else:
+                                st.warning(f"⚠️ No fields available in {parent_object}. Ensure parent object has details.")
                         
                         elif strategy_key == "field_combination":
+                            # Multiple fields - prepare options with icons for relationship fields
+                            field_options = []
+                            field_labels_dict = {}
+                            
+                            for field_name in all_fields:
+                                field_meta = parent_fields.get(field_name, {})
+                                if field_meta.get('is_relationship_field'):
+                                    label = f"🔗 {field_name}"
+                                else:
+                                    label = f"🏷️ {field_name}"
+                                field_options.append(field_name)
+                                field_labels_dict[field_name] = label
+                            
                             # Multiple fields
                             selected_fields = st.multiselect(
                                 "Select Fields to Combine (AND condition):",
-                                options=all_fields,
+                                options=field_options,
+                                format_func=lambda x: field_labels_dict.get(x, x),
                                 key=f"lookup_combo_{i}",
-                                help="All selected fields must match in target org"
+                                help="All selected fields must match in target org. You can mix direct and relationship fields."
                             )
                             
                             if selected_fields:
@@ -2818,12 +4174,26 @@ def show_org_migration(credentials: dict):
                                 """)
                         
                         elif strategy_key == "field_concatenation":
+                            # Concatenated fields - prepare options with icons
+                            field_options = []
+                            field_labels_dict = {}
+                            
+                            for field_name in all_fields:
+                                field_meta = parent_fields.get(field_name, {})
+                                if field_meta.get('is_relationship_field'):
+                                    label = f"🔗 {field_name}"
+                                else:
+                                    label = f"🏷️ {field_name}"
+                                field_options.append(field_name)
+                                field_labels_dict[field_name] = label
+                            
                             # Concatenated fields
                             selected_fields = st.multiselect(
                                 "Select Fields to Concatenate:",
-                                options=all_fields,
+                                options=field_options,
+                                format_func=lambda x: field_labels_dict.get(x, x),
                                 key=f"lookup_concat_{i}",
-                                help="Fields will be checked together in target org"
+                                help="Fields will be checked together in target org. You can mix direct and relationship fields."
                             )
                             
                             separator = st.text_input(
@@ -2859,11 +4229,199 @@ def show_org_migration(credentials: dict):
             st.markdown("### 📊 Lookup Resolution Summary")
             
             if st.session_state.migration_lookup_configs:
-                for lookup_field, config in st.session_state.migration_lookup_configs.items():
-                    st.success(f"✅ **{lookup_field}** → {config['parent_object']} (Strategy: {config['match_strategy']})")
-                    st.caption(f"   Match Fields: {', '.join(config['match_fields'])}")
+                # Filter to only show lookups from selected data (File mode or SOQL mode)
+                configs_to_show = st.session_state.migration_lookup_configs.copy()
+                selected_fields_for_summary = []
+                summary_mode = ""
+                
+                # PRIORITY 1: Check FILE MODE
+                if st.session_state.get('migration_using_file_mode', False) and st.session_state.get('migration_file_data') is not None:
+                    file_df = st.session_state.get('migration_file_data')
+                    selected_fields_for_summary = list(file_df.columns)
+                    summary_mode = "File Mode"
+                
+                # PRIORITY 2: Check SOQL MODE
+                elif st.session_state.get('migration_using_soql_mode', False) and st.session_state.get('migration_filtered_fields'):
+                    selected_fields_for_summary = list(st.session_state.get('migration_filtered_fields', {}).keys())
+                    summary_mode = "SOQL Mode"
+                
+                # Apply filtering if we have selected fields
+                if selected_fields_for_summary:
+                    configs_to_show = {k: v for k, v in configs_to_show.items() if k in selected_fields_for_summary}
+                
+                if configs_to_show:
+                    if summary_mode:
+                        st.info(f"🔍 **{summary_mode}**: Showing {len(configs_to_show)} lookup field(s) from your selection")
+                    for lookup_field, config in configs_to_show.items():
+                        st.success(f"✅ **{lookup_field}** → {config['parent_object']} (Strategy: {config['match_strategy']})")
+                        st.caption(f"   Match Fields: {', '.join(config['match_fields'])}")
+                else:
+                    if summary_mode:
+                        st.info(f"ℹ️ {summary_mode}: No lookup fields configured from your selection")
+                    else:
+                        st.warning("⚠️ No lookup configurations defined yet")
             else:
                 st.warning("⚠️ No lookup configurations defined yet")
+        
+        # ========== CHILD OBJECT LOOKUP CONFIGURATION ==========
+        if st.session_state.get('migration_child_lookup_metadata'):
+            st.markdown("---")
+            st.markdown("### 🔧 Child Object Lookup Field Mapping")
+            st.info(
+                "💡 For each child object's lookup field, choose how to match records in the target org. "
+                "System fields (CreatedById, LastModifiedById, etc.) are hidden — only business lookup fields are shown."
+            )
+
+            child_lookup_configs = st.session_state.get('migration_child_lookup_configs', {})
+
+            for child_object, lookup_field_list in st.session_state.migration_child_lookup_metadata.items():
+                # lookup_field_list is List[Dict] with keys: field_name, reference_to, type
+                # Handle legacy format (plain list of strings) gracefully
+                if lookup_field_list and isinstance(lookup_field_list[0], str):
+                    lookup_field_list = [{'field_name': f, 'reference_to': [], 'type': 'reference'} for f in lookup_field_list]
+
+                with st.expander(f"⚙️ {child_object} — {len(lookup_field_list)} lookup field(s)", expanded=True):
+                    child_configs = child_lookup_configs.get(child_object, {})
+
+                    for lf_meta in lookup_field_list:
+                        lookup_field = lf_meta['field_name']
+                        parent_object = lf_meta['reference_to'][0] if lf_meta['reference_to'] else \
+                            child_configs.get(lookup_field, {}).get('parent_object', 'Unknown')
+
+                        st.markdown(f"#### 🔗 `{lookup_field}` → **{parent_object}**")
+
+                        # Skip option
+                        skip = st.checkbox(
+                            f"Skip {lookup_field} (no resolution needed)",
+                            value=child_configs.get(lookup_field, {}).get('skip', False),
+                            key=f"child_skip_{child_object}_{lookup_field}"
+                        )
+                        if skip:
+                            child_configs[lookup_field] = {'skip': True, 'parent_object': parent_object}
+                            st.info(f"⏭️ {lookup_field} will be skipped during migration")
+                            st.markdown("---")
+                            continue
+
+                        # Load target parent fields
+                        try:
+                            parent_fields = get_object_fields_with_relationships(
+                                st.session_state.target_sf_conn, parent_object, include_relationship_fields=True
+                            )
+                            ext_id_fields = identify_external_id_fields(parent_fields)
+                            unique_fields_list = identify_unique_fields(parent_fields)
+                            all_field_names = sorted(parent_fields.keys())
+                        except Exception as e:
+                            st.error(f"❌ Could not load fields for {parent_object}: {e}")
+                            st.markdown("---")
+                            continue
+
+                        saved = child_configs.get(lookup_field, {})
+                        saved_strategy = saved.get('match_strategy', 'external_id')
+                        strategy_options = [
+                            "external_id - Single External ID Field",
+                            "unique_field - Single Unique Field",
+                            "field_combination - Multiple Fields (AND)",
+                            "field_concatenation - Concatenated Fields"
+                        ]
+                        saved_idx = next(
+                            (i for i, s in enumerate(strategy_options) if s.startswith(saved_strategy)), 0
+                        )
+
+                        strategy_choice = st.radio(
+                            f"Matching Strategy for `{lookup_field}`:",
+                            options=strategy_options,
+                            index=saved_idx,
+                            key=f"child_strat_{child_object}_{lookup_field}",
+                            help="How to find the matching parent record in the target org"
+                        )
+                        strategy_key = strategy_choice.split(" - ")[0]
+
+                        if strategy_key in ('external_id', 'unique_field'):
+                            base_fields = ext_id_fields if strategy_key == 'external_id' else unique_fields_list
+                            field_options = list(base_fields) + [
+                                fn for fn, fm in parent_fields.items() if fm.get('is_relationship_field')
+                            ]
+                            field_labels = (
+                                [f"🏷️ {f} (Direct)" for f in base_fields] +
+                                [f"🔗 {fn} (Relationship)" for fn, fm in parent_fields.items() if fm.get('is_relationship_field')]
+                            )
+                            if not field_options:
+                                field_options = all_field_names
+                                field_labels = [f"🏷️ {f}" for f in all_field_names]
+
+                            saved_field = saved.get('match_fields', [field_options[0] if field_options else 'Id'])[0]
+                            sel_idx = field_options.index(saved_field) if saved_field in field_options else 0
+
+                            selected_field = st.selectbox(
+                                "Match Field (in target org):",
+                                options=field_options,
+                                index=sel_idx,
+                                format_func=lambda x: field_labels[field_options.index(x)] if x in field_options else x,
+                                key=f"child_matchf_{child_object}_{lookup_field}"
+                            )
+                            child_configs[lookup_field] = {
+                                'parent_object': parent_object,
+                                'match_strategy': strategy_key,
+                                'match_fields': [selected_field]
+                            }
+                            st.caption(
+                                f"💡 Source `{lookup_field}` ID → query source {parent_object}.{selected_field} → "
+                                f"find target {parent_object} by {selected_field} → replace with target ID"
+                            )
+
+                        elif strategy_key == 'field_combination':
+                            label_map = {
+                                fn: (f"🔗 {fn}" if fm.get('is_relationship_field') else f"🏷️ {fn}")
+                                for fn, fm in parent_fields.items()
+                            }
+                            saved_fields = saved.get('match_fields', [])
+                            selected_fields = st.multiselect(
+                                "Select Fields to Combine (AND condition):",
+                                options=all_field_names,
+                                default=[f for f in saved_fields if f in all_field_names],
+                                format_func=lambda x: label_map.get(x, x),
+                                key=f"child_combo_{child_object}_{lookup_field}"
+                            )
+                            if selected_fields:
+                                child_configs[lookup_field] = {
+                                    'parent_object': parent_object,
+                                    'match_strategy': 'field_combination',
+                                    'match_fields': selected_fields
+                                }
+
+                        elif strategy_key == 'field_concatenation':
+                            label_map = {
+                                fn: (f"🔗 {fn}" if fm.get('is_relationship_field') else f"🏷️ {fn}")
+                                for fn, fm in parent_fields.items()
+                            }
+                            saved_fields = saved.get('match_fields', [])
+                            concat_fields = st.multiselect(
+                                "Select Fields to Concatenate:",
+                                options=all_field_names,
+                                default=[f for f in saved_fields if f in all_field_names],
+                                format_func=lambda x: label_map.get(x, x),
+                                key=f"child_concat_{child_object}_{lookup_field}"
+                            )
+                            separator = st.text_input(
+                                "Separator (e.g. '-', ' '):",
+                                value=saved.get('separator', '-'),
+                                key=f"child_sep_{child_object}_{lookup_field}"
+                            )
+                            if concat_fields:
+                                child_configs[lookup_field] = {
+                                    'parent_object': parent_object,
+                                    'match_strategy': 'field_concatenation',
+                                    'match_fields': concat_fields,
+                                    'separator': separator
+                                }
+
+                        st.markdown("---")
+
+                    child_lookup_configs[child_object] = child_configs
+
+            st.session_state.migration_child_lookup_configs = child_lookup_configs
+        
+        _mig_next_btn("Data Preview", "mig_6")
     
     # ============================================================================
     # TAB 7: DATA PREVIEW & REVIEW
@@ -2878,7 +4436,10 @@ def show_org_migration(credentials: dict):
         preview_data = None
         data_source = "Unknown"
         
-        if 'migration_validation_data' in st.session_state:
+        if 'migration_extracted_data' in st.session_state:
+            preview_data = st.session_state.migration_extracted_data
+            data_source = "Extracted from Source Org"
+        elif 'migration_validation_data' in st.session_state:
             preview_data = st.session_state.migration_validation_data
             data_source = "Pre-Migration Validation"
         elif 'rules_validation_data' in st.session_state:
@@ -3020,6 +4581,7 @@ def show_org_migration(credentials: dict):
         
         else:
             st.info("📤 Load data through the validation tabs (Pre-Migration, Business Rules, or Data Quality) to preview it here")
+        _mig_next_btn("Execute Migration", "mig_7")
     
     # ============================================================================
     # TAB 8: EXECUTE MIGRATION
@@ -3038,6 +4600,24 @@ def show_org_migration(credentials: dict):
                     if st.session_state.get('migration_where_clause') else ""))
         else:
             st.info("📋 **Mode:** Manual field mapping")
+        
+        # Show migration scope
+        st.markdown("---")
+        if 'migration_selected_children' not in st.session_state or not st.session_state.migration_selected_children:
+            st.info(
+                "📦 **Migration Scope:** Parent object ONLY\n\n"
+                "You're migrating only the **parent object**. "
+                "To include related child objects, go back to **Tab 2A (Related Objects)** and select them.",
+                icon="ℹ️"
+            )
+        else:
+            selected_count = len(st.session_state.migration_selected_children)
+            st.success(
+                f"📦 **Migration Scope:** Parent + {selected_count} Related Child Object(s)\n\n"
+                f"**Children selected:** {', '.join(st.session_state.migration_selected_children)}",
+                icon="✅"
+            )
+        st.markdown("---")
         
         # Validation
         st.markdown("### ✅ Pre-Migration Validation")
@@ -3138,14 +4718,21 @@ def show_org_migration(credentials: dict):
                     help="Filter records to extract from source org. Example: Industry = 'Technology' AND AnnualRevenue > 1000000"
                 )
             
+            # Use LIMIT from Tab 2 SOQL if available, otherwise default to 10000
+            soql_limit_default = st.session_state.get('migration_soql_limit')
+            default_max = min(soql_limit_default, 100000) if soql_limit_default else 10000
+            
             max_records = st.number_input(
                 "Maximum Records to Extract:",
                 min_value=1,
                 max_value=100000,
-                value=10000,
+                value=default_max,
                 step=100,
-                help="Specify how many records to extract (1 to 100,000)"
+                help="Specify how many records to extract (1 to 100,000). Auto-populated from SOQL LIMIT if set in Field Mapping tab."
             )
+            
+            if soql_limit_default:
+                st.caption(f"💡 Default set from your SOQL query LIMIT {soql_limit_default}")
             
             # Show extraction preview
             st.markdown("#### 📋 Extraction Preview")
@@ -3203,7 +4790,7 @@ def show_org_migration(credentials: dict):
                         soql = f"SELECT {', '.join(field_list)} FROM {object_name}"
                         if extract_filter:
                             soql += f" WHERE {extract_filter}"
-                        soql += f" LIMIT {min(max_records, 1000)}"  # Sample check
+                        soql += f" LIMIT {max_records}"
                         
                         result = source_sf.query(soql)
                         source_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
@@ -3216,6 +4803,51 @@ def show_org_migration(credentials: dict):
                         source_data = source_data[fields_to_keep]
                         
                         st.success(f"✅ Extracted {len(source_data)} records for validation (keeping only {len(fields_to_keep)} mapped fields)")
+                        
+                        # === STORE SAMPLE DATA IN SESSION STATE FOR VALIDATION TABS ===
+                        st.session_state.migration_extracted_data = source_data.copy()
+                        st.caption("💾 Sample data stored in session for validation tabs (Tab 3, 4, 5)")
+                        
+                        # === EXTRACT CHILD RECORDS IF RELATED OBJECTS SELECTED (OPTIONAL) ===
+                        if 'migration_selected_children' in st.session_state and st.session_state.migration_selected_children:
+                            selected_children = st.session_state.migration_selected_children
+                            st.info(f"📦 Extracting {len(selected_children)} related child object(s)...")
+                            
+                            migration_data = build_parent_child_mapping(
+                                parent_df=source_data.copy(),
+                                child_objects_config={
+                                    child: st.session_state.migration_child_objects[child]
+                                    for child in selected_children
+                                    if child in st.session_state.migration_child_objects
+                                },
+                                sf_conn=source_sf,
+                                parent_object=object_name
+                            )
+                            
+                            # Store complete migration data structure
+                            st.session_state.migration_complete_data = migration_data
+                            st.session_state.migration_with_children = True
+                            
+                            # Display migration summary
+                            display_migration_summary(migration_data)
+                            
+                            # Validate child records
+                            validation_errors = validate_child_records(migration_data)
+                            if validation_errors:
+                                st.markdown("### ⚠️ Child Records Validation Issues")
+                                for error in validation_errors:
+                                    st.warning(f"• {error}")
+                            else:
+                                st.success("✅ All child records validation passed")
+                        else:
+                            # No children selected - that's fine!
+                            st.markdown("---")
+                            st.info(
+                                "📝 **No child objects selected**\n\n"
+                                "This is fine - only the parent object will be migrated. "
+                                "You can always go back to Tab 2A to include related objects if needed.",
+                                icon="ℹ️"
+                            )
                         
                         # Validate existing records
                         st.info("🔍 Checking which records already exist in target org...")
@@ -3257,7 +4889,21 @@ def show_org_migration(credentials: dict):
                         
                         # Show new records
                         if validation_results['new_count'] > 0:
-                            st.success(f"✅ {validation_results['new_count']} records will be inserted as new records")
+                            with st.expander(f"🆕 View {validation_results['new_count']} New Records (will be INSERT)", expanded=True):
+                                st.success(f"✅ {validation_results['new_count']} records will be inserted as new records")
+                                st.info("💡 These records don't exist in the target org, so they will be inserted.")
+                                
+                                # Show preview of new records
+                                new_records = validation_results['new_records']
+                                if new_records:
+                                    new_df = pd.DataFrame({
+                                        'Record #': [r['index'] + 1 for r in new_records],
+                                        'Match Values': [str(r['match_values']) for r in new_records]
+                                    })
+                                    st.dataframe(new_df.head(50), use_container_width=True, hide_index=True)
+                                    
+                                    if len(new_records) > 50:
+                                        st.caption(f"📋 Showing first 50 of {len(new_records)} new records")
                         
                         # Show invalid records
                         if validation_results['invalid_count'] > 0:
@@ -3276,6 +4922,24 @@ def show_org_migration(credentials: dict):
             
             st.markdown("---")
             
+            # ── Data Preview before migration ──────────────────────────────
+            preview_df = None
+            if st.session_state.get('migration_extracted_data') is not None:
+                preview_df = st.session_state.migration_extracted_data
+            elif st.session_state.get('migration_data') is not None:
+                preview_df = st.session_state.migration_data
+
+            if preview_df is not None:
+                with st.expander(
+                    f"👁️ Preview data before migration  ({len(preview_df)} records, "
+                    f"{len(preview_df.columns)} fields)",
+                    expanded=False
+                ):
+                    st.caption("These are the exact records — with field mappings and lookup resolution applied — that will be sent to the target org.")
+                    st.dataframe(preview_df.head(100), use_container_width=True, hide_index=True)
+                    if len(preview_df) > 100:
+                        st.info(f"Showing first 100 of {len(preview_df)} records.")
+
             # Execute button
             if st.button("🚀 Start Migration", type="primary"):
                 st.markdown("### 📊 Migration Progress")
@@ -3333,7 +4997,12 @@ def show_org_migration(credentials: dict):
                     st.code(soql, language="sql")
                     
                     result = source_sf.query(soql)
-                    source_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
+                    all_records = result['records']
+                    # Handle paginated results (query_more) for >2000 records
+                    while not result.get('done', True) and 'nextRecordsUrl' in result:
+                        result = source_sf.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                        all_records.extend(result['records'])
+                    source_data = pd.DataFrame(all_records).drop(columns=['attributes'], errors='ignore')
                     
                     st.success(f"✅ Extracted {len(source_data)} records from source org")
                     
@@ -3368,20 +5037,28 @@ def show_org_migration(credentials: dict):
                     
                     st.success(f"✅ Applied field mappings: Keeping only {len(mapped_fields)} mapped fields (excluded unmapped/auto-generated fields)")
                     
+                    # === STORE EXTRACTED DATA IN SESSION STATE FOR VALIDATION TABS ===
+                    st.session_state.migration_extracted_data = mapped_data.copy()
+                    st.caption("💾 Data stored in session for validation tabs (Tab 3, 4, 5)")
+                    
                     # Check existing records (needed for all operations to detect duplicates)
                     if st.session_state.get('migration_main_match_strategy'):
-                        st.info("🔍 Step 3/5: Checking for existing records in TARGET org...")
-                        
-                        final_validation = validate_existing_records_in_target(
-                            target_sf=target_sf,
-                            object_name=object_name,
-                            match_strategy=st.session_state.migration_main_match_strategy,
-                            match_fields=st.session_state.migration_main_match_fields,
-                            source_data=mapped_data,
-                            concat_separator=st.session_state.get('migration_main_concat_separator', '_')
-                        )
-                        
-                        st.success(f"✅ Validation: {final_validation['new_count']} new, {final_validation['existing_count']} existing")
+                        # Reuse already-computed validation results if the user ran "Check Existing Records"
+                        if st.session_state.get('validation_completed') and 'validation_results' in st.session_state:
+                            st.info("🔍 Step 3/5: Using pre-computed validation results (already checked)...")
+                            final_validation = st.session_state['validation_results']
+                            st.success(f"✅ Validation: {final_validation['new_count']} new, {final_validation['existing_count']} existing")
+                        else:
+                            st.info("🔍 Step 3/5: Checking for existing records in TARGET org...")
+                            final_validation = validate_existing_records_in_target(
+                                target_sf=target_sf,
+                                object_name=object_name,
+                                match_strategy=st.session_state.migration_main_match_strategy,
+                                match_fields=st.session_state.migration_main_match_fields,
+                                source_data=mapped_data,
+                                concat_separator=st.session_state.get('migration_main_concat_separator', '_')
+                            )
+                            st.success(f"✅ Validation: {final_validation['new_count']} new, {final_validation['existing_count']} existing")
                         
                         # Handle duplicates based on operation type
                         if migration_operation == "INSERT" and final_validation['existing_count'] > 0:
@@ -3438,6 +5115,29 @@ def show_org_migration(credentials: dict):
                         for lookup_field, count in resolution_stats['resolved'].items():
                             st.write(f"   • {lookup_field}: {count} resolved, {resolution_stats['unresolved'][lookup_field]} unresolved")
                         
+                        # Track lookup resolution operation
+                        try:
+                            total_resolved = sum(resolution_stats['resolved'].values())
+                            total_unresolved = sum(resolution_stats['unresolved'].values())
+                            
+                            track_lookup_resolution(
+                                source_org=st.session_state.migration_source_org,
+                                target_org=st.session_state.migration_target_org,
+                                object_name=st.session_state.migration_object,
+                                total_lookups=total_resolved + total_unresolved,
+                                resolved_lookups=total_resolved,
+                                unresolved_lookups=total_unresolved,
+                                lookup_details={
+                                    'lookup_fields_count': len(st.session_state.migration_lookup_configs),
+                                    'lookup_fields': list(st.session_state.migration_lookup_configs.keys()),
+                                    'resolution_details': resolution_stats
+                                },
+                                data=resolved_data if 'resolved_data' in locals() else None
+                            )
+                        except Exception as tracking_error:
+                            # Log tracking error but don't interrupt the workflow
+                            st.warning(f"⚠️ Failed to track lookup resolution: {str(tracking_error)}")
+                        
                         # Load to target
                         st.info("📥 Step 5/5: Loading data to target org...")
                     else:
@@ -3468,74 +5168,83 @@ def show_org_migration(credentials: dict):
                     
                     st.info(f"📋 Sending {len(final_fields)} fields to target org: {', '.join(sorted(final_fields))}")
                     
-                    # Convert to records
+                    # ===CRITICAL: Store RESOLVED data back to session state for Tab 7/8 to use===
+                    st.session_state.migration_extracted_data = resolved_data.copy()
+                    st.caption("💾 Updated session with resolved lookup data for Tab 7/8")
+                    
+                    # Clean NaN values before JSON serialization (fixes 'Out of range float values' error)
+                    # Convert all columns to object type first so None stays as None (not NaN)
+                    for col in resolved_data.columns:
+                        resolved_data[col] = resolved_data[col].astype(object)
+                        resolved_data[col] = resolved_data[col].where(pd.notna(resolved_data[col]), None)
+                    
+                    # Convert to records and scrub any remaining NaN/float('nan') values and empty strings
                     records = resolved_data.to_dict('records')
+                    import math
+                    for record in records:
+                        for key, value in record.items():
+                            if value is not None and isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                                record[key] = None
+                            elif value == '':
+                                record[key] = None
                     
-                    # Execute migration
-                    batches = [records[i:i + batch_size] for i in range(0, len(records), batch_size)]
-                    
+                    # Execute migration (Bulk API 2.0 — auto-batched, faster throughput)
                     success_count = 0
                     error_count = 0
-                    error_details = []  # Store detailed error information
-                    success_details = []  # Store success details
+                    error_details = []
+                    success_details = []
                     
                     progress_bar = st.progress(0)
+                    st.info("🚀 Loading data via Bulk API 2.0 (server-side batching for maximum speed)...")
                     
-                    for i, batch in enumerate(batches):
-                        try:
-                            if migration_operation == "INSERT":
-                                result = getattr(target_sf.bulk, object_name).insert(batch)
-                            elif migration_operation == "UPSERT":
-                                # Requires external ID field
-                                ext_id_field = list(st.session_state.migration_lookup_configs.values())[0]['match_fields'][0]
-                                result = getattr(target_sf.bulk, object_name).upsert(batch, ext_id_field)
-                            elif migration_operation == "UPDATE":
-                                result = getattr(target_sf.bulk, object_name).update(batch)
-                            
-                            for idx, r in enumerate(result):
-                                if r['success']:
-                                    success_count += 1
-                                    success_details.append({
-                                        'record_index': len(success_details) + error_count,
-                                        'salesforce_id': r.get('id', 'N/A'),
-                                        'operation': migration_operation
-                                    })
-                                else:
-                                    error_count += 1
-                                    # Extract detailed error information using helper function
-                                    # Try multiple possible error field locations
-                                    error_message = extract_detailed_error_message(r.get('error'))
-                                    
-                                    # If no error found, check other possible fields
-                                    if error_message == "Unknown error - no error details provided":
-                                        # Try common alternative field names
-                                        for alt_field in ['errors', 'errorMessage', 'message', 'err']:
-                                            if alt_field in r and r[alt_field]:
-                                                error_message = extract_detailed_error_message(r[alt_field])
-                                                if error_message != "Unknown error - no error details provided":
-                                                    break
-                                    
-                                    error_details.append({
-                                        'record_index': idx + (i * batch_size),
-                                        'error': error_message,
-                                        'record_data': batch[idx],
-                                        'operation': migration_operation,
-                                        'raw_error': r.get('error'),  # Store raw error for debugging
-                                        'complete_response': dict(r)  # Store complete response for debugging
-                                    })
+                    try:
+                        ext_id_field = None
+                        if migration_operation == "UPSERT":
+                            main_match_fields = st.session_state.get('migration_main_match_fields', [])
+                            if main_match_fields:
+                                ext_id_field = main_match_fields[0]
+                            else:
+                                st.error("❌ No match field configured for UPSERT operation")
+                                st.stop()
                         
-                        except Exception as e:
-                            st.error(f"Batch {i+1} failed: {str(e)}")
-                            error_count += len(batch)
-                            for idx, rec in enumerate(batch):
-                                error_details.append({
-                                    'record_index': idx + (i * batch_size),
-                                    'error': str(e),
-                                    'record_data': rec,
-                                    'operation': migration_operation
-                                })
+                        bulk_result = _bulk2_execute(
+                            target_sf, object_name,
+                            migration_operation.lower(), records,
+                            ext_id_field=ext_id_field
+                        )
                         
-                        progress_bar.progress((i + 1) / len(batches))
+                        progress_bar.progress(1.0)
+                        
+                        # Use job-summary counts — authoritative source of truth
+                        success_count = bulk_result['success_count']
+                        error_count   = bulk_result['error_count']
+                        
+                        # Build success_details for display (count only, no per-record SF IDs from bulk2)
+                        success_details = [{'record_index': i, 'salesforce_id': 'N/A',
+                                            'operation': migration_operation}
+                                           for i in range(success_count)]
+                        
+                        # Build error_details — each entry has the ACTUAL failed record data
+                        for fr in bulk_result['failed_records']:
+                            error_details.append({
+                                'record_index': fr['row_number'],
+                                'error': fr['error'],
+                                'record_data': fr['record_data'],
+                                'operation': migration_operation,
+                                'raw_error': fr['error'],
+                                'complete_response': fr['record_data']
+                            })
+                    
+                    except Exception as e:
+                        st.error(f"❌ Bulk API 2.0 load failed: {str(e)}")
+                        error_count = len(records)
+                        for idx, rec in enumerate(records):
+                            error_details.append({
+                                'record_index': idx + 1,
+                                'error': str(e),
+                                'record_data': rec,
+                                'operation': migration_operation
+                            })
                     
                     st.markdown("---")
                     st.markdown("### 📊 Migration Results")
@@ -3698,12 +5407,218 @@ Error Details:
                             st.info(f"📝 Migration history saved: {Path(log_path).name}")
                         except Exception as log_error:
                             st.warning(f"⚠️ Could not save migration log: {str(log_error)}")
+                        
+                        # Track migration operation
+                        try:
+                            track_migration_execution(
+                                source_org=st.session_state.migration_source_org,
+                                target_org=st.session_state.migration_target_org,
+                                object_name=st.session_state.migration_object,
+                                total_records=len(records),
+                                successful_records=success_count,
+                                failed_records=error_count,
+                                migration_details={
+                                    'migration_operation': migration_operation,
+                                    'batch_size': batch_size,
+                                    'max_records': max_records,
+                                    'where_filter': extract_filter,
+                                    'field_mappings_count': len([f for f in st.session_state.migration_field_mappings.values() if f != '-- Skip --']),
+                                    'lookup_configs_count': len(st.session_state.migration_lookup_configs),
+                                    'main_match_strategy': st.session_state.get('migration_main_match_strategy'),
+                                    'main_match_fields': st.session_state.get('migration_main_match_fields'),
+                                },
+                                data=resolved_data if 'resolved_data' in locals() else None
+                            )
+                        except Exception as tracking_error:
+                            # Log tracking error but don't interrupt the workflow
+                            st.warning(f"⚠️ Failed to track migration operation: {str(tracking_error)}")
+                        
+                        # ===== PHASE 2: OPTIMIZED PARENT-CHILD MIGRATION (NEW) =====
+                        # Sequential loading: Parent → (for each child: remap → resolve → load)
+                        if success_count > 0 and st.session_state.get('migration_selected_children'):
+                            st.markdown("---")
+                            st.markdown("## 📦 Phase 2: Load Related Child Records (Optimized Sequential)")
+                            
+                            selected_children = st.session_state.migration_selected_children
+                            source_sf = st.session_state.source_sf_conn
+                            target_sf = st.session_state.target_sf_conn
+                            
+                            st.info(f"🔄 Loading {len(selected_children)} child object(s) with optimized lookup resolution...")
+                            
+                            # STEP 1: Build parent ID mapping from parent load results
+                            parent_id_mapping = {}
+                            for success in success_details:
+                                # Note: This is simplified - real mapping would need source ID from input
+                                parent_id_mapping[success.get('record_index', '')] = success.get('salesforce_id', '')
+                            
+                            st.success(f"✅ Parent object loaded - Built ID mapping for {len(parent_id_mapping)} records")
+                            
+                            # STEP 2: Load child records sequentially
+                            child_results_summary = {}
+                            
+                            for child_index, child_object in enumerate(selected_children, 1):
+                                st.markdown(f"### Child {child_index}/{len(selected_children)}: {child_object}")
+                                
+                                try:
+                                    # Get child records from session state (previously extracted)
+                                    if 'migration_complete_data' not in st.session_state:
+                                        st.warning(f"⚠️ No pre-extracted data for {child_object}")
+                                        continue
+                                    
+                                    migration_data = st.session_state.migration_complete_data
+                                    if child_object not in migration_data.get('children', {}):
+                                        st.info(f"ℹ️ No records found for {child_object}")
+                                        continue
+                                    
+                                    child_info = migration_data['children'][child_object]
+                                    child_df = child_info.get('data', pd.DataFrame())
+                                    parent_ref_field = child_info.get('parent_field', 'AccountId')
+                                    
+                                    if child_df.empty:
+                                        st.info(f"ℹ️ No child records for {child_object}")
+                                        child_results_summary[child_object] = {'loaded': 0, 'failed': 0, 'skipped': 0}
+                                        continue
+                                    
+                                    st.write(f"📊 {len(child_df)} records to process")
+                                    
+                                    # STEP 2A: Remap parent IDs using mapping from parent load
+                                    progress_text = st.empty()
+                                    progress_text.info(f"🔄 Step 1/3: Remapping parent ID references...")
+                                    
+                                    child_remapped = remap_child_parent_ids(child_df.copy(), parent_id_mapping, parent_ref_field)
+                                    st.success(f"✅ Remapped parent IDs for {child_object}")
+                                    
+                                    # STEP 2B: Resolve child object's own lookup fields (Optimized)
+                                    child_lookup_configs = st.session_state.migration_child_lookup_configs.get(child_object, {})
+                                    
+                                    if child_lookup_configs:
+                                        progress_text.info(f"🔄 Step 2/3: Resolving {len(child_lookup_configs)} lookup field(s)...")
+                                        
+                                        child_resolved, resolution_stats = resolve_child_object_lookups_optimized(
+                                            child_df=child_remapped,
+                                            child_object=child_object,
+                                            source_sf=source_sf,
+                                            target_sf=target_sf,
+                                            child_lookup_configs=child_lookup_configs,
+                                            parent_id_mapping=parent_id_mapping,
+                                            progress_callback=lambda msg: progress_text.info(msg)
+                                        )
+                                        
+                                        st.success(f"✅ Resolved {resolution_stats['total_resolved']} lookups, {resolution_stats['total_unresolved']} unresolved")
+                                        child_df_final = child_resolved
+                                    else:
+                                        st.info(f"ℹ️ No child lookup configuration for {child_object} - proceeding without resolution")
+                                        child_df_final = child_remapped
+                                    
+                                    # STEP 2C: Load child records
+                                    progress_text.info(f"🔄 Step 3/3: Loading child records to target org...")
+                                    
+                                    # Clean data before loading
+                                    for col in child_df_final.columns:
+                                        child_df_final[col] = child_df_final[col].astype(object)
+                                        child_df_final[col] = child_df_final[col].where(pd.notna(child_df_final[col]), None)
+                                    
+                                    child_records = child_df_final.to_dict('records')
+                                    import math
+                                    for record in child_records:
+                                        for key, value in record.items():
+                                            if value is not None and isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                                                record[key] = None
+                                            elif value == '':
+                                                record[key] = None
+                                    
+                                    # Filter to keep only valid fields
+                                    child_success = 0
+                                    child_failed = 0
+                                    
+                                    try:
+                                        ext_id_field = None
+                                        if migration_operation == "UPSERT":
+                                            main_match_fields = st.session_state.get('migration_main_match_fields', [])
+                                            ext_id_field = main_match_fields[0] if main_match_fields else 'Id'
+                                        
+                                        child_bulk_result = _bulk2_execute(
+                                            target_sf, child_object,
+                                            migration_operation.lower(), child_records,
+                                            ext_id_field=ext_id_field
+                                        )
+                                        
+                                        child_success = child_bulk_result['success_count']
+                                        child_failed  = child_bulk_result['error_count']
+                                        
+                                        if child_bulk_result['failed_records']:
+                                            with st.expander(f"❌ {child_object}: {child_failed} failed record(s)", expanded=True):
+                                                for fr in child_bulk_result['failed_records']:
+                                                    st.error(f"Row {fr['row_number']}: {fr['error']}")
+                                                    st.json(fr['record_data'])
+                                    
+                                    except Exception as e:
+                                        st.error(f"Error loading {child_object}: {str(e)}")
+                                        child_failed += len(child_records)
+                                    
+                                    # Summary for this child
+                                    child_results_summary[child_object] = {
+                                        'loaded': child_success,
+                                        'failed': child_failed,
+                                        'skipped': len(child_df_final) - child_success - child_failed
+                                    }
+                                    
+                                    progress_text.empty()
+                                    st.success(f"✅ {child_object}: {child_success}/{len(child_df_final)} records loaded")
+                                
+                                except Exception as e:
+                                    st.error(f"❌ Error processing {child_object}: {str(e)}")
+                                    child_results_summary[child_object] = {'loaded': 0, 'failed': len(child_df_final) if 'child_df_final' in locals() else 0, 'skipped': 0}
+                            
+                            # Final summary for Phase 2
+                            if child_results_summary:
+                                st.markdown("---")
+                                st.markdown("### 📊 Child Objects Migration Summary")
+                                for child, summary in child_results_summary.items():
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        st.success(f"✅ {child}: {summary['loaded']} loaded")
+                                    with col2:
+                                        if summary['failed'] > 0:
+                                            st.error(f"❌ {summary['failed']} failed")
+                                    with col3:
+                                        if summary['skipped'] > 0:
+                                            st.warning(f"⏭️ {summary['skipped']} skipped")
+                        
+                        elif success_count > 0 and not st.session_state.get('migration_selected_children'):
+                            st.markdown("---")
+                            st.info("ℹ️ No child objects selected - Parent object migration complete")
+                    
+                    elif error_count > 0:
+                        # Even if there are errors, track the migration attempt
+                        try:
+                            track_migration_execution(
+                                source_org=st.session_state.migration_source_org,
+                                target_org=st.session_state.migration_target_org,
+                                object_name=st.session_state.migration_object,
+                                total_records=len(records),
+                                successful_records=success_count,
+                                failed_records=error_count,
+                                migration_details={
+                                    'migration_operation': migration_operation,
+                                    'batch_size': batch_size,
+                                    'max_records': max_records,
+                                    'where_filter': extract_filter,
+                                    'status': 'Partial Success' if success_count > 0 else 'Failed',
+                                    'field_mappings_count': len([f for f in st.session_state.migration_field_mappings.values() if f != '-- Skip --']),
+                                },
+                                data=None
+                            )
+                        except Exception as tracking_error:
+                            # Log tracking error but don't interrupt the workflow
+                            st.warning(f"⚠️ Failed to track migration operation: {str(tracking_error)}")
                     
                 except Exception as e:
                     st.error(f"❌ Migration failed: {str(e)}")
                     st.exception(e)
         else:
             st.error("❌ Please complete all configurations before executing migration")
+        _mig_next_btn("Migration History", "mig_8")
     
     # ============================================================================
     # TAB 9: MIGRATION HISTORY

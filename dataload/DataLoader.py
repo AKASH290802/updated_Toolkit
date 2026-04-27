@@ -18,6 +18,7 @@ import threading
 import time
 import datetime
 import csv
+import io
 
 # --- Step 1: Select Salesforce Org ---
 def select_org(orgs):
@@ -1385,11 +1386,25 @@ def process_single_batch(batch_data, batch_num, operation, external_id_name, sel
                     rec_clean[field] = coerce_to_bool(rec_clean[field])
             batch_records.append(rec_clean)
 
-        # Perform bulk operation for this batch
+        # Perform bulk 2.0 operation for this batch
+        bulk2_type = getattr(thread_sf_conn.bulk2, selected_object)
         if operation == 'upsert':
-            results = getattr(thread_sf_conn.bulk, selected_object).upsert(batch_records, external_id_field=external_id_name)
+            job_results = bulk2_type.upsert(records=batch_records, external_id_field=external_id_name)
         else:
-            results = getattr(thread_sf_conn.bulk, selected_object).insert(batch_records)
+            job_results = bulk2_type.insert(records=batch_records)
+
+        # Parse per-record results from bulk2 job(s)
+        results = []
+        for job in job_results:
+            job_id = job['job_id']
+            success_csv = bulk2_type.get_successful_records(job_id)
+            if success_csv and success_csv.strip():
+                for row in csv.DictReader(io.StringIO(success_csv)):
+                    results.append({'success': True, 'id': row.get('sf__Id', ''), 'errors': None})
+            failed_csv = bulk2_type.get_failed_records(job_id)
+            if failed_csv and failed_csv.strip():
+                for row in csv.DictReader(io.StringIO(failed_csv)):
+                    results.append({'success': False, 'id': row.get('sf__Id', ''), 'errors': row.get('sf__Error', 'Unknown error')})
 
         # Process results for this batch
         batch_success_rows = []

@@ -4,6 +4,7 @@ import os
 import json
 import pandas as pd
 from pathlib import Path
+from PIL import Image
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +75,51 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+def create_tavant_logo():
+    """Create TAVANT logo if it doesn't exist"""
+    logo_path = os.path.join(project_root, 'assets', 'tavant_logo.png')
+    
+    if not os.path.exists(logo_path):
+        try:
+            # Create logo image
+            logo = Image.new('RGB', (160, 160), color='#17a697')
+            
+            # Add rounded corners
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(logo)
+            
+            # Create a rounded rectangle logo
+            radius = 20
+            draw.rounded_rectangle([(0, 0), (160, 160)], radius=radius, fill='#17a697')
+            
+            # Add white TAVANT text
+            try:
+                from PIL import ImageFont
+                # Try to use a nice font
+                font_size = 32
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                # Fallback to default
+                font = ImageFont.load_default()
+            
+            # Calculate text position (center)
+            text = "TAVANT"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            x = (160 - text_width) // 2
+            y = (160 - text_height) // 2
+            
+            draw.text((x, y), text, fill='white', font=font)
+            
+            # Save logo
+            logo.save(logo_path)
+            return logo_path
+        except Exception as e:
+            return None
+    
+    return logo_path
+
 def initialize_session_state():
     """Initialize session state variables"""
     if 'current_org' not in st.session_state:
@@ -133,9 +179,32 @@ def main():
     credentials = load_credentials()
     st.session_state.credentials = credentials  # Store for config management updates
     
-    # Main header
-    st.markdown('<h1 class="main-header">🔄 DM Toolkit</h1>', unsafe_allow_html=True)
-    st.markdown('<p style="text-align: center; color: #666; margin-bottom: 2rem;">Data Migration & Validation Platform</p>', unsafe_allow_html=True)
+    # Create or get TAVANT logo
+    logo_path = create_tavant_logo()
+    
+    # Main header with TAVANT logo inline - using custom HTML with gradient
+    header_html = """
+    <div style="display: flex; align-items: center; gap: 20px; margin-bottom: 2rem;">
+        <div style="width: 100px; height: 100px; background: #000000; 
+                    border-radius: 16px; display: flex; align-items: center; justify-content: center; color: #ff7f0e; 
+                    font-weight: bold; font-size: 20px; flex-shrink: 0; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);">
+            TAVANT
+        </div>
+        <div>
+            <h1 style="background: linear-gradient(90deg, #ff7f0e 0%, #ff5722 50%, #d32f2f 100%); 
+                       -webkit-background-clip: text; -webkit-text-fill-color: transparent; 
+                       font-size: 2.8rem; font-weight: 800; margin: 0; line-height: 1;">
+                DM Toolkit
+            </h1>
+            <p style="color: #999; margin: 0.5rem 0 0 0; font-size: 1rem;">
+                Data Migration & Validation Platform
+            </p>
+        </div>
+    </div>
+    """
+    
+    st.markdown(header_html, unsafe_allow_html=True)
+    st.divider()
     
     # Sidebar navigation
     with st.sidebar:

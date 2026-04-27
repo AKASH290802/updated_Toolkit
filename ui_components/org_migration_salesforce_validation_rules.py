@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def extract_salesforce_validation_rules(target_sf, object_name: str) -> List[Dict]:
     """
-    Extract actual ValidationRules from target org using Tooling API
+    Extract actual ValidationRules from target org using Metadata API (primary) with Tooling API fallback
     
     Args:
         target_sf: Salesforce connection to target org
@@ -29,95 +29,226 @@ def extract_salesforce_validation_rules(target_sf, object_name: str) -> List[Dic
         validation_rules = []
         
         # ValidationRule is a metadata object, not queryable via SOQL
-        # We need to use the Tooling API instead
+        # Try Metadata API first (more reliable), then Tooling API as fallback
         
-        st.write(f"🔍 **Attempting to extract ValidationRules for {object_name} using Tooling API...**")
+        # ===== ATTEMPT 1: Try Metadata API (Primary Method) =====
+        st.write(f"🔍 **Attempting to extract ValidationRules for {object_name} using Metadata API...**")
+        metadata_result = _extract_validation_rules_metadata_api(target_sf, object_name)
         
-        try:
-            # ValidationRules can only be queried via Tooling API or Metadata API
-            # Attempt to access via Tooling API with proper headers
-            
-            instance_url = target_sf.base_url
-            tooling_url = f"{instance_url}/services/data/v59.0/tooling/query"
-            
-            # Build SOQL query
-            query = f"SELECT Id, ValidationName, EntityDefinition.QualifiedApiName, ErrorConditionFormula, ErrorMessage, Description, Active, CreatedDate FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Active = true"
-            
-            st.caption(f"Query: `{query[:80]}...`")
-            logger.info(f"Querying ValidationRules for {object_name}")
-            
-            # Try using the session with explicit headers
-            headers = {
-                'Authorization': f'Bearer {target_sf.session.auth}',
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            response = target_sf.session.get(tooling_url, params={'q': query}, headers=headers)
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result.get('size', 0) > 0:
-                    st.success(f"✅ Found {result['size']} ValidationRule(s)")
-                    
-                    for record in result.get('records', []):
-                        rule = {
-                            'rule_id': record.get('Id'),
-                            'rule_name': record.get('ValidationName'),
-                            'object': object_name,
-                            'error_message': record.get('ErrorMessage', ''),
-                            'error_condition_formula': record.get('ErrorConditionFormula', ''),
-                            'description': record.get('Description', ''),
-                            'active': record.get('Active', True),
-                            'created_date': record.get('CreatedDate')
-                        }
-                        validation_rules.append(rule)
-                        logger.info(f"Extracted ValidationRule: {rule['rule_name']}")
-                        st.caption(f"  • {rule['rule_name']}: {rule['error_message']}")
-                
-                else:
-                    st.info(f"ℹ️ No ValidationRules found for {object_name}")
-                    logger.info(f"No ValidationRules found for {object_name}")
-                
-                return validation_rules
-            
-            elif response.status_code == 401:
-                # Session expired - try one more time with fresh auth
-                st.warning("⚠️ Session expired. ValidationRules access requires 'View Setup and Configuration' permission.")
-                st.info("💡 **Workaround:** Make sure your Salesforce user has the 'View Setup and Configuration' permission to access ValidationRules via Tooling API.")
-                logger.warning("Session expired when accessing Tooling API - user may lack 'View Setup and Configuration' permission")
-                return []
-            
-            else:
-                try:
-                    error_content = response.json()
-                except:
-                    error_content = response.text or response.reason
-                
-                st.warning(f"⚠️ Tooling API error ({response.status_code}): {error_content}")
-                logger.warning(f"Tooling API error: {error_content}")
-                return []
+        if metadata_result:
+            st.success(f"✅ Found {len(metadata_result)} ValidationRule(s) via Metadata API")
+            return metadata_result
         
-        except AttributeError as e:
-            if 'session.auth' in str(e):
-                st.warning("⚠️ Could not access authentication from connection object.")
-                st.info("💡 ValidationRules validation requires proper Salesforce connection with Tooling API access.")
-            else:
-                st.warning(f"⚠️ Error accessing Tooling API: {str(e)}")
-            logger.warning(f"AttributeError accessing Tooling API: {str(e)}")
-            return []
+        # ===== ATTEMPT 2: Fallback to Tooling API =====
+        st.write(f"📌 **Metadata API unavailable, trying Tooling API as fallback...**")
+        tooling_result = _extract_validation_rules_tooling_api(target_sf, object_name)
         
-        except Exception as e:
-            st.warning(f"⚠️ Error querying ValidationRules via Tooling API: {str(e)}")
-            st.info("💡 ValidationRules require 'View Setup and Configuration' permission. If you don't have this permission, field-level validation will be used instead.")
-            logger.warning(f"Error querying ValidationRules via Tooling API: {str(e)}")
-            logger.debug(f"Full error: {str(e)}", exc_info=True)
-            return []
+        if tooling_result:
+            st.success(f"✅ Found {len(tooling_result)} ValidationRule(s) via Tooling API")
+            return tooling_result
+        
+        # ===== ATTEMPT 3: Field-level validation fallback =====
+        st.info(f"ℹ️ No ValidationRules found for {object_name}. Field-level validation will be used instead.")
+        logger.info(f"No ValidationRules found for {object_name} via Metadata or Tooling API")
+        return []
     
     except Exception as e:
         st.warning(f"⚠️ Error in ValidationRule extraction: {str(e)}")
         logger.error(f"Error in ValidationRule extraction: {str(e)}")
+        return []
+
+
+def _extract_validation_rules_metadata_api(target_sf, object_name: str) -> List[Dict]:
+    """
+    Extract ValidationRules using Metadata API
+    
+    Args:
+        target_sf: Salesforce connection
+        object_name: Object name to query
+    
+    Returns:
+        List of ValidationRule dicts or empty list if failed
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        
+        instance_url = target_sf.base_url
+        metadata_url = f"{instance_url}/services/data/v59.0/metadata/types/ValidationRule"
+        
+        # Get auth token
+        auth_token = target_sf.session.headers.get('Authorization', '')
+        if not auth_token and hasattr(target_sf.session, 'auth'):
+            auth_token = f"Bearer {target_sf.session.auth}"
+        
+        headers = {
+            'Authorization': auth_token,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        # Query to get ValidationRule members
+        logger.info(f"Querying Metadata API for ValidationRules on {object_name}")
+        response = target_sf.session.get(metadata_url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            validation_rules = []
+            
+            # Filter for the target object
+            members = result.get('members', [])
+            
+            for member in members:
+                # Member names are like "ValidationRuleName"
+                # We need to retrieve full metadata for each rule
+                try:
+                    rule_data = _retrieve_validation_rule_metadata(target_sf, member, object_name)
+                    if rule_data:
+                        validation_rules.append(rule_data)
+                        st.caption(f"  • {rule_data['rule_name']}: {rule_data['error_message']}")
+                except Exception as e:
+                    logger.warning(f"Could not retrieve metadata for rule {member}: {str(e)}")
+                    continue
+            
+            return validation_rules if validation_rules else []
+        
+        elif response.status_code == 403:
+            logger.warning("Metadata API access forbidden - user may lack 'View Setup and Configuration' permission")
+            return []
+        
+        else:
+            logger.warning(f"Metadata API error ({response.status_code}): {response.text}")
+            return []
+    
+    except Exception as e:
+        logger.warning(f"Error accessing Metadata API: {str(e)}")
+        return []
+
+
+def _retrieve_validation_rule_metadata(target_sf, rule_name: str, object_name: str) -> Optional[Dict]:
+    """
+    Retrieve full metadata for a specific ValidationRule
+    
+    Args:
+        target_sf: Salesforce connection
+        rule_name: Name of the ValidationRule
+        object_name: Object the rule belongs to
+    
+    Returns:
+        Rule dictionary or None if failed
+    """
+    try:
+        instance_url = target_sf.base_url
+        # Metadata Retrieve endpoint
+        retrieve_url = f"{instance_url}/services/data/v59.0/metadata/read/ValidationRule/{rule_name}"
+        
+        auth_token = target_sf.session.headers.get('Authorization', '')
+        if not auth_token and hasattr(target_sf.session, 'auth'):
+            auth_token = f"Bearer {target_sf.session.auth}"
+        
+        headers = {
+            'Authorization': auth_token,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        response = target_sf.session.get(retrieve_url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            rule_metadata = response.json()
+            
+            # Only process if it matches our target object
+            if rule_metadata.get('entityName') == object_name or rule_metadata.get('entity') == object_name:
+                rule = {
+                    'rule_id': rule_metadata.get('id', ''),
+                    'rule_name': rule_metadata.get('fullName', rule_name),
+                    'object': object_name,
+                    'error_message': rule_metadata.get('errorMessage', ''),
+                    'error_condition_formula': rule_metadata.get('validationFormula', rule_metadata.get('errorConditionFormula', '')),
+                    'description': rule_metadata.get('description', ''),
+                    'active': rule_metadata.get('active', True),
+                    'created_date': rule_metadata.get('createdDate', '')
+                }
+                return rule
+        
+        return None
+    
+    except Exception as e:
+        logger.warning(f"Error retrieving ValidationRule {rule_name} metadata: {str(e)}")
+        return None
+
+
+def _extract_validation_rules_tooling_api(target_sf, object_name: str) -> List[Dict]:
+    """
+    Extract ValidationRules using Tooling API (fallback method)
+    
+    Args:
+        target_sf: Salesforce connection to target org
+        object_name: Salesforce object name
+    
+    Returns:
+        List of ValidationRule dictionaries with formulas, or empty list if failed
+    """
+    try:
+        validation_rules = []
+        
+        instance_url = target_sf.base_url
+        tooling_url = f"{instance_url}/services/data/v59.0/tooling/query"
+        
+        # Build SOQL query
+        query = f"SELECT Id, ValidationName, EntityDefinition.QualifiedApiName, ErrorConditionFormula, ErrorMessage, Description, Active, CreatedDate FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Active = true"
+        
+        logger.info(f"Querying ValidationRules via Tooling API for {object_name}")
+        
+        # Get auth token
+        auth_token = target_sf.session.headers.get('Authorization', '')
+        if not auth_token and hasattr(target_sf.session, 'auth'):
+            auth_token = f"Bearer {target_sf.session.auth}"
+        
+        headers = {
+            'Authorization': auth_token,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        response = target_sf.session.get(tooling_url, params={'q': query}, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            if result.get('size', 0) > 0:
+                for record in result.get('records', []):
+                    rule = {
+                        'rule_id': record.get('Id'),
+                        'rule_name': record.get('ValidationName'),
+                        'object': object_name,
+                        'error_message': record.get('ErrorMessage', ''),
+                        'error_condition_formula': record.get('ErrorConditionFormula', ''),
+                        'description': record.get('Description', ''),
+                        'active': record.get('Active', True),
+                        'created_date': record.get('CreatedDate')
+                    }
+                    validation_rules.append(rule)
+                    logger.info(f"Extracted ValidationRule via Tooling API: {rule['rule_name']}")
+                    st.caption(f"  • {rule['rule_name']}: {rule['error_message']}")
+            
+            return validation_rules
+        
+        elif response.status_code == 401:
+            st.warning("⚠️ Session expired. ValidationRules access via Tooling API requires 'View Setup and Configuration' permission.")
+            logger.warning("Session expired when accessing Tooling API - user may lack 'View Setup and Configuration' permission")
+            return []
+        
+        else:
+            try:
+                error_content = response.json()
+            except:
+                error_content = response.text or response.reason
+            
+            logger.warning(f"Tooling API error ({response.status_code}): {error_content}")
+            return []
+    
+    except Exception as e:
+        logger.warning(f"Error accessing Tooling API: {str(e)}")
         return []
 
 

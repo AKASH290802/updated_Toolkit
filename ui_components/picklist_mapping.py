@@ -48,9 +48,9 @@ def show_create_mappings(credentials: Dict):
     # Step 1: Upload File
     st.markdown("### Step 1: Upload Sample Data File")
     uploaded_file = st.file_uploader(
-        "Choose a CSV or Excel file",
-        type=['csv', 'xlsx', 'xls'],
-        help="Upload a file containing data with picklist values you want to map",
+        "Choose a CSV, Excel, or PSV file",
+        type=['csv', 'xlsx', 'xls', 'psv'],
+        help="Upload CSV, Excel, or PSV (Pipe-separated) files containing data with picklist values you want to map",
         key="picklist_file_upload"
     )
     

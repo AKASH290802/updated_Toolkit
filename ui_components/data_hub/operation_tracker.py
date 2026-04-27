@@ -222,6 +222,188 @@ def get_last_operation_data(object_name: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def track_validation_check(
+    data: pd.DataFrame,
+    object_name: str,
+    source_org: str,
+    validation_type: str,
+    total_records: int,
+    passed_records: int,
+    failed_records: int,
+    validation_details: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """
+    Track a validation check operation (Business Rules or Data Quality)
+    
+    Args:
+        data: DataFrame being validated
+        object_name: Salesforce object name
+        source_org: Organization where data resides
+        validation_type: "Business_Rules" / "Data_Quality" / "Schema"
+        total_records: Total records checked
+        passed_records: Records that passed validation
+        failed_records: Records that failed validation
+        validation_details: Dict with additional validation info
+    
+    Returns:
+        operation_id
+    """
+    try:
+        from ui_components.data_hub.operation_manager import get_operation_manager
+        
+        op_manager = get_operation_manager()
+        
+        # Determine validation status
+        if failed_records == 0:
+            validation_status = "PASSED"
+        elif passed_records == 0:
+            validation_status = "FAILED"
+        else:
+            validation_status = "PARTIAL"
+        
+        operation_id = op_manager.create_operation(
+            operation_type=f"Validation_Check_{validation_type}",
+            object_name=object_name,
+            record_count=total_records,
+            data=data,
+            source_org=source_org,
+            validation_status=validation_status,
+            validation_passed=passed_records,
+            validation_failed=failed_records,
+            notes=f"Validation Type: {validation_type}. Details: {validation_details or {}}",
+            created_by=st.session_state.get("current_user", "Unknown")
+        )
+        
+        logger.info(f"Tracked {validation_type} validation: {operation_id}")
+        return operation_id
+    
+    except Exception as e:
+        logger.error(f"Error tracking validation check: {str(e)}")
+        return None
+
+
+def track_migration_execution(
+    source_org: str,
+    target_org: str,
+    object_name: str,
+    total_records: int,
+    successful_records: int,
+    failed_records: int,
+    migration_details: Optional[Dict[str, Any]] = None,
+    data: Optional[pd.DataFrame] = None
+) -> Optional[str]:
+    """
+    Track a migration execution from source to target org
+    
+    Args:
+        source_org: Source organization
+        target_org: Target organization
+        object_name: Salesforce object being migrated
+        total_records: Total records migrated
+        successful_records: Records successfully migrated
+        failed_records: Records that failed migration
+        migration_details: Dict with mapping strategy, field mappings, etc.
+        data: DataFrame of migrated data
+    
+    Returns:
+        operation_id
+    """
+    try:
+        from ui_components.data_hub.operation_manager import get_operation_manager
+        
+        op_manager = get_operation_manager()
+        
+        # Determine validation status
+        if failed_records == 0:
+            validation_status = "PASSED"
+        elif successful_records == 0:
+            validation_status = "FAILED"
+        else:
+            validation_status = "PARTIAL"
+        
+        operation_id = op_manager.create_operation(
+            operation_type="Migration_Execute",
+            object_name=object_name,
+            record_count=total_records,
+            data=data,
+            source_org=source_org,
+            target_org=target_org,
+            validation_status=validation_status,
+            validation_passed=successful_records,
+            validation_failed=failed_records,
+            notes=f"Migration from {source_org} to {target_org}. Details: {migration_details or {}}",
+            created_by=st.session_state.get("current_user", "Unknown")
+        )
+        
+        logger.info(f"Tracked migration execution: {operation_id}")
+        return operation_id
+    
+    except Exception as e:
+        logger.error(f"Error tracking migration execution: {str(e)}")
+        return None
+
+
+def track_lookup_resolution(
+    source_org: str,
+    target_org: str,
+    object_name: str,
+    total_lookups: int,
+    resolved_lookups: int,
+    unresolved_lookups: int,
+    lookup_details: Optional[Dict[str, Any]] = None,
+    data: Optional[pd.DataFrame] = None
+) -> Optional[str]:
+    """
+    Track lookup resolution operation during data integration
+    
+    Args:
+        source_org: Source organization
+        target_org: Target organization
+        object_name: Object with lookups being resolved
+        total_lookups: Total lookup references
+        resolved_lookups: Successfully resolved
+        unresolved_lookups: Could not be resolved
+        lookup_details: Fields resolved, resolution strategy, etc.
+        data: DataFrame with lookup data
+    
+    Returns:
+        operation_id
+    """
+    try:
+        from ui_components.data_hub.operation_manager import get_operation_manager
+        
+        op_manager = get_operation_manager()
+        
+        # Determine validation status
+        if unresolved_lookups == 0:
+            validation_status = "PASSED"
+        elif resolved_lookups == 0:
+            validation_status = "FAILED"
+        else:
+            validation_status = "PARTIAL"
+        
+        operation_id = op_manager.create_operation(
+            operation_type="Lookup_Resolution",
+            object_name=object_name,
+            record_count=total_lookups,
+            data=data,
+            source_org=source_org,
+            target_org=target_org,
+            validation_status=validation_status,
+            validation_passed=resolved_lookups,
+            validation_failed=unresolved_lookups,
+            notes=f"Lookup Resolution Details: {lookup_details or {}}",
+            created_by=st.session_state.get("current_user", "Unknown")
+        )
+        
+        logger.info(f"Tracked lookup resolution: {operation_id}")
+        return operation_id
+    
+    except Exception as e:
+        logger.error(f"Error tracking lookup resolution: {str(e)}")
+        return None
+
+
 def display_operation_summary(operation_id: str):
     """Display a summary of an operation in Streamlit"""
     try:

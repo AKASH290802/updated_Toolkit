@@ -36,7 +36,7 @@ def show_data_hub_interface(sf_conn=None):
     data_hub = st.session_state.data_hub
     
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4 = st.tabs(["📥 Load Data", "💾 Manage Datasets", "📋 Active Dataset", "📊 Data Operations"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📥 Load Data", "💾 Manage Datasets", "📋 Active Dataset", "📊 Operation History"])
     
     # ==================== TAB 1: LOAD DATA ====================
     with tab1:
@@ -64,12 +64,20 @@ def show_data_hub_interface(sf_conn=None):
         st.header("Active Dataset Preview")
         _show_active_dataset_preview(data_hub)
     
-    # ==================== TAB 4: DATA OPERATIONS HISTORY ====================
+    # ==================== TAB 4: OPERATION HISTORY ====================
     with tab4:
-        st.header("📊 Data Operations History")
+        st.header("📊 Operation History")
         st.markdown("""
-        View all data operations (queries, file uploads, data loads) performed across all sessions.
-        All operations are persisted and can be retrieved anytime.
+        Complete audit trail of ALL operations performed in the toolkit.
+        Tracks: Data loads, validations, data quality checks, migrations, and more.
+        
+        **Operations tracked by:**
+        - ✅ Organization (Source & Target)
+        - ✅ Object (Account, Opportunity, Custom Objects, etc.)
+        - ✅ Operation Type (Load, Validation, Quality Check, Migration, etc.)
+        - ✅ Status (Success, Failure, Partial)
+        - ✅ Validation Results (Pass/Fail counts)
+        - ✅ Timestamp & User Info
         """)
         
         try:
@@ -94,38 +102,84 @@ def show_data_hub_interface(sf_conn=None):
             
             st.markdown("---")
             
-            # Step 2: Filters
+            # Step 2: Filters with cascading dropdowns
             st.markdown("### 🔍 Filter Operations")
             
             col1, col2, col3, col4 = st.columns(4)
             
-            unique_orgs = ["All"] + op_manager.get_unique_orgs()
-            unique_objects = ["All"] + op_manager.get_unique_objects()
+            # Get available Salesforce orgs from credentials file
+            available_orgs = _get_available_salesforce_orgs()
             
             with col1:
-                org_filter = st.selectbox("Organization:", unique_orgs, key="history_org_filter")
+                if len(available_orgs) == 0:
+                    st.warning("⚠️ No Salesforce organizations configured in linkedservices.json")
+                    org_filter = None
+                else:
+                    org_filter = st.selectbox(
+                        "Organization:",
+                        available_orgs,
+                        key="history_org_filter",
+                        help="Select a Salesforce organization to view operations"
+                    )
+            
+            # Get objects based on selected org - CASCADING DROPDOWN
             with col2:
-                object_filter = st.selectbox("Object:", unique_objects, key="history_object_filter")
+                if org_filter is None:
+                    st.info("Select an organization first")
+                    object_filter = None
+                else:
+                    # Get objects from the selected org
+                    org_objects = _get_objects_for_org(org_filter)
+                    
+                    if len(org_objects) == 0:
+                        st.info(f"No objects found for {org_filter}. Check Salesforce connection.")
+                        object_filter = None
+                    else:
+                        object_filter = st.selectbox(
+                            "Object:",
+                            org_objects,
+                            key="history_object_filter",
+                            help=f"Objects available in {org_filter}"
+                        )
+            
             with col3:
                 op_type_filter = st.selectbox(
                     "Operation Type:",
-                    ["All", "SOQL_Query", "File_Upload", "Data_Load"],
-                    key="history_op_type_filter"
+                    ["All", "SOQL_Query", "File_Upload", "Data_Load", "Validation_Check_Business_Rules", "Validation_Check_Data_Quality", "Validation_Check_Schema", "Migration_Execute", "Lookup_Resolution"],
+                    key="history_op_type_filter",
+                    help="Select operation type or 'All' to see all types"
                 )
             with col4:
                 status_filter = st.selectbox(
                     "Status:",
                     ["All", "COMPLETE", "FAILED"],
-                    key="history_status_filter"
+                    key="history_status_filter",
+                    help="Filter by operation status"
                 )
             
-            # Apply filters
-            history = op_manager.get_operation_history(
-                org_filter=None if org_filter == "All" else org_filter,
-                object_filter=None if object_filter == "All" else object_filter,
-                operation_type_filter=None if op_type_filter == "All" else op_type_filter,
-                status_filter=None if status_filter == "All" else status_filter
-            )
+            # Debug info (optional - can remove later)
+            with st.expander("🔧 Debug Info", expanded=False):
+                st.write(f"**Selected Org:** {org_filter}")
+                st.write(f"**Selected Object:** {object_filter}")
+                st.write(f"**Selected Operation Type:** {op_type_filter}")
+                st.write(f"**Selected Status:** {status_filter}")
+                if org_filter:
+                    st.write(f"**Available Objects for {org_filter}:** {op_manager.get_unique_objects_for_org(org_filter)}")
+            
+            # Apply filters - only query if org and object are selected
+            if org_filter is None:
+                st.warning("📭 Please select an organization to view operations.")
+                history = []
+            elif object_filter is None:
+                st.warning(f"📭 No objects available for {org_filter}. Please select another organization or upload data first.")
+                history = []
+            else:
+                history = op_manager.get_operation_history(
+                    org_filter=org_filter,
+                    object_filter=object_filter,
+                    operation_type_filter=None if op_type_filter == "All" else op_type_filter,
+                    status_filter=None if status_filter == "All" else status_filter
+                )
             
             st.markdown("---")
             
@@ -363,7 +417,7 @@ def _show_file_upload_section(data_hub: DataHub):
                         )
                         
                         st.success(f"✅ Dataset '{dataset_name}' loaded successfully!")
-                        st.info(f"📦 Dataset ID: `{dataset_id}`")
+                        st.info(f" Dataset ID: `{dataset_id}`")
                         st.balloons()
                 else:
                     st.error(load_msg)
@@ -683,3 +737,80 @@ def has_active_dataset() -> bool:
     if 'data_hub' in st.session_state:
         return st.session_state.data_hub.has_active_dataset()
     return False
+
+
+def _get_available_salesforce_orgs() -> list:
+    """
+    Get list of available Salesforce organizations from credentials file
+    
+    Returns:
+        List of org names (e.g., ['HeraQA', 'TestDev', 'deployement'])
+    """
+    try:
+        import json
+        import os
+        
+        creds_file = r"C:\DM_toolkit\Services\linkedservices.json"
+        if not os.path.exists(creds_file):
+            return []
+        
+        with open(creds_file, 'r') as f:
+            credentials = json.load(f)
+        
+        # Filter for Salesforce orgs (those with Salesforce credentials)
+        sf_orgs = []
+        for org_name, org_creds in credentials.items():
+            if 'username' in org_creds and 'password' in org_creds:
+                sf_orgs.append(org_name)
+        
+        return sorted(sf_orgs)
+    except Exception as e:
+        st.error(f"Error loading organizations: {str(e)}")
+        return []
+
+
+@st.cache_data(ttl=3600)
+def _get_objects_for_org(org_name: str) -> list:
+    """
+    Get list of Salesforce objects for a specific organization
+    
+    Args:
+        org_name: Name of the Salesforce organization
+    
+    Returns:
+        Sorted list of object names (e.g., ['Account', 'Contact', 'Opportunity'])
+    """
+    try:
+        import json
+        import os
+        from simple_salesforce import Salesforce
+        
+        creds_file = r"C:\DM_toolkit\Services\linkedservices.json"
+        if not os.path.exists(creds_file):
+            return []
+        
+        with open(creds_file, 'r') as f:
+            credentials = json.load(f)
+        
+        if org_name not in credentials:
+            st.warning(f"Organization '{org_name}' not found in credentials")
+            return []
+        
+        org_creds = credentials[org_name]
+        
+        # Connect to Salesforce
+        sf = Salesforce(
+            username=org_creds.get('username'),
+            password=org_creds.get('password'),
+            security_token=org_creds.get('security_token', ''),
+            domain=org_creds.get('domain', 'login')
+        )
+        
+        # Get all objects
+        all_objects = sf.describe()['sobjects']
+        object_names = [obj['name'] for obj in all_objects if obj.get('queryable', False)]
+        
+        return sorted(object_names)
+    except Exception as e:
+        st.warning(f"Could not retrieve objects for {org_name}: {str(e)}")
+        return []

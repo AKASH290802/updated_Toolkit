@@ -14,6 +14,31 @@ from .utils import (
     load_data_file
 )
 
+def add_next_button(current_tab_index: int, total_tabs: int, session_state_key: str = 'active_tab', selectbox_key: str = 'tab_selector'):
+    """Add a JS-based Next button at bottom right to navigate to the next native Streamlit tab."""
+    if current_tab_index >= total_tabs - 1:
+        return
+    import streamlit.components.v1 as components
+    components.html(f"""
+    <div style="display:flex;justify-content:flex-end;padding:10px 0;">
+        <button onclick="
+            var tabs=window.parent.document.querySelectorAll('button[data-baseweb=\'tab\']');
+            var found=false;
+            for(var i=0;i<tabs.length;i++){{
+                if(tabs[i].getAttribute('aria-selected')==='true'){{found=true;continue;}}
+                if(found){{tabs[i].click();break;}}
+            }}
+        " style="
+            background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;
+            padding:0.55rem 1.4rem;border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;
+            box-shadow:0 2px 8px rgba(102,126,234,0.3);transition:all 0.3s ease;
+        "
+        onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(102,126,234,0.5)'"
+        onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 2px 8px rgba(102,126,234,0.3)'"
+        >Next &#10145;&#65039;</button>
+    </div>
+    """, height=60)
+
 def show_mapping_operations(credentials: Dict):
     """Display mapping operations interface"""
     
@@ -30,6 +55,22 @@ def show_mapping_operations(credentials: Dict):
         st.error("❌ Failed to establish Salesforce connection. Please check your credentials.")
         return
     
+    # Initialize session state for tab selection
+    if 'mapping_selected_tab' not in st.session_state:
+        st.session_state.mapping_selected_tab = 0
+    
+    # Add tab selector dropdown
+    st.markdown("### Select Operation:")
+    selected_tab_idx = st.selectbox(
+        "Choose a mapping operation",
+        options=[0, 1, 2, 3],
+        format_func=lambda x: ["🔧 View Field Mapping", "📋 Picklist Mappings", "✏️ Modify Mapping", "📊 Mapping Insights"][x],
+        key="mapping_selected_tab",
+        label_visibility="collapsed"
+    )
+    
+    st.divider()
+    
     # Main tabs
     tab1, tab2, tab3, tab4 = st.tabs([
         "🔧 View Field Mapping",
@@ -38,15 +79,20 @@ def show_mapping_operations(credentials: Dict):
         "📊 Mapping Insights"
     ])
     
+    total_tabs = 4
+    
     with tab1:
         show_generate_mapping(sf_conn)
+        add_next_button(0, total_tabs, selectbox_key='mapping_selected_tab')
     
     with tab2:
         from .picklist_mapping import show_picklist_mapping_manager
         show_picklist_mapping_manager(credentials)
+        add_next_button(1, total_tabs, selectbox_key='mapping_selected_tab')
     
     with tab3:
         show_edit_mapping(sf_conn)
+        add_next_button(2, total_tabs, selectbox_key='mapping_selected_tab')
     
     with tab4:
         show_mapping_analytics()

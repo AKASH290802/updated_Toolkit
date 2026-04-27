@@ -9,6 +9,89 @@ import pandas as pd
 from typing import Optional, Dict, Any
 
 
+def get_all_datasets() -> list:
+    """
+    Get list of all datasets in Data Hub.
+    
+    Returns:
+        List of dicts with 'id', 'name', 'is_active', 'metadata' keys.
+        Empty list if no datasets.
+    """
+    if 'data_hub' in st.session_state:
+        return st.session_state.data_hub.list_datasets()
+    return []
+
+
+def get_dataset_by_id(dataset_id: str) -> Optional[pd.DataFrame]:
+    """
+    Get a specific dataset DataFrame by its ID.
+    
+    Args:
+        dataset_id: UUID of the dataset
+    
+    Returns:
+        DataFrame or None
+    """
+    if 'data_hub' in st.session_state:
+        return st.session_state.data_hub.get_dataset(dataset_id)
+    return None
+
+
+def select_dataset_from_hub(key: str) -> Optional[pd.DataFrame]:
+    """
+    Show a dropdown of all Data Hub datasets and return the selected DataFrame.
+    
+    If only one dataset exists, it is auto-selected (no dropdown shown).
+    
+    Args:
+        key: Unique Streamlit widget key prefix for this selector
+    
+    Returns:
+        DataFrame of the selected dataset, or None if nothing selected/available
+    """
+    datasets = get_all_datasets()
+    if not datasets:
+        st.info("💡 No datasets in Data Hub. Please upload data in the 📊 Data Hub tab first.")
+        return None
+
+    if len(datasets) == 1:
+        ds = datasets[0]
+        meta = ds['metadata']
+        st.success(f"📊 Data Hub dataset: **{ds['name']}** ({meta['row_count']} rows, {meta['column_count']} columns)")
+        return get_dataset_by_id(ds['id'])
+
+    # Multiple datasets — show a selectbox
+    display_names = []
+    id_map = {}
+    for ds in datasets:
+        meta = ds['metadata']
+        label = f"{ds['name']}  ({meta['row_count']} rows, {meta['column_count']} cols)"
+        if ds['is_active']:
+            label += "  ★ active"
+        display_names.append(label)
+        id_map[label] = ds['id']
+
+    # Default to the active dataset
+    default_idx = 0
+    for i, ds in enumerate(datasets):
+        if ds['is_active']:
+            default_idx = i
+            break
+
+    selected_label = st.selectbox(
+        "📊 Select dataset from Data Hub:",
+        options=display_names,
+        index=default_idx,
+        key=f"hub_dataset_select_{key}"
+    )
+
+    if selected_label:
+        selected_id = id_map[selected_label]
+        return get_dataset_by_id(selected_id)
+
+    return None
+
+
 def get_data_from_hub() -> Optional[pd.DataFrame]:
     """
     Get active dataset from Data Hub

@@ -1,8 +1,74 @@
 {
+  "AkashDev": {
+    "username": "akashgcompany622@agentforce.com",
+    "password": "Akrish567",
+    "security_token": "PPrt4mniRYWZG3iYYUdwdxSaS",
+    "domain": "login"
+  },
   "DEv": {
     "username": "Gary",
     "password": "123",
     "security_token": "688",
     "domain": "login"
+  },
+  "FCS": {
+    "username": "karnasaikishore.r@tavant.com.kbtjpuat",
+    "password": "KBT@2025",
+    "security_token": "f31dabo6Lynci46fzzHYd4xB",
+    "domain": "test"
+  },
+  "ValmontDev": {
+    "username": "epparlanarayana.chowdhary@valmont.com.tavantdev",
+    "password": "Tavant@12345",
+    "security_token": "BsSEvuUeTLU0ZIJihyWSIHcS",
+    "domain": "test"
+  },
+  "ValmontUAT": {
+    "username": "epparlanarayana.chowdhary@valmont.com.tavantfull",
+    "password": "Tavant@12345",
+    "security_token": "nUHynabsg1wfKFNsBPOpcalF0",
+    "domain": "test"
+  },
+  "KBT_Europe_DEV": {
+    "username": "datamigrationengine@tavant.kubotaeudev.com",
+    "password": "R@kesh@0266M",
+    "security_token": "s6XC598jPKBg8hJRVGNuIRAl",
+    "domain": "test"
+  },
+  "Tav": {
+    "username": "datamigrationengine@tavant.kubotaeudev.com",
+    "password": "R@kesh@0266M",
+    "security_token": "",
+    "domain": "login"
+  },
+  "ValmontQA": {
+    "username": "epparlanarayana.chowdhary@valmont.com.vrmqa",
+    "password": "Tavant@12345",
+    "security_token": "2QlU59EBiX4gRdJ0BuBEtVFvM",
+    "domain": "test"
+  },
+  "DTNA_QA": {
+    "username": "data.migration@tavant.com.prsmwqa",
+    "password": "NDtnaP#26",
+    "security_token": "",
+    "domain": "test"
+  },
+  "DTNA_UAT": {
+    "username": "vidya.ramachandra@daimlertruck.com.ngwuat",
+    "password": "DTNAPreprod#25",
+    "security_token": "BbMTbSdaTrq4Lk4totdt8hmW",
+    "domain": "test"
+  },
+  "HDI_UAT": {
+    "username": "manish.kohale@tavant.com.hdiuat",
+    "password": "Tavant@1",
+    "security_token": "w0YiPnRXp1dRA0Ag0orRgqMr6",
+    "domain": "test"
+  },
+  "HDI_DEV": {
+    "username": "manish.kohale@tavant.com.hdiprod.hdidevspt",
+    "password": "Manish@hdiprod1",
+    "security_token": "1DAqWwa9XOWXS1Ugl6tK9Jtk",
+    "domain": "test"
   }
 }

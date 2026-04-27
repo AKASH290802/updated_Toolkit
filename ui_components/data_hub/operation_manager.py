@@ -228,6 +228,27 @@ class OperationManager:
                 objects.add(op.get("object_name"))
         return sorted(list(objects))
     
+    def get_unique_objects_for_org(self, org_name: Optional[str] = None) -> List[str]:
+        """
+        Get list of unique objects for a specific organization
+        
+        Args:
+            org_name: Organization name (source or target)
+        
+        Returns:
+            Sorted list of object names in that org
+        """
+        if not org_name:
+            return self.get_unique_objects()
+        
+        objects = set()
+        for op in self.manifest.get("operations", []):
+            # Check if this operation is from the selected org (source or target)
+            if org_name in (op.get("source_org"), op.get("target_org")):
+                if op.get("object_name"):
+                    objects.add(op.get("object_name"))
+        return sorted(list(objects))
+    
     def get_operation_stats(self) -> Dict[str, Any]:
         """Get statistics about operations"""
         operations = self.manifest.get("operations", [])

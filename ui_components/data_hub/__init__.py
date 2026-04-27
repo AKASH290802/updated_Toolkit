@@ -21,7 +21,7 @@ Usage:
 
 from .data_hub import DataHub
 from .data_hub_ui import show_data_hub_interface, get_active_dataset, get_active_dataset_info, has_active_dataset
-from .integration import get_data_from_hub, get_data_info, has_data, show_data_source_info, validate_data_available, get_data_summary
+from .integration import get_data_from_hub, get_data_info, has_data, show_data_source_info, validate_data_available, get_data_summary, get_all_datasets, get_dataset_by_id, select_dataset_from_hub
 
 __all__ = [
     'DataHub',
@@ -35,6 +35,9 @@ __all__ = [
     'show_data_source_info',
     'validate_data_available',
     'get_data_summary',
+    'get_all_datasets',
+    'get_dataset_by_id',
+    'select_dataset_from_hub',
     'initialize_data_hub'
 ]
 

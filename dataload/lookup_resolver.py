@@ -220,6 +220,9 @@ def resolve_dataframe_lookups(sf_conn, df: pd.DataFrame, object_name: str,
     """
     Resolve all lookup fields in a DataFrame
     
+    **OPTIMIZED FOR SPEED**: Uses batch SOQL queries with IN clause instead of
+    querying one value at a time. Reduces API calls from N to N/200.
+    
     Args:
         sf_conn: Salesforce connection
         df: DataFrame with data (CSV columns as keys)
@@ -273,55 +276,122 @@ def resolve_dataframe_lookups(sf_conn, df: pd.DataFrame, object_name: str,
         print(f"   Parent Object: {parent_object}")
         print(f"   Type: {lookup_info['type']}")
         
-        # Step 3: Resolve each row's value
+        # Get candidate fields for this lookup
+        candidate_fields = get_candidate_fields_for_lookup(
+            sf_conn=sf_conn,
+            parent_object=parent_object,
+            source_object=object_name,
+            lookup_field_name=sf_field_name
+        )
+        
+        # Step 3: Collect unique non-null, non-ID values
         rows_with_values = 0
-        rows_resolved = 0
+        values_needing_resolution = {}  # value -> list of row indices
+        already_valid_ids = {}  # value -> list of row indices (already SF IDs)
+        null_rows = []
         
         for row_idx, row_value in df_resolved[csv_column].items():
-            # Skip NULL/empty values
             if pd.isna(row_value) or str(row_value).strip() == '':
+                null_rows.append(row_idx)
                 continue
             
             rows_with_values += 1
+            value_str = str(row_value).strip()
             
-            # RESOLVE: Try to get Salesforce ID for this value
-            resolved_id, error_msg = resolve_lookup_value(
-                sf_conn=sf_conn,
-                parent_object=parent_object,
-                value=row_value,
-                source_object=object_name,
-                lookup_field_name=sf_field_name
-            )
-            
-            if error_msg:
-                # Resolution FAILED
-                failed_resolutions.append({
-                    'row': row_idx + 1,
-                    'csv_column': csv_column,
-                    'sf_field': sf_field_name,
-                    'parent_object': parent_object,
-                    'original_value': str(row_value),
-                    'resolved_id': None,
-                    'status': 'FAILED',
-                    'error': error_msg
-                })
-                print(f"   ❌ Row {row_idx + 1}: '{row_value}' → ERROR: {error_msg}")
+            # Check if already a Salesforce ID
+            if len(value_str) in [15, 18]:
+                already_valid_ids.setdefault(value_str, []).append(row_idx)
             else:
-                # Resolution SUCCEEDED
-                df_resolved.at[row_idx, csv_column] = resolved_id
-                successful_resolutions += 1
-                rows_resolved += 1
-                resolution_report.append({
-                    'row': row_idx + 1,
-                    'csv_column': csv_column,
-                    'sf_field': sf_field_name,
-                    'parent_object': parent_object,
-                    'original_value': str(row_value),
-                    'resolved_id': resolved_id,
-                    'status': 'SUCCESS',
-                    'error': None
-                })
-                print(f"   ✅ Row {row_idx + 1}: '{row_value}' → {resolved_id}")
+                values_needing_resolution.setdefault(value_str, []).append(row_idx)
+        
+        # Step 4: Batch verify existing Salesforce IDs
+        valid_sf_ids = set()
+        if already_valid_ids:
+            unique_ids = list(already_valid_ids.keys())
+            for i in range(0, len(unique_ids), 200):
+                chunk = unique_ids[i:i + 200]
+                id_list = ', '.join([f"'{sid}'" for sid in chunk])
+                try:
+                    result = sf_conn.query(f"SELECT Id FROM {parent_object} WHERE Id IN ({id_list})")
+                    for record in result['records']:
+                        valid_sf_ids.add(record['Id'])
+                except:
+                    pass
+        
+        # Step 5: Batch resolve non-ID values using candidate fields
+        value_to_id = {}  # resolved: value -> sf_id
+        unresolved_values = set(values_needing_resolution.keys())
+        
+        for field_name_to_search in candidate_fields:
+            if not unresolved_values:
+                break  # All values resolved
+            
+            # Batch query: use IN clause with chunks of 200
+            remaining = list(unresolved_values)
+            for i in range(0, len(remaining), 200):
+                chunk = remaining[i:i + 200]
+                in_values = ', '.join([f"'{str(v).replace(chr(39), chr(39)*2)}'" for v in chunk])
+                
+                try:
+                    soql = f"SELECT Id, {field_name_to_search} FROM {parent_object} WHERE {field_name_to_search} IN ({in_values})"
+                    result = sf_conn.query(soql)
+                    records = result['records']
+                    while not result['done']:
+                        result = sf_conn.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                        records.extend(result['records'])
+                    
+                    for record in records:
+                        field_val = record.get(field_name_to_search)
+                        if field_val is not None and str(field_val) in unresolved_values:
+                            value_to_id[str(field_val)] = record['Id']
+                            unresolved_values.discard(str(field_val))
+                except:
+                    continue  # Try next candidate field
+        
+        # Step 6: Apply resolutions to DataFrame
+        rows_resolved = 0
+        
+        # Apply resolved values
+        for value_str, row_indices in values_needing_resolution.items():
+            resolved_id = value_to_id.get(value_str)
+            if resolved_id:
+                for row_idx in row_indices:
+                    df_resolved.at[row_idx, csv_column] = resolved_id
+                    successful_resolutions += 1
+                    rows_resolved += 1
+                    resolution_report.append({
+                        'row': row_idx + 1,
+                        'csv_column': csv_column,
+                        'sf_field': sf_field_name,
+                        'parent_object': parent_object,
+                        'original_value': value_str,
+                        'resolved_id': resolved_id,
+                        'status': 'SUCCESS',
+                        'error': None
+                    })
+                print(f"   ✅ '{value_str}' → {resolved_id} ({len(row_indices)} row(s))")
+            else:
+                # Resolution FAILED
+                searched = ", ".join(candidate_fields)
+                error = f"Could not find {parent_object} matching value '{value_str}'. Searched fields: {searched}"
+                for row_idx in row_indices:
+                    failed_resolutions.append({
+                        'row': row_idx + 1,
+                        'csv_column': csv_column,
+                        'sf_field': sf_field_name,
+                        'parent_object': parent_object,
+                        'original_value': value_str,
+                        'resolved_id': None,
+                        'status': 'FAILED',
+                        'error': error
+                    })
+                print(f"   ❌ '{value_str}' → NOT FOUND ({len(row_indices)} row(s))")
+        
+        # Count valid IDs
+        for value_str, row_indices in already_valid_ids.items():
+            if value_str in valid_sf_ids:
+                rows_resolved += len(row_indices)
+                successful_resolutions += len(row_indices)
         
         print(f"   Summary: {rows_resolved}/{rows_with_values} values resolved")
     

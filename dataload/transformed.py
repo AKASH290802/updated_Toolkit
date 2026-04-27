@@ -572,25 +572,60 @@ for lookup_field, related_object in lookup_fields.items():
             unique_values = df_mapped[lookup_field].dropna().unique()
             lookup_count = 0
             
+            # OPTIMIZED: Batch resolve unique values using IN clause instead of one-by-one
+            # Filter out values that already look like Salesforce IDs
+            values_to_resolve = []
             for value in unique_values:
-                # Check if the value is already a valid Salesforce ID (15 or 18 characters)
                 if isinstance(value, str) and len(value) in [15, 18] and value.isalnum():
-                    continue
-                # Query Salesforce for the ID using the specified field
+                    continue  # Already a Salesforce ID
+                values_to_resolve.append(value)
+            
+            # Build lookup map: original_value -> salesforce_id (batch query)
+            value_to_id_map = {}
+            chunk_size = 200  # SOQL IN clause safe limit
+            
+            for i in range(0, len(values_to_resolve), chunk_size):
+                chunk = values_to_resolve[i:i + chunk_size]
+                # Build IN clause with proper escaping
+                in_values = []
+                for v in chunk:
+                    escaped = str(v).replace("'", "\\'")
+                    in_values.append(f"'{escaped}'")
+                in_clause = ', '.join(in_values)
+                
                 try:
-                    # Escape single quotes in the value to prevent SOQL injection
-                    escaped_value = str(value).replace("'", "\\'")
-                    result = sf_conn.query(f"SELECT Id FROM {related_object} WHERE {match_field} = '{escaped_value}'")
-                    if result['records']:
-                        salesforce_id = result['records'][0]['Id']
-                        df_mapped.loc[df_mapped[lookup_field] == value, lookup_field] = salesforce_id
-                        lookup_count += 1
-                    else:
-                        print(f"Warning: No record found in {related_object} with {match_field} = '{value}'")
-                        # Continue processing instead of raising error
+                    soql = f"SELECT Id, {match_field} FROM {related_object} WHERE {match_field} IN ({in_clause})"
+                    result = sf_conn.query(soql)
+                    records = result['records']
+                    # Handle query_more for large result sets
+                    while not result['done']:
+                        result = sf_conn.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+                        records.extend(result['records'])
+                    
+                    for record in records:
+                        field_val = record.get(match_field)
+                        if field_val is not None:
+                            value_to_id_map[str(field_val)] = record['Id']
                 except Exception as e:
-                    print(f"Error processing lookup value '{value}': {e}")
-                    # Continue processing instead of raising error
+                    print(f"Batch query failed for chunk, falling back to individual queries: {e}")
+                    # Fallback: query individually for this chunk
+                    for value in chunk:
+                        try:
+                            escaped_value = str(value).replace("'", "\\'")
+                            result = sf_conn.query(f"SELECT Id FROM {related_object} WHERE {match_field} = '{escaped_value}'")
+                            if result['records']:
+                                value_to_id_map[str(value)] = result['records'][0]['Id']
+                        except Exception as e2:
+                            print(f"Error processing lookup value '{value}': {e2}")
+            
+            # Apply resolved IDs to DataFrame using the batch map
+            for value in values_to_resolve:
+                salesforce_id = value_to_id_map.get(str(value))
+                if salesforce_id:
+                    df_mapped.loc[df_mapped[lookup_field] == value, lookup_field] = salesforce_id
+                    lookup_count += 1
+                else:
+                    print(f"Warning: No record found in {related_object} with {match_field} = '{value}'")
             
             print(f"Resolved {lookup_count} lookup values for {lookup_field} using {match_field}")
             lookup_count_summary[lookup_field] = lookup_count
@@ -716,6 +751,25 @@ def categorize_transform_results(df_original, df_transformed, lookup_fields, sel
     print(f"Checking {len(lookup_fields)} lookup field(s): {list(lookup_fields.keys())}")
     print(f"Validating picklist and unique field constraints...")
     
+    # PRE-COMPUTE: Build duplicate maps for unique fields (vectorized, O(N) per field)
+    unique_field_duplicates = {}  # field_name -> {value: [list of row indices with that value]}
+    for field_name, field_meta in sf_fields.items():
+        if (field_name in df_transformed_indexed.columns and field_meta.get('unique', False)):
+            col = df_transformed_indexed[field_name]
+            # Find all duplicated values
+            dup_mask = col.duplicated(keep=False) & col.notna() & (col.astype(str).str.strip() != '')
+            if dup_mask.any():
+                dup_values = col[dup_mask]
+                value_groups = {}
+                for row_idx, val in dup_values.items():
+                    val_key = val
+                    if val_key not in value_groups:
+                        value_groups[val_key] = []
+                    value_groups[val_key].append(row_idx)
+                unique_field_duplicates[field_name] = value_groups
+            else:
+                unique_field_duplicates[field_name] = {}
+    
     for idx in range(len(df_transformed_indexed)):
         record_failed = False
         record_details = {
@@ -773,7 +827,7 @@ def categorize_transform_results(df_original, df_transformed, lookup_fields, sel
                             'valid_values': valid_values[:10]  # Show first 10 valid values
                         })
         
-        # Check 3: Unique field validation (check for duplicates within the dataset)
+        # Check 3: Unique field validation (using pre-computed duplicate map — O(1) per row)
         for field_name, field_meta in sf_fields.items():
             if (field_name in df_transformed_indexed.columns and 
                 field_meta.get('unique', False) and 
@@ -781,18 +835,18 @@ def categorize_transform_results(df_original, df_transformed, lookup_fields, sel
                 str(df_transformed_indexed.iloc[idx][field_name]).strip() != ''):
                 
                 current_value = df_transformed_indexed.iloc[idx][field_name]
+                dup_groups = unique_field_duplicates.get(field_name, {})
+                dup_indices = dup_groups.get(current_value, [])
                 
-                # Check for duplicates in the dataset (excluding current row)
-                duplicate_mask = (df_transformed_indexed[field_name] == current_value) & (df_transformed_indexed.index != idx)
-                duplicate_count = duplicate_mask.sum()
+                # Filter out current row from duplicates
+                other_dups = [di for di in dup_indices if di != idx]
                 
-                if duplicate_count > 0:
+                if other_dups:
                     record_failed = True
-                    duplicate_indices = df_transformed_indexed.index[duplicate_mask].tolist()
                     record_details['unique_field_failures'].append({
                         'field': field_name,
                         'duplicate_value': str(current_value),
-                        'duplicate_row_indices': duplicate_indices[:5]  # Show first 5 duplicate rows
+                        'duplicate_row_indices': other_dups[:5]  # Show first 5 duplicate rows
                     })
         
         # Determine final status and reason

@@ -9,6 +9,7 @@ import re
 import ast
 import importlib.util
 import openpyxl
+import streamlit.components.v1 as components
 from openpyxl.styles import PatternFill, Font, Alignment
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -2228,6 +2229,32 @@ def calculate_correlation_score(test_results: List[Dict], validation_results: Li
     
     return min(correlation_score * 100, 100.0)
 
+def add_next_button(current_tab_index: int, total_tabs: int, session_state_key: str = 'active_tab', selectbox_key: str = 'tab_selector'):
+    """Add a JS-based Next button at bottom right to navigate to the next native Streamlit tab."""
+    if current_tab_index >= total_tabs - 1:
+        return
+    # Build a mapping of tab indices to partial label text for matching
+    # We use generic approach: find all tabs and click the one after current
+    components.html(f"""
+    <div style="display:flex;justify-content:flex-end;padding:10px 0;">
+        <button onclick="
+            var tabs=window.parent.document.querySelectorAll('button[data-baseweb=\'tab\']');
+            var found=false;
+            for(var i=0;i<tabs.length;i++){{
+                if(tabs[i].getAttribute('aria-selected')==='true'){{found=true;continue;}}
+                if(found){{tabs[i].click();break;}}
+            }}
+        " style="
+            background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;
+            padding:0.55rem 1.4rem;border-radius:8px;cursor:pointer;font-size:0.88rem;font-weight:600;
+            box-shadow:0 2px 8px rgba(102,126,234,0.3);transition:all 0.3s ease;
+        "
+        onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(102,126,234,0.5)'"
+        onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 2px 8px rgba(102,126,234,0.3)'"
+        >Next &#10145;&#65039;</button>
+    </div>
+    """, height=60)
+
 def show_unit_testing(credentials: Dict):
     """Display unit testing interface"""
     
@@ -2251,11 +2278,15 @@ def show_unit_testing(credentials: Dict):
         "📊 Test Reports"
     ])
     
+    total_tabs = 3
+    
     with tab1:
         show_generate_tests(sf_conn)
+        add_next_button(0, total_tabs, 'unit_testing_active_tab')
     
     with tab2:
         show_execute_tests()
+        add_next_button(1, total_tabs, 'unit_testing_active_tab')
     
     with tab3:
         show_test_reports()
@@ -2558,6 +2589,8 @@ def show_test_reports():
     # Add tabs for different types of reports
     tab1, tab2, tab3 = st.tabs(["📁 Test Files & Results", "📊 Coverage Analysis", "🤖 GenAI Correlation"])
     
+    total_tabs = 3
+    
     with tab1:
         # Show generated test files for current org
         show_existing_test_files()
@@ -2578,6 +2611,8 @@ def show_test_reports():
                 show_test_result_detail(result)
         else:
             st.info("No test execution results found. Run unit tests to see reports.")
+        
+        add_next_button(0, total_tabs, 'test_reports_active_tab')
     
     with tab2:
         if test_results:
@@ -2590,6 +2625,8 @@ def show_test_reports():
             show_test_trend_analysis(test_results)
         else:
             st.info("No test execution results found for coverage analysis.")
+        
+        add_next_button(1, total_tabs, 'test_reports_active_tab')
     
     with tab3:
         # GenAI Validation Correlation Analysis
