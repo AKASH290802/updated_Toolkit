@@ -236,29 +236,6 @@ def categorize_transform_results(df_original: pd.DataFrame, df_transformed: pd.D
     
     status_text.text("✅ Transform analysis completed!")
     
-    # Display comprehensive results
-    st.success("🎯 **Transform Results Analysis Complete**")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        success_pct = f"{success_count/total_count*100:.1f}%" if total_count > 0 else "N/A"
-        st.metric("✅ Success", f"{success_count} records", success_pct)
-    with col2:
-        failure_pct = f"{failure_count/total_count*100:.1f}%" if total_count > 0 else "N/A"
-        st.metric("❌ Failure", f"{failure_count} records", failure_pct)
-    with col3:
-        st.metric("📊 Total", f"{total_count} records", "100%")
-    
-    if failure_count > 0:
-        st.warning("🔍 **Failure Breakdown:**")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.write(f"🔗 **Lookup failures:** {lookup_failures}")
-        with col2:
-            st.write(f"📋 **Picklist failures:** {picklist_failures}")
-        with col3:
-            st.write(f"🔑 **Unique field failures:** {unique_failures}")
-    
     return df_success, df_failure, {
         'success_count': success_count,
         'failure_count': failure_count,

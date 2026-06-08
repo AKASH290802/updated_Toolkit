@@ -34,6 +34,8 @@ try:
         create_progress_tracker,
         load_data_file
     )
+    from .file_library_ui import show_file_picker_inline
+    from .file_store_manager import register_source_file, register_output_file
     from .etl_engine import ETLEngine
     from .business_rules import BusinessRulesManager
     from .etl_ui_enhancements import ETLUIEnhancements
@@ -49,6 +51,13 @@ except ImportError:
         create_progress_tracker,
         load_data_file
     )
+    try:
+        from file_library_ui import show_file_picker_inline
+        from file_store_manager import register_source_file, register_output_file
+    except ImportError:
+        show_file_picker_inline = None
+        register_source_file = None
+        register_output_file = None
     from etl_engine import ETLEngine
     from business_rules import BusinessRulesManager
     from etl_ui_enhancements import ETLUIEnhancements
@@ -846,18 +855,35 @@ def extract_from_sql(credentials: Dict):
 def extract_from_file():
     """Extract data from uploaded file"""
     st.write("### 📁 File Upload")
-    
+
+    org_name = st.session_state.get('current_org', 'unknown')
+
+    source_mode = st.radio(
+        "File Source",
+        ["📤 Upload New File", "📁 Choose from File Library"],
+        horizontal=True,
+        key="extract_source_mode",
+    )
+
+    if source_mode == "📁 Choose from File Library":
+        df, fname = (show_file_picker_inline("extract", org_name=org_name)
+                     if show_file_picker_inline else (None, None))
+        if df is not None:
+            st.write("#### Data Preview")
+            display_dataframe_with_download(df, fname, "File Data Preview")
+        return
+
+    # --- Upload New File ---
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=['csv', 'xlsx', 'xls', 'psv'],
         help="Upload CSV, Excel, or PSV (Pipe-separated) files"
     )
-    
+
     if uploaded_file:
         if validate_file_upload(uploaded_file):
             # Display file info
             col1, col2, col3 = st.columns(3)
-            
             with col1:
                 st.metric("File Name", uploaded_file.name)
             with col2:
@@ -865,23 +891,35 @@ def extract_from_file():
             with col3:
                 file_ext = os.path.splitext(uploaded_file.name)[1]
                 st.metric("File Type", file_ext.upper())
-            
+
             # Preview data
             try:
                 df = load_data_file(uploaded_file)
                 if df is not None:
                     st.write("#### Data Preview")
                     display_dataframe_with_download(df, uploaded_file.name, "File Data Preview")
-                    
+
+                    # Auto-register in file library
+                    if register_source_file:
+                        register_source_file(
+                            uploaded_file, uploaded_file.name,
+                            org_name=org_name, object_name='',
+                            row_count=len(df), col_count=len(df.columns),
+                        )
+
                     # Save file option
                     if st.button("💾 Save to DataFiles", use_container_width=True):
-                        save_path = os.path.join(project_root, 'DataFiles', 
-                                               st.session_state.current_org or 'uploads')
+                        save_path = os.path.join(project_root, 'DataFiles',
+                                                 org_name or 'uploads')
                         saved_path = save_uploaded_file(uploaded_file, save_path)
                         if saved_path:
                             st.success(f"✅ File saved to: {saved_path}")
-                            show_processing_status("file_upload", f"File {uploaded_file.name} uploaded successfully", "success")
-                
+                            show_processing_status(
+                                "file_upload",
+                                f"File {uploaded_file.name} uploaded successfully",
+                                "success",
+                            )
+
             except Exception as e:
                 st.error(f"❌ Error reading file: {str(e)}")
 
@@ -948,18 +986,18 @@ def load_to_sql(credentials: Dict):
     
     # Option to select from different sources
     if data_hub_available:
-        source_options = ["Use Data Hub", "Upload New File", "Select Existing File"]
+        source_options = ["Use Data Hub", "Upload New File", "Select Existing File", "📁 File Library"]
     else:
-        source_options = ["Upload New File", "Select Existing File"]
-    
+        source_options = ["Upload New File", "Select Existing File", "📁 File Library"]
+
     source_option = st.radio(
         "Data Source",
         source_options,
         key="sql_load_source"
     )
-    
+
     df_to_load = None
-    
+
     if source_option == "Use Data Hub":
         hub_df = select_dataset_from_hub("sql_load")
         if hub_df is not None:
@@ -967,7 +1005,7 @@ def load_to_sql(credentials: Dict):
             st.success(f"✅ Data loaded from Hub: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
             with st.expander("📊 Data Preview", expanded=False):
                 st.dataframe(df_to_load.head(10), use_container_width=True)
-    
+
     elif source_option == "Upload New File":
         uploaded_file = st.file_uploader(
             "Choose a file to load",
@@ -975,27 +1013,42 @@ def load_to_sql(credentials: Dict):
             key="sql_load_upload",
             help="Upload CSV, Excel, or PSV (Pipe-separated) files"
         )
-        
+
         if uploaded_file and validate_file_upload(uploaded_file):
             try:
                 df_to_load = load_data_file(uploaded_file)
                 if df_to_load is not None:
                     st.success(f"✅ File loaded: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
-                
+                    if register_source_file:
+                        register_source_file(
+                            uploaded_file, uploaded_file.name,
+                            org_name=st.session_state.get('current_org', 'unknown'),
+                            object_name='sql_load',
+                            row_count=len(df_to_load),
+                            col_count=len(df_to_load.columns),
+                        )
             except Exception as e:
                 st.error(f"❌ Error reading file: {str(e)}")
-    
+
+    elif source_option == "📁 File Library":
+        picked_df, picked_name = (show_file_picker_inline(
+            "sql_load",
+            org_name=st.session_state.get('current_org'),
+        ) if show_file_picker_inline else (None, None))
+        if picked_df is not None:
+            df_to_load = picked_df
+
     else:
         # Select existing file
         existing_files = get_existing_files("DataFiles")
-        
+
         if existing_files:
             selected_file = st.selectbox(
                 "Select Existing File",
                 options=[""] + existing_files,
                 key="sql_load_existing"
             )
-            
+
             if selected_file:
                 try:
                     file_path = os.path.join(
@@ -1003,18 +1056,18 @@ def load_to_sql(credentials: Dict):
                         "DataFiles",
                         selected_file
                     )
-                    
+
                     file_ext = os.path.splitext(selected_file)[1].lower()
-                    
+
                     if file_ext == '.csv':
                         df_to_load = pd.read_csv(file_path, dtype=str)
                     elif file_ext == '.psv':
                         df_to_load = pd.read_csv(file_path, sep='|', dtype=str)
                     else:
                         df_to_load = pd.read_excel(file_path, dtype=str)
-                    
+
                     st.success(f"✅ File loaded: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
-                    
+
                 except Exception as e:
                     st.error(f"❌ Error reading file: {str(e)}")
         else:
@@ -1267,18 +1320,18 @@ def load_to_salesforce(sf_conn):
         
         # Option to select from different sources
         if data_hub_available:
-            source_options = ["Use Data Hub", "Upload New File", "Select Existing File"]
+            source_options = ["Use Data Hub", "Upload New File", "Select Existing File", "📁 File Library"]
         else:
-            source_options = ["Upload New File", "Select Existing File"]
-        
+            source_options = ["Upload New File", "Select Existing File", "📁 File Library"]
+
         source_option = st.radio(
             "Data Source",
             source_options,
             key="sf_load_source"
         )
-        
+
         df_to_load = None
-        
+
         if source_option == "Use Data Hub":
             hub_df = select_dataset_from_hub("sf_load")
             if hub_df is not None:
@@ -1286,7 +1339,7 @@ def load_to_salesforce(sf_conn):
                 st.success(f"✅ Data loaded from Hub: {len(df_to_load)} rows, {len(df_to_load.columns)} columns")
                 with st.expander("📊 Data Preview", expanded=False):
                     st.dataframe(df_to_load.head(10), use_container_width=True)
-        
+
         elif source_option == "Upload New File":
             uploaded_file = st.file_uploader(
                 "Choose file to load",
@@ -1294,25 +1347,42 @@ def load_to_salesforce(sf_conn):
                 key="sf_load_file",
                 help="Upload CSV, Excel, or PSV (Pipe-separated) files"
             )
-            
+
             if uploaded_file and validate_file_upload(uploaded_file):
                 try:
                     df_to_load = load_data_file(uploaded_file)
+                    if df_to_load is not None and register_source_file:
+                        register_source_file(
+                            uploaded_file, uploaded_file.name,
+                            org_name=st.session_state.get('current_org', 'unknown'),
+                            object_name=target_object,
+                            row_count=len(df_to_load),
+                            col_count=len(df_to_load.columns),
+                        )
                 except Exception as e:
                     st.error(f"❌ Error reading file: {str(e)}")
-        
+
+        elif source_option == "📁 File Library":
+            picked_df, picked_name = (show_file_picker_inline(
+                "sf_load",
+                org_name=st.session_state.get('current_org'),
+                object_name=target_object,
+            ) if show_file_picker_inline else (None, None))
+            if picked_df is not None:
+                df_to_load = picked_df
+
         else:
             # Show existing files
             data_files_path = os.path.join(project_root, 'DataFiles')
             existing_files = get_existing_files(data_files_path)
-            
+
             if existing_files:
                 selected_file = st.selectbox(
                     "Select Existing File",
                     options=[""] + existing_files,
                     key="sf_existing_file"
                 )
-                
+
                 if selected_file:
                     try:
                         file_path = os.path.join(data_files_path, selected_file)
@@ -1453,7 +1523,8 @@ def load_to_salesforce(sf_conn):
                     org_name=st.session_state.get('current_org', 'unknown'),
                     object_name=target_object,
                     csv_columns=csv_columns,
-                    auto_apply=False
+                    auto_apply=False,
+                    key_suffix='_dataload'
                 )
                 
                 if auto_loaded_mappings and st.session_state.get('use_saved_mappings', False):
@@ -1511,6 +1582,110 @@ def load_to_salesforce(sf_conn):
                     # Full custom mapping interface
                     field_mappings = create_custom_mapping_interface(df_to_load.columns.tolist(), sf_fields, sf_field_info, None, df_to_load)
                 
+                # ================================================================
+                # ADDITIONAL COLUMNS (new fields not present in the uploaded file)
+                # ================================================================
+                st.write("#### ➕ Additional Columns")
+                st.caption("Add new fields with fixed values or concatenated source-field values. These will be inserted into every record before loading.")
+
+                _ac_key = f"additional_columns_{target_object}"
+                if _ac_key not in st.session_state:
+                    st.session_state[_ac_key] = []
+
+                _ac_list = st.session_state[_ac_key]
+
+                # ── Render existing additional column rows ───────────────────
+                _to_delete = []
+                for _i, _col_def in enumerate(_ac_list):
+                    with st.container():
+                        _c1, _c2, _c3, _c4 = st.columns([3, 2, 4, 1])
+                        with _c1:
+                            _col_def['target_field'] = st.selectbox(
+                                "Target SF Field",
+                                options=[""] + sorted(sf_fields),
+                                index=([""] + sorted(sf_fields)).index(_col_def.get('target_field', ''))
+                                      if _col_def.get('target_field', '') in sf_fields else 0,
+                                key=f"ac_tgt_{_ac_key}_{_i}",
+                                label_visibility="collapsed"
+                            )
+                        with _c2:
+                            _col_def['value_type'] = st.selectbox(
+                                "Value Type",
+                                options=["Static Text", "Concatenate Fields"],
+                                index=0 if _col_def.get('value_type', 'Static Text') == 'Static Text' else 1,
+                                key=f"ac_vtype_{_ac_key}_{_i}",
+                                label_visibility="collapsed"
+                            )
+                        with _c3:
+                            if _col_def['value_type'] == "Static Text":
+                                _col_def['static_value'] = st.text_input(
+                                    "Static Value",
+                                    value=_col_def.get('static_value', ''),
+                                    placeholder="Enter a fixed text value for all records",
+                                    key=f"ac_sv_{_ac_key}_{_i}",
+                                    label_visibility="collapsed"
+                                )
+                            else:
+                                _src_cols = df_to_load.columns.tolist() if df_to_load is not None else []
+                                _prev_sel = [f for f in _col_def.get('concat_fields', []) if f in _src_cols]
+                                _col_def['concat_fields'] = st.multiselect(
+                                    "Fields to Concatenate",
+                                    options=_src_cols,
+                                    default=_prev_sel,
+                                    key=f"ac_cf_{_ac_key}_{_i}",
+                                    label_visibility="collapsed"
+                                )
+                                _col_def['concat_separator'] = st.text_input(
+                                    "Separator",
+                                    value=_col_def.get('concat_separator', ' '),
+                                    max_chars=10,
+                                    key=f"ac_sep_{_ac_key}_{_i}",
+                                    help="Characters placed between concatenated values (default: space)",
+                                    label_visibility="collapsed"
+                                )
+                        with _c4:
+                            if st.button("🗑️", key=f"ac_del_{_ac_key}_{_i}", help="Remove this column"):
+                                _to_delete.append(_i)
+
+                for _idx in reversed(_to_delete):
+                    _ac_list.pop(_idx)
+                st.session_state[_ac_key] = _ac_list
+
+                if st.button("➕ Add Additional Column", key=f"ac_add_{_ac_key}"):
+                    st.session_state[_ac_key].append({
+                        'target_field': '',
+                        'value_type': 'Static Text',
+                        'static_value': '',
+                        'concat_fields': [],
+                        'concat_separator': ' '
+                    })
+                    st.rerun()
+
+                # ── Apply additional columns to df_to_load ───────────────────
+                # This adds/overwrites columns in df_to_load so the rest of the
+                # pipeline (lookup resolution, transformation, loading) picks them up.
+                if df_to_load is not None and _ac_list:
+                    for _col_def in _ac_list:
+                        _tgt = _col_def.get('target_field', '').strip()
+                        if not _tgt:
+                            continue
+                        if _col_def['value_type'] == 'Static Text':
+                            _val = _col_def.get('static_value', '')
+                            df_to_load[_tgt] = _val
+                        else:
+                            _fields = _col_def.get('concat_fields', [])
+                            _sep    = _col_def.get('concat_separator', ' ')
+                            if _fields:
+                                _valid_fields = [f for f in _fields if f in df_to_load.columns]
+                                if _valid_fields:
+                                    df_to_load[_tgt] = df_to_load[_valid_fields].astype(str).agg(_sep.join, axis=1)
+                    # Also register each added column as a pass-through mapping
+                    # so it is included in the load
+                    for _col_def in _ac_list:
+                        _tgt = _col_def.get('target_field', '').strip()
+                        if _tgt and _tgt not in field_mappings.values():
+                            field_mappings[f'_additional_{_tgt}'] = _tgt
+
                 # Show mapping summary
                 if field_mappings:
                     with st.expander("📋 Mapping Summary", expanded=False):
@@ -1977,20 +2152,20 @@ def load_to_salesforce(sf_conn):
                             st.error("❌ Could not retrieve Salesforce object fields")
                     
                     elif upsert_matching_strategy_display == "🔗 Field Combination (Multiple fields together)":
-                        st.write("#### 🔗 Select Fields for Combination Matching")
-                        st.info("💡 Select multiple fields that together uniquely identify records. Matching combinations will be updated, others inserted.")
-                        st.markdown("**Example:** `First Name` + `Last Name` + `Email` = Unique record")
+                        st.write("#### 🔗 Select Fields to Combine")
+                        st.info("💡 Select multiple fields whose values will be combined and written into a single target Salesforce field.")
+                        st.markdown("**Example:** `First Name` + `Last Name` + `Email` → combined value written into `External_Key__c`")
                         
                         # Get all Salesforce fields for this object
                         obj_desc = get_object_description(sf_conn, target_object)
                         if obj_desc:
                             all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
                             
-                            # Select multiple fields
+                            # Select multiple source fields
                             selected_fields = st.multiselect(
-                                "Select Fields for Matching (select 2 or more)",
+                                "Select Fields to Combine (select 2 or more)",
                                 options=all_sf_fields,
-                                help="These fields together must uniquely identify records",
+                                help="Values from these fields will be joined with '|' and written into the target field",
                                 key="upsert_combination_fields"
                             )
                             
@@ -2005,88 +2180,55 @@ def load_to_salesforce(sf_conn):
                                     st.success(f"✅ All {len(selected_fields)} fields found in uploaded data")
                                     
                                     # Show combination preview
-                                    st.write("**Preview of Field Combination:**")
+                                    st.write("**Preview of Combined Value:**")
                                     preview_df = df_to_load[selected_fields].head(5).copy()
-                                    preview_df['Combined Match Key'] = preview_df.apply(
+                                    preview_df['Combined Value'] = preview_df.apply(
                                         lambda row: ' | '.join([str(row[f]) for f in selected_fields]), axis=1
                                     )
                                     st.dataframe(preview_df, use_container_width=True)
                                     
-                                    # Check for duplicates in combination
-                                    duplicate_count = df_to_load[selected_fields].duplicated().sum()
-                                    unique_count = df_to_load[selected_fields].drop_duplicates().shape[0]
-                                    
-                                    col_c1, col_c2, col_c3 = st.columns(3)
-                                    with col_c1:
-                                        st.metric("Total Records", len(df_to_load))
-                                    with col_c2:
-                                        st.metric("Unique Combinations", unique_count)
-                                    with col_c3:
-                                        st.metric("Duplicate Combinations", duplicate_count)
-                                    
-                                    # ===== MAP FIELD COMBINATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector ────────────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Field Combination to Salesforce External ID Field")
-                                    st.info("💡 These fields together act as an external ID. Select which Salesforce field will be matched.")
+                                    st.write("#### 🎯 Select Target Salesforce Field")
+                                    st.info("💡 The combined value will be written into this field on every record before loading.")
                                     
-                                    combination_match_mode = st.radio(
-                                        "How should these fields be matched in Salesforce?",
-                                        options=[
-                                            "Match All Fields Together (AND logic)",
-                                            "Map to Single External ID Field (concatenated)"
-                                        ],
-                                        help="Choose how to match the combination in Salesforce",
-                                        key="upsert_combination_match_mode"
-                                    )
+                                    external_id_fields = get_external_id_fields(sf_conn, target_object)
                                     
-                                    if combination_match_mode == "Map to Single External ID Field (concatenated)":
-                                        # Get external ID fields
-                                        external_id_fields = get_external_id_fields(sf_conn, target_object)
-                                        all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
-                                        
-                                        if external_id_fields:
-                                            st.write("**Available External ID Fields (Recommended):**")
-                                            for field in external_id_fields:
-                                                st.write(f"• **{field}** ⭐")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select External ID Field for Composite Key",
-                                                options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="upsert_combination_external_id_field",
-                                                index=1 if len(external_id_fields) > 0 else 0
-                                            )
-                                        else:
-                                            st.warning("⚠️ No External ID fields found. Select any unique field:")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select Field for Composite Key Matching",
-                                                options=[""] + all_sf_fields,
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="upsert_combination_external_id_field"
-                                            )
-                                        
-                                        if combination_external_id_field:
-                                            st.success(f"✅ Field combinations will be matched against: **{combination_external_id_field}**")
+                                    if external_id_fields:
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(external_id_fields)}")
+                                        combination_external_id_field = st.selectbox(
+                                            "Select target field to populate with combined value",
+                                            options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
+                                            help="The combined value of the left-side fields will be written into this field",
+                                            key="upsert_combination_external_id_field",
+                                            index=1 if len(external_id_fields) > 0 else 0
+                                        )
                                     else:
-                                        # Match all fields together with AND logic
-                                        combination_external_id_field = None
-                                        st.success(f"✅ Field combinations will be matched with AND logic: WHERE {selected_fields[0]} = value1 AND {selected_fields[1]} = value2 ...")
+                                        combination_external_id_field = st.selectbox(
+                                            "Select target field to populate with combined value",
+                                            options=[""] + all_sf_fields,
+                                            help="The combined value of the left-side fields will be written into this field",
+                                            key="upsert_combination_external_id_field"
+                                        )
                                     
-                                    st.info("ℹ️ Matching combinations will be updated, non-matching will be inserted as new records")
+                                    if combination_external_id_field:
+                                        st.success(f"✅ Combined value of [{', '.join(selected_fields)}] will be written into **{combination_external_id_field}**")
                                     
-                                    # Store match configuration
+                                    # Store configuration
                                     st.session_state.upsert_match_field = None
                                     st.session_state.upsert_matching_strategy = "field_combination"
                                     st.session_state.upsert_match_fields = selected_fields
+                                    st.session_state.upsert_combination_target_field = combination_external_id_field or ''
                             
                             elif len(selected_fields) == 1:
-                                st.warning("⚠️ Please select at least 2 fields for combination matching")
+                                st.warning("⚠️ Please select at least 2 fields for combination")
                         else:
                             st.error("❌ Could not retrieve Salesforce object fields")
                     
                     elif upsert_matching_strategy_display == "➕ Field Concatenation (Join fields with separator)":
                         st.write("#### ➕ Configure Field Concatenation")
-                        st.info("💡 Concatenate multiple fields to create a unique match key. Matching values will be updated, others inserted.")
-                        st.markdown("**Example:** `FirstName` + `_` + `LastName` = `John_Doe`")
+                        st.info("💡 Select fields to concatenate. The resulting value will be written into a target Salesforce field on every record before loading.")
+                        st.markdown("**Example:** `FirstName` + `_` + `LastName` → `John_Doe` written into `Full_Name_Key__c`")
                         
                         # Get all Salesforce fields for this object
                         obj_desc = get_object_description(sf_conn, target_object)
@@ -2157,49 +2299,43 @@ def load_to_salesforce(sf_conn):
                                     with col_ct3:
                                         st.metric("Duplicate Concatenations", duplicate_count)
                                     
-                                    # ===== MAP CONCATENATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector (Upsert concat) ────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Concatenated Value to Salesforce External ID Field")
-                                    st.info("💡 The concatenated value will be used as an external ID to match/upsert records in Salesforce. Select which Salesforce field stores this composite key.")
+                                    st.write("#### 🎯 Populate Into Salesforce Field")
+                                    st.info("💡 The concatenated value will be written into this Salesforce field on every record.")
                                     
                                     # Get external ID fields
                                     external_id_fields = get_external_id_fields(sf_conn, target_object)
                                     all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
                                     
                                     if external_id_fields:
-                                        st.write("**Available External ID Fields (Recommended):**")
-                                        for field in external_id_fields:
-                                            st.write(f"• **{field}** ⭐")
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(external_id_fields)}")
                                         concat_external_id_field = st.selectbox(
-                                            "Select External ID Field for Composite Key",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                            help="Select which Salesforce field stores this composite key",
+                                            help="The concatenated value will be written into this field",
                                             key="upsert_concat_external_id_field",
                                             index=1 if len(external_id_fields) > 0 else 0
                                         )
                                     else:
-                                        st.warning("⚠️ No External ID fields found. Select any unique field:")
                                         concat_external_id_field = st.selectbox(
-                                            "Select Field for Composite Key Matching",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + all_sf_fields,
-                                            help="Select which Salesforce field stores this composite key (preferably a unique identifier)",
+                                            help="The concatenated value will be written into this field",
                                             key="upsert_concat_external_id_field"
                                         )
                                     
                                     if concat_external_id_field:
-                                        st.success(f"✅ Concatenated values will be matched against Salesforce field: **{concat_external_id_field}**")
-                                        st.write(f"**How it works:**")
-                                        st.write(f"1. Concatenate CSV fields: {', '.join(concat_fields)} → Concatenated Value")
-                                        st.write(f"2. Match against Salesforce: `SELECT Id FROM {target_object} WHERE {concat_external_id_field} = '<Concatenated Value>'`")
-                                        st.write(f"3. If match found → Update record | If not found → Insert as new record")
-                                    
-                                    st.info("ℹ️ Matching concatenations will be updated, non-matching will be inserted as new records")
+                                        st.success(f"✅ Concatenated value of [{', '.join(concat_fields)}] will be written into **{concat_external_id_field}**")
+                                        st.caption(f"Separator used: '{separator}' | Example: {separator.join(['value1', 'value2'])}")
                                     
                                     # Store match configuration
                                     st.session_state.upsert_match_field = None
                                     st.session_state.upsert_matching_strategy = "field_concatenation"
                                     st.session_state.upsert_match_fields = concat_fields
                                     st.session_state.upsert_concat_separator = separator
+                                    # Persist target field so the populate step at load time works
+                                    st.session_state.upsert_concat_target_field = concat_external_id_field or ''
                             
                             elif len(concat_fields) == 1:
                                 st.warning("⚠️ Please select at least 2 fields for concatenation")
@@ -2343,57 +2479,32 @@ def load_to_salesforce(sf_conn):
                                     with col_c3:
                                         st.metric("Duplicate Combinations", duplicate_count)
                                     
-                                    # ===== MAP FIELD COMBINATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector ────────────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Field Combination to Salesforce External ID Field")
-                                    st.info("💡 These fields together act as an external ID. Select which Salesforce field will be matched.")
+                                    st.write("#### 🎯 Populate Into Salesforce Field")
+                                    st.info("💡 The combined value of the selected fields will be written into this Salesforce field on every record.")
                                     
-                                    combination_match_mode = st.radio(
-                                        "How should these fields be matched in Salesforce?",
-                                        options=[
-                                            "Match All Fields Together (AND logic)",
-                                            "Map to Single External ID Field (concatenated)"
-                                        ],
-                                        help="Choose how to match the combination in Salesforce",
-                                        key="update_combination_match_mode"
+                                    external_id_fields_upd = get_external_id_fields(sf_conn, target_object)
+                                    all_sf_fields_upd = [f['name'] for f in obj_desc.get('fields', [])]
+                                    
+                                    if external_id_fields_upd:
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(external_id_fields_upd)}")
+                                    combination_external_id_field = st.selectbox(
+                                        "Select Salesforce field to populate with combined value",
+                                        options=[""] + (external_id_fields_upd or []) + [f for f in all_sf_fields_upd if f not in (external_id_fields_upd or [])],
+                                        help="The combined value of the left-side fields will be written into this field",
+                                        key="update_combination_external_id_field",
+                                        index=1 if external_id_fields_upd else 0
                                     )
                                     
-                                    if combination_match_mode == "Map to Single External ID Field (concatenated)":
-                                        # Get external ID fields
-                                        external_id_fields = get_external_id_fields(sf_conn, target_object)
-                                        all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
-                                        
-                                        if external_id_fields:
-                                            st.write("**Available External ID Fields (Recommended):**")
-                                            for field in external_id_fields:
-                                                st.write(f"• **{field}** ⭐")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select External ID Field for Composite Key",
-                                                options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="update_combination_external_id_field",
-                                                index=1 if len(external_id_fields) > 0 else 0
-                                            )
-                                        else:
-                                            st.warning("⚠️ No External ID fields found. Select any unique field:")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select Field for Composite Key Matching",
-                                                options=[""] + all_sf_fields,
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="update_combination_external_id_field"
-                                            )
-                                        
-                                        if combination_external_id_field:
-                                            st.success(f"✅ Field combinations will be matched against: **{combination_external_id_field}**")
-                                    else:
-                                        # Match all fields together with AND logic
-                                        combination_external_id_field = None
-                                        st.success(f"✅ Field combinations will be matched with AND logic: WHERE {selected_fields[0]} = value1 AND {selected_fields[1]} = value2 ...")
+                                    if combination_external_id_field:
+                                        st.success(f"✅ Combined value of [{', '.join(selected_fields)}] will be written into **{combination_external_id_field}**")
                                     
                                     # Store match configuration
-                                    st.session_state.match_field = None  # Not using single field
+                                    st.session_state.match_field = None
                                     st.session_state.update_matching_strategy = "field_combination"
                                     st.session_state.update_match_fields = selected_fields
+                                    st.session_state.update_combination_target_field = combination_external_id_field or ''
                             
                             elif len(selected_fields) == 1:
                                 st.warning("⚠️ Please select at least 2 fields for combination matching")
@@ -2474,47 +2585,42 @@ def load_to_salesforce(sf_conn):
                                     with col_ct3:
                                         st.metric("Duplicate Concatenations", duplicate_count)
                                     
-                                    # ===== MAP CONCATENATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector (Update concat) ────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Concatenated Value to Salesforce External ID Field")
-                                    st.info("💡 The concatenated value will be used as an external ID to match records in Salesforce. Select which Salesforce field stores this composite key.")
+                                    st.write("#### 🎯 Populate Into Salesforce Field")
+                                    st.info("💡 The concatenated value will be written into this Salesforce field on every record.")
                                     
                                     # Get external ID fields
                                     external_id_fields = get_external_id_fields(sf_conn, target_object)
                                     all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
                                     
                                     if external_id_fields:
-                                        st.write("**Available External ID Fields (Recommended):**")
-                                        for field in external_id_fields:
-                                            st.write(f"• **{field}** ⭐")
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(external_id_fields)}")
                                         concat_external_id_field = st.selectbox(
-                                            "Select External ID Field for Composite Key",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                            help="Select which Salesforce field stores this composite key",
+                                            help="The concatenated value will be written into this field",
                                             key="update_concat_external_id_field",
                                             index=1 if len(external_id_fields) > 0 else 0
                                         )
                                     else:
-                                        st.warning("⚠️ No External ID fields found. Select any unique field:")
                                         concat_external_id_field = st.selectbox(
-                                            "Select Field for Composite Key Matching",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + all_sf_fields,
-                                            help="Select which Salesforce field stores this composite key (preferably a unique identifier)",
+                                            help="The concatenated value will be written into this field",
                                             key="update_concat_external_id_field"
                                         )
                                     
                                     if concat_external_id_field:
-                                        st.success(f"✅ Concatenated values will be matched against Salesforce field: **{concat_external_id_field}**")
-                                        st.write(f"**How it works:**")
-                                        st.write(f"1. Concatenate fields: {', '.join(concat_fields)} → Concatenated Value")
-                                        st.write(f"2. Match against Salesforce: `SELECT Id FROM {target_object} WHERE {concat_external_id_field} = '<Concatenated Value>'`")
-                                        st.write(f"3. Update matching record(s)")
+                                        st.success(f"✅ Concatenated value of [{', '.join(concat_fields)}] will be written into **{concat_external_id_field}**")
+                                        st.caption(f"Separator: '{separator}' | Example: {separator.join(['value1', 'value2'])}")
                                     
                                     # Store match configuration
-                                    st.session_state.match_field = None  # Not using single field
+                                    st.session_state.match_field = None
                                     st.session_state.update_matching_strategy = "field_concatenation"
                                     st.session_state.update_match_fields = concat_fields
                                     st.session_state.update_concat_separator = separator
+                                    st.session_state.update_concat_target_field = concat_external_id_field or ''
                             
                             elif len(concat_fields) == 1:
                                 st.warning("⚠️ Please select at least 2 fields for concatenation")
@@ -2668,59 +2774,34 @@ def load_to_salesforce(sf_conn):
                                     with col_c3:
                                         st.metric("Duplicate Combinations", duplicate_count)
                                     
-                                    # ===== MAP FIELD COMBINATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector ────────────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Field Combination to Salesforce External ID Field")
-                                    st.info("💡 These fields together act as an external ID. Select which Salesforce field(s) will be used to match existing records.")
+                                    st.write("#### 🎯 Populate Into Salesforce Field")
+                                    st.info("💡 The combined value of the selected fields will be written into this Salesforce field on every record.")
                                     
-                                    combination_match_mode = st.radio(
-                                        "How should these fields be matched in Salesforce?",
-                                        options=[
-                                            "Match All Fields Together (AND logic)",
-                                            "Map to Single External ID Field (concatenated)"
-                                        ],
-                                        help="Choose how to match the combination in Salesforce",
-                                        key="insert_combination_match_mode"
+                                    ext_id_fields_ins = get_external_id_fields(sf_conn, target_object)
+                                    all_sf_fields_ins = [f['name'] for f in obj_desc.get('fields', [])]
+                                    
+                                    if ext_id_fields_ins:
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(ext_id_fields_ins)}")
+                                    combination_external_id_field = st.selectbox(
+                                        "Select Salesforce field to populate with combined value",
+                                        options=[""] + (ext_id_fields_ins or []) + [f for f in all_sf_fields_ins if f not in (ext_id_fields_ins or [])],
+                                        help="The combined value of the left-side fields will be written into this field",
+                                        key="insert_combination_external_id_field",
+                                        index=1 if ext_id_fields_ins else 0
                                     )
                                     
-                                    if combination_match_mode == "Map to Single External ID Field (concatenated)":
-                                        # Get external ID fields
-                                        external_id_fields = get_external_id_fields(sf_conn, target_object)
-                                        all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
-                                        
-                                        if external_id_fields:
-                                            st.write("**Available External ID Fields (Recommended):**")
-                                            for field in external_id_fields:
-                                                st.write(f"• **{field}** ⭐")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select External ID Field for Composite Key",
-                                                options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="insert_combination_external_id_field",
-                                                index=1 if len(external_id_fields) > 0 else 0
-                                            )
-                                        else:
-                                            st.warning("⚠️ No External ID fields found. Select any unique field:")
-                                            combination_external_id_field = st.selectbox(
-                                                "Select Field for Composite Key Matching",
-                                                options=[""] + all_sf_fields,
-                                                help="Select which Salesforce field stores this composite key",
-                                                key="insert_combination_external_id_field"
-                                            )
-                                        
-                                        if combination_external_id_field:
-                                            st.success(f"✅ Field combinations will be matched against: **{combination_external_id_field}**")
-                                    else:
-                                        # Match all fields together with AND logic
-                                        combination_external_id_field = None
-                                        st.success(f"✅ Field combinations will be matched with AND logic: WHERE {selected_fields[0]} = value1 AND {selected_fields[1]} = value2 ...")
+                                    if combination_external_id_field:
+                                        st.success(f"✅ Combined value of [{', '.join(selected_fields)}] will be written into **{combination_external_id_field}**")
                                     
                                     # Store configuration
                                     st.session_state.insert_source_field = None
-                                    st.session_state.insert_target_field = None
+                                    st.session_state.insert_target_field = combination_external_id_field or None
                                     st.session_state.insert_matching_strategy = "field_combination"
                                     st.session_state.insert_match_fields = selected_fields
                                     st.session_state.insert_is_composite = True
+                                    st.session_state.insert_combination_target_field = combination_external_id_field or ''
                             
                             elif len(selected_fields) == 1:
                                 st.warning("⚠️ Please select at least 2 fields for combination")
@@ -2799,49 +2880,44 @@ def load_to_salesforce(sf_conn):
                                     with col_ct3:
                                         st.metric("Duplicate Concatenations", duplicate_count)
                                     
-                                    # ===== MAP CONCATENATION TO EXTERNAL ID FIELD =====
+                                    # ── Target field selector (Insert concat) ────────────────────────
                                     st.markdown("---")
-                                    st.write("#### 🔗 Map Concatenated Value to Salesforce External ID Field")
-                                    st.info("💡 The concatenated value will be used as an external ID to match/insert records in Salesforce. Select which Salesforce field stores this composite key.")
+                                    st.write("#### 🎯 Populate Into Salesforce Field")
+                                    st.info("💡 The concatenated value will be written into this Salesforce field on every record.")
                                     
                                     # Get external ID fields
                                     external_id_fields = get_external_id_fields(sf_conn, target_object)
                                     all_sf_fields = [f['name'] for f in obj_desc.get('fields', [])]
                                     
                                     if external_id_fields:
-                                        st.write("**Available External ID Fields (Recommended):**")
-                                        for field in external_id_fields:
-                                            st.write(f"• **{field}** ⭐")
+                                        st.caption(f"⭐ External ID fields (recommended): {', '.join(external_id_fields)}")
                                         concat_external_id_field = st.selectbox(
-                                            "Select External ID Field for Composite Key",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + external_id_fields + [f for f in all_sf_fields if f not in external_id_fields],
-                                            help="Select which Salesforce field stores this composite key",
+                                            help="The concatenated value will be written into this field",
                                             key="insert_concat_external_id_field",
                                             index=1 if len(external_id_fields) > 0 else 0
                                         )
                                     else:
-                                        st.warning("⚠️ No External ID fields found. Select any unique field:")
                                         concat_external_id_field = st.selectbox(
-                                            "Select Field for Composite Key Matching",
+                                            "Select Salesforce field to populate with concatenated value",
                                             options=[""] + all_sf_fields,
-                                            help="Select which Salesforce field stores this composite key (preferably a unique identifier)",
+                                            help="The concatenated value will be written into this field",
                                             key="insert_concat_external_id_field"
                                         )
                                     
                                     if concat_external_id_field:
-                                        st.success(f"✅ Concatenated values will be matched against Salesforce field: **{concat_external_id_field}**")
-                                        st.write(f"**How it works:**")
-                                        st.write(f"1. Concatenate CSV fields: {', '.join(concat_fields)} → Concatenated Value")
-                                        st.write(f"2. Match against Salesforce: `SELECT Id FROM {target_object} WHERE {concat_external_id_field} = '<Concatenated Value>'`")
-                                        st.write(f"3. If match found → Update record | If not found → Insert as new record")
+                                        st.success(f"✅ Concatenated value of [{', '.join(concat_fields)}] will be written into **{concat_external_id_field}**")
+                                        st.caption(f"Separator: '{separator}' | Example: {separator.join(['value1', 'value2'])}")
                                     
                                     # Store configuration
                                     st.session_state.insert_source_field = None
-                                    st.session_state.insert_target_field = None
+                                    st.session_state.insert_target_field = concat_external_id_field or None
                                     st.session_state.insert_matching_strategy = "field_concatenation"
                                     st.session_state.insert_match_fields = concat_fields
                                     st.session_state.insert_concat_separator = separator
                                     st.session_state.insert_is_composite = True
+                                    st.session_state.insert_concat_target_field = concat_external_id_field or ''
                             
                             elif len(concat_fields) == 1:
                                 st.warning("⚠️ Please select at least 2 fields for concatenation")
@@ -3469,6 +3545,42 @@ def load_to_salesforce(sf_conn):
                     # Store field mappings in session state for use in load_data_to_salesforce
                     st.session_state.load_field_mappings = field_mappings.copy()
                     
+                    # ── POPULATE step for Field Combination / Field Concatenation ────────────
+                    # When the user chose to map the combination/concatenation result INTO a
+                    # specific right-side Salesforce field, compute that value now and write it
+                    # into df_to_load as a new column.  After population we switch the strategy
+                    # to 'external_id' so the existing external-ID upsert path handles matching.
+                    if operation_type == "Upsert":
+                        _us = st.session_state.get('upsert_matching_strategy')
+                        _um_fields = st.session_state.get('upsert_match_fields', [])
+
+                        if _us == 'field_combination':
+                            _tgt  = st.session_state.get('upsert_combination_target_field', '').strip()
+                            if _tgt and _um_fields:
+                                # Concatenate all selected source fields with '|' separator into target field
+                                _valid = [f for f in _um_fields if f in df_to_load.columns]
+                                if _valid:
+                                    df_to_load[_tgt] = df_to_load[_valid].astype(str).agg('|'.join, axis=1)
+                                    st.info(f"🔗 Populated **{_tgt}** with combined values of: {', '.join(_valid)}")
+                                    # Redirect to external_id strategy using the populated target field
+                                    st.session_state.upsert_matching_strategy = 'external_id'
+                                    st.session_state.upsert_match_field      = _tgt
+                                    st.session_state.upsert_match_fields     = [_tgt]
+
+                        elif _us == 'field_concatenation':
+                            _tgt = st.session_state.get('upsert_concat_target_field', '').strip()
+                            _sep = st.session_state.get('upsert_concat_separator', '_')
+                            if _tgt and _um_fields:
+                                _valid = [f for f in _um_fields if f in df_to_load.columns]
+                                if _valid:
+                                    df_to_load[_tgt] = df_to_load[_valid].astype(str).agg(_sep.join, axis=1)
+                                    st.info(f"🔗 Populated **{_tgt}** with concatenated values of: {', '.join(_valid)} (separator: '{_sep}')")
+                                    # Redirect to external_id strategy using the populated target field
+                                    st.session_state.upsert_matching_strategy = 'external_id'
+                                    st.session_state.upsert_match_field      = _tgt
+                                    st.session_state.upsert_match_fields     = [_tgt]
+                    # ─────────────────────────────────────────────────────────────────────────
+
                     # Get additional parameters for different operations
                     insert_match_field = st.session_state.get('insert_match_field', None) if operation_type == "Insert" else None
                     update_match_field = st.session_state.get('match_field', None) if operation_type == "Update" else None
@@ -3479,7 +3591,7 @@ def load_to_salesforce(sf_conn):
                     update_match_fields = st.session_state.get('update_match_fields', None) if operation_type == "Update" else None
                     update_concat_separator = st.session_state.get('update_concat_separator', None) if operation_type == "Update" else None
                     
-                    # Get UPSERT matching strategy parameters
+                    # Get UPSERT matching strategy parameters (read AFTER the populate step may have updated them)
                     upsert_matching_strategy = st.session_state.get('upsert_matching_strategy', None) if operation_type == "Upsert" else None
                     upsert_match_fields = st.session_state.get('upsert_match_fields', None) if operation_type == "Upsert" else None
                     upsert_concat_separator = st.session_state.get('upsert_concat_separator', None) if operation_type == "Upsert" else None
@@ -3653,15 +3765,22 @@ def test_sql_connection(db_config: Dict):
     """Test SQL connection with enhanced feedback"""
     try:
         import pyodbc
-        
+
         with st.spinner("Testing SQL Server connection..."):
+            # Resolve driver (handles Auto-detect)
+            try:
+                from ui_components.config_management import _resolve_driver
+            except ImportError:
+                from config_management import _resolve_driver
+            resolved_driver = _resolve_driver(db_config.get('driver', 'Auto-detect (recommended)'))
+
             # Build connection string based on enhanced config
-            connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']};DATABASE={db_config['database']}"
-            
+            connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']};DATABASE={db_config['database']}"
+
             # Add port if specified
             if db_config.get('port') and db_config.get('port') != '1433':
                 if '\\' not in db_config['server']:  # Only add port if not using named instance
-                    connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
+                    connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
             
             # Add authentication
             if db_config.get('Trusted_Connection') == 'yes':
@@ -3670,22 +3789,27 @@ def test_sql_connection(db_config: Dict):
                 connection_string += f";UID={db_config['username']};PWD={db_config['password']}"
             
             # Add enhanced settings if available
-            if db_config.get('encrypt'):
-                connection_string += f";Encrypt={db_config['encrypt']}"
-            
-            if db_config.get('trust_server_cert'):
+            encrypt_val = db_config.get('encrypt', 'no')
+            if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+                connection_string += f";Encrypt={encrypt_val}"
+
+            # TrustServerCertificate: respect explicit setting OR auto-enable for Azure SQL
+            trust_cert = db_config.get('trust_server_cert', False)
+            is_azure = '.database.windows.net' in db_config.get('server', '')
+            older_driver = any(d in db_config.get('driver', '') for d in ['13', '11', 'Native', 'SQL Server}'])
+            if trust_cert or (is_azure and older_driver):
                 connection_string += ";TrustServerCertificate=yes"
-            
+
             if db_config.get('connection_timeout'):
                 connection_string += f";Connection Timeout={db_config['connection_timeout']}"
-            
+
             if db_config.get('application_name'):
                 connection_string += f";APP={db_config['application_name']}"
             
             # Test connection
             with pyodbc.connect(connection_string) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT @@VERSION as sql_version, DB_NAME() as current_db, SYSTEM_USER as current_user, COUNT(*) as table_count FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")
+                cursor.execute("SELECT @@VERSION as sql_version, DB_NAME() as current_db, SYSTEM_USER as connected_user, COUNT(*) as table_count FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")
                 result = cursor.fetchone()
                 
                 if result:
@@ -3695,7 +3819,7 @@ def test_sql_connection(db_config: Dict):
                     col1, col2 = st.columns(2)
                     with col1:
                         st.info(f"**Database:** {result.current_db}")
-                        st.info(f"**Connected User:** {result.current_user}")
+                        st.info(f"**Connected User:** {result.connected_user}")
                     
                     with col2:
                         st.info(f"**Tables Available:** {result.table_count}")
@@ -3709,28 +3833,41 @@ def test_sql_connection(db_config: Dict):
         st.error("❌ **pyodbc module not installed**")
         st.code("pip install pyodbc", language="bash")
     except Exception as e:
-        st.error(f"❌ **SQL Server connection failed**")
-        
         error_msg = str(e)
-        if "Login failed" in error_msg:
+        st.error("❌ **SQL Server connection failed**")
+        st.code(error_msg, language="text")  # Always show full error
+        # NOTE: firewall/SSL checks must come BEFORE the driver check because
+        # pyodbc always embeds the driver name in the error text.
+        if "40615" in error_msg or "IP address" in error_msg:
+            st.warning("🔥 **Firewall Issue:** Your IP is not whitelisted on the Azure SQL Server. Add it in Azure Portal → SQL Server → Networking → Firewall rules.")
+        elif "SSL" in error_msg or "certificate" in error_msg.lower() or "TLS" in error_msg:
+            st.warning("🔒 **SSL Issue:** Enable 'Trust Server Certificate' in the connection settings and retry.")
+        elif "Login failed" in error_msg:
             st.warning("🔐 **Authentication Issue:** Check username and password")
-        elif "server was not found" in error_msg:
-            st.warning("🌐 **Server Issue:** Check server address and port") 
-        else:
-            st.warning(f"**Error:** {error_msg}")
+        elif "server was not found" in error_msg or "network-related" in error_msg:
+            st.warning("🌐 **Server Issue:** Check server address and network connectivity")
+        elif "IM002" in error_msg or "data source name not found" in error_msg.lower():
+            st.warning("🔧 **Driver Issue:** The selected ODBC driver is not installed on this machine.")
 
 def execute_sql_query(db_config: Dict, query: str):
     """Execute SQL query with enhanced connection handling"""
     try:
         import pyodbc
-        
+
+        # Resolve driver (handles Auto-detect)
+        try:
+            from ui_components.config_management import _resolve_driver
+        except ImportError:
+            from config_management import _resolve_driver
+        resolved_driver = _resolve_driver(db_config.get('driver', 'Auto-detect (recommended)'))
+
         # Build connection string (same as test_sql_connection)
-        connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']};DATABASE={db_config['database']}"
-        
+        connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']};DATABASE={db_config['database']}"
+
         # Add port if specified
         if db_config.get('port') and db_config.get('port') != '1433':
             if '\\' not in db_config['server']:
-                connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
+                connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
         
         # Add authentication
         if db_config.get('Trusted_Connection') == 'yes':
@@ -3739,15 +3876,19 @@ def execute_sql_query(db_config: Dict, query: str):
             connection_string += f";UID={db_config['username']};PWD={db_config['password']}"
         
         # Add enhanced settings
-        if db_config.get('encrypt'):
-            connection_string += f";Encrypt={db_config['encrypt']}"
-        
-        if db_config.get('trust_server_cert'):
+        encrypt_val = db_config.get('encrypt', 'no')
+        if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+            connection_string += f";Encrypt={encrypt_val}"
+
+        trust_cert = db_config.get('trust_server_cert', False)
+        is_azure = '.database.windows.net' in db_config.get('server', '')
+        older_driver = any(d in db_config.get('driver', '') for d in ['13', '11', 'Native', 'SQL Server}'])
+        if trust_cert or (is_azure and older_driver):
             connection_string += ";TrustServerCertificate=yes"
-        
+
         if db_config.get('connection_timeout'):
             connection_string += f";Connection Timeout={db_config['connection_timeout']}"
-        
+
         if db_config.get('application_name'):
             connection_string += f";APP={db_config['application_name']}"
         
@@ -4831,23 +4972,34 @@ def load_data_to_sql_server(db_config: Dict, df: pd.DataFrame, table_name: str, 
         # Step 1: Establish connection
         status_text.text("🔗 Establishing database connection...")
         progress_bar.progress(10)
-        
+
+        # Resolve driver (handles Auto-detect)
+        try:
+            from ui_components.config_management import _resolve_driver
+        except ImportError:
+            from config_management import _resolve_driver
+        resolved_driver = _resolve_driver(db_config.get('driver', 'Auto-detect (recommended)'))
+
         # Build connection string
-        connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']};DATABASE={db_config['database']}"
-        
+        connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']};DATABASE={db_config['database']}"
+
         if db_config.get('port') and db_config.get('port') != '1433':
             if '\\' not in db_config['server']:
-                connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
+                connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
         
         if db_config.get('Trusted_Connection') == 'yes':
             connection_string += ";Trusted_Connection=yes"
         else:
             connection_string += f";UID={db_config['username']};PWD={db_config['password']}"
-        
-        if db_config.get('encrypt'):
-            connection_string += f";Encrypt={db_config['encrypt']}"
-        
-        if db_config.get('trust_server_cert'):
+
+        encrypt_val = db_config.get('encrypt', 'no')
+        if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+            connection_string += f";Encrypt={encrypt_val}"
+
+        trust_cert = db_config.get('trust_server_cert', False)
+        is_azure = '.database.windows.net' in db_config.get('server', '')
+        older_driver = any(d in db_config.get('driver', '') for d in ['13', '11', 'Native', 'SQL Server}'])
+        if trust_cert or (is_azure and older_driver):
             connection_string += ";TrustServerCertificate=yes"
         
         # Create SQLAlchemy engine
@@ -6001,10 +6153,33 @@ def display_operation_results(success_records: list, failed_records: list, opera
             if success_data:
                 success_df = pd.DataFrame(success_data)
                 st.dataframe(success_df, use_container_width=True, hide_index=True)
-                
+
                 if len(success_records) > 1000:
                     st.info(f"📊 Showing first 1000 records. Total successful: {len(success_records)}")
-                
+
+                # Auto-save and register output in File Library
+                try:
+                    import os as _os
+                    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    _out_dir = _os.path.join(project_root, 'file_store', 'output',
+                                             st.session_state.get('current_org', 'unknown'),
+                                             target_object, 'data_load')
+                    _os.makedirs(_out_dir, exist_ok=True)
+                    _out_path = _os.path.join(_out_dir, f"{target_object}_success_{_ts}.csv")
+                    success_df.to_csv(_out_path, index=False)
+                    if register_output_file:
+                        register_output_file(
+                            _out_path,
+                            original_name=_os.path.basename(_out_path),
+                            org_name=st.session_state.get('current_org', 'unknown'),
+                            object_name=target_object,
+                            operation_type='Data Load',
+                            row_count=len(success_df),
+                            status='success',
+                        )
+                except Exception:
+                    pass
+
                 # Download option
                 csv_data = success_df.to_csv(index=False)
                 st.download_button(
@@ -6068,9 +6243,32 @@ def display_operation_results(success_records: list, failed_records: list, opera
             if failed_data:
                 failed_df = pd.DataFrame(failed_data)
                 st.dataframe(failed_df, use_container_width=True, hide_index=True)
-                
+
                 if len(failed_records) > 1000:
                     st.info(f"📊 Showing first 1000 records. Total failed: {len(failed_records)}")
+
+                # Auto-save and register output in File Library
+                try:
+                    import os as _os
+                    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    _out_dir = _os.path.join(project_root, 'file_store', 'output',
+                                             st.session_state.get('current_org', 'unknown'),
+                                             target_object, 'data_load')
+                    _os.makedirs(_out_dir, exist_ok=True)
+                    _out_path = _os.path.join(_out_dir, f"{target_object}_failed_{_ts}.csv")
+                    failed_df.to_csv(_out_path, index=False)
+                    if register_output_file:
+                        register_output_file(
+                            _out_path,
+                            original_name=_os.path.basename(_out_path),
+                            org_name=st.session_state.get('current_org', 'unknown'),
+                            object_name=target_object,
+                            operation_type='Data Load',
+                            row_count=len(failed_df),
+                            status='failed',
+                        )
+                except Exception:
+                    pass
                 
                 # Expandable section to show full error details
                 with st.expander("🔍 View Full Error Details"):

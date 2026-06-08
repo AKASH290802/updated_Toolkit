@@ -106,10 +106,11 @@ def _bulk2_execute(sf_conn, object_name: str, operation: str, records: list,
     else:
         raise ValueError(f"Unsupported operation: {operation}")
 
-    total_success  = 0
-    total_failed   = 0
-    failed_records = []
-    global_row     = 0  # running count of records across all jobs (for display row numbers)
+    total_success    = 0
+    total_failed     = 0
+    failed_records   = []
+    successful_records = []  # [{sf_id, submitted_data}] — one entry per successfully inserted record
+    global_row       = 0  # running count of records across all jobs (for display row numbers)
 
     for job in job_results:
         job_id      = job['job_id']
@@ -121,6 +122,24 @@ def _bulk2_execute(sf_conn, object_name: str, operation: str, records: list,
         n_success      = n_processed - n_failed
         total_success += n_success
         total_failed  += n_failed
+
+        # ── Collect successful-record SF IDs from Salesforce's own CSV ─────
+        # get_successful_records() returns a CSV with:
+        #   sf__Id     — the new Salesforce ID assigned by this operation
+        #   sf__Created — 'true' for inserts, 'false' for updates
+        #   <all original submitted fields>
+        if n_success > 0:
+            try:
+                success_csv = bulk2_type.get_successful_records(job_id)
+                if success_csv and success_csv.strip():
+                    for row in csv.DictReader(io.StringIO(success_csv)):
+                        sf_id = row.get('sf__Id', '')
+                        submitted = {k: v for k, v in row.items() if not k.startswith('sf__')}
+                        successful_records.append({'sf_id': sf_id, 'submitted_data': submitted})
+            except Exception:
+                # If the API call fails, still count the successes — just no ID data
+                for _ in range(n_success):
+                    successful_records.append({'sf_id': '', 'submitted_data': {}})
 
         # ── Extract failed-record details from Salesforce's own CSV ────────
         # The failed-records CSV contains:
@@ -157,10 +176,11 @@ def _bulk2_execute(sf_conn, object_name: str, operation: str, records: list,
             global_row += n_total_job   # advance counter even for all-success jobs
 
     return {
-        'success_count':  total_success,
-        'error_count':    total_failed,
-        'total':          len(records),
-        'failed_records': failed_records
+        'success_count':     total_success,
+        'error_count':       total_failed,
+        'total':             len(records),
+        'failed_records':    failed_records,
+        'successful_records': successful_records   # new: [{sf_id, submitted_data}]
     }
 
 
@@ -312,82 +332,126 @@ def get_object_fields(sf_conn: Salesforce, object_name: str) -> Dict[str, Any]:
 
 def get_object_fields_with_relationships(sf_conn: Salesforce, object_name: str, include_relationship_fields: bool = True) -> Dict[str, Any]:
     """
-    Get all fields for a Salesforce object including relationship fields with dot notation
-    
-    Args:
-        sf_conn: Salesforce connection
-        object_name: Name of the Salesforce object
-        include_relationship_fields: If True, includes fields from related objects (e.g., ProductCategory.Name)
-    
-    Returns:
-        Dictionary of field metadata including relationship fields
-        Example: {
-            'Name': {...},
-            'ProductCategoryId': {...},
-            'ProductCategory.Name': {...},  ← Relationship field
-            'ProductCategory.Description': {...}  ← Relationship field
-        }
+    Get all fields for a Salesforce object including relationship fields with dot notation.
+    Supports up to 2 levels of parent traversal to allow paths like:
+        Rel1__r.Name                       (level 1)
+        Rel1__r.Rel2__r.Name               (level 2)
+
+    Cycle guard: an object is never described twice in the same call, preventing
+    infinite loops on self-referential or bidirectional relationships.
+
+    Returns a dict keyed by API/dot-notation name:
+        'Name'                         direct field
+        'Account.Name'                 level-1 relationship field
+        'Account.Parent.Name'          level-2 relationship field
     """
+    _SYSTEM_SKIP = {'OwnerId', 'RecordTypeId', 'CreatedById', 'LastModifiedById'}
+    _SYSTEM_PARENT_SKIP = {'Id', 'CreatedById', 'LastModifiedById', 'OwnerId'}
+    MAX_DEPTH = 2  # Salesforce SOQL supports up to 5; we cap at 2 for performance
+
+    # Per-call describe cache (object_name → describe result) to avoid duplicate API calls
+    _describe_cache: Dict[str, Any] = {}
+
+    def _describe(obj: str):
+        if obj not in _describe_cache:
+            try:
+                _describe_cache[obj] = getattr(sf_conn, obj).describe()
+            except Exception:
+                _describe_cache[obj] = None
+        return _describe_cache[obj]
+
+    def _add_relationship_fields(fields_info: Dict, parent_obj: str, rel_prefix: str,
+                                  current_depth: int, visited: set):
+        """
+        Recursively add relationship fields up to MAX_DEPTH.
+        rel_prefix: dot-notation prefix built so far (e.g. 'Account' or 'Account.Parent')
+        visited:    set of object names already in the current traversal path (cycle guard)
+        """
+        if current_depth > MAX_DEPTH:
+            return
+        if parent_obj in visited:
+            return  # cycle guard
+
+        desc = _describe(parent_obj)
+        if not desc:
+            return
+
+        visited = visited | {parent_obj}  # immutable update — doesn't affect sibling paths
+
+        for pf in desc['fields']:
+            pf_name = pf['name']
+
+            if pf_name in _SYSTEM_PARENT_SKIP:
+                continue
+
+            dot_name = f"{rel_prefix}.{pf_name}"
+
+            if pf['type'] != 'reference':
+                # Leaf field — add it
+                if dot_name not in fields_info:
+                    fields_info[dot_name] = {
+                        'label': f"{rel_prefix} → {pf.get('label', pf_name)}",
+                        'type': pf.get('type', 'string'),
+                        'referenceTo': pf.get('referenceTo', []),
+                        'externalId': pf.get('externalId', False),
+                        'unique': pf.get('unique', False),
+                        'createable': False,
+                        'updateable': False,
+                        'nillable': pf.get('nillable', True),
+                        'is_relationship_field': True,
+                        'relationship_depth': current_depth,
+                        'parent_object': parent_obj,
+                        'relationship_name': rel_prefix,
+                        'parent_field_name': pf_name,
+                        'picklistValues': pf.get('picklistValues', [])
+                    }
+            else:
+                # Another reference field — go one level deeper if budget allows
+                if current_depth < MAX_DEPTH:
+                    ref_to = pf.get('referenceTo', [])
+                    if not ref_to:
+                        continue
+                    child_rel_name = pf.get('relationshipName')
+                    if not child_rel_name:
+                        continue
+                    if pf_name in _SYSTEM_SKIP:
+                        continue
+                    next_prefix = f"{rel_prefix}.{child_rel_name}"
+                    _add_relationship_fields(
+                        fields_info, ref_to[0], next_prefix,
+                        current_depth + 1, visited
+                    )
+
     try:
-        # Get direct fields first
         fields_info = get_object_fields(sf_conn, object_name)
-        
+
         if not include_relationship_fields:
             return fields_info
-        
-        # Add relationship fields
+
+        # Traverse level-1 reference fields of the root object
         try:
-            describe_result = getattr(sf_conn, object_name).describe()
-            
-            # Get all lookup/reference fields
-            for field in describe_result['fields']:
-                reference_to = field.get('referenceTo', [])
-                
-                # Skip if not a reference field or if it's a system field
-                if not reference_to or field['name'] in ['OwnerId', 'RecordTypeId', 'CreatedById', 'LastModifiedById']:
-                    continue
-                
-                parent_object = reference_to[0]
-                relationship_name = field.get('relationshipName', field['name'].replace('Id', ''))
-                
-                # Query parent object fields
-                try:
-                    parent_fields = get_object_fields(sf_conn, parent_object)
-                    
-                    # For each parent field, create a relationship field entry
-                    for parent_field_name, parent_field_meta in parent_fields.items():
-                        # Skip system fields from parent
-                        if parent_field_name in ['Id', 'CreatedById', 'LastModifiedById']:
-                            continue
-                        
-                        # Create dot notation field name
-                        relationship_field_name = f"{relationship_name}.{parent_field_name}"
-                        
-                        # Add to fields info with marker that it's a relationship field
-                        fields_info[relationship_field_name] = {
-                            'label': f"{relationship_name} → {parent_field_meta.get('label', parent_field_name)}",
-                            'type': parent_field_meta.get('type', 'reference'),
-                            'referenceTo': parent_field_meta.get('referenceTo', []),
-                            'externalId': parent_field_meta.get('externalId', False),
-                            'unique': parent_field_meta.get('unique', False),
-                            'createable': False,  # Relationship fields are not directly creatable
-                            'updateable': False,
-                            'nillable': parent_field_meta.get('nillable', True),
-                            'is_relationship_field': True,  # Mark as relationship field
-                            'parent_object': parent_object,
-                            'relationship_name': relationship_name,
-                            'parent_field_name': parent_field_name,
-                            'picklistValues': parent_field_meta.get('picklistValues', [])
-                        }
-                except Exception as e:
-                    # Skip if we can't get parent object fields
-                    pass
-        
-        except Exception as e:
-            # If relationship extraction fails, just return direct fields
-            pass
-        
+            root_desc = _describe(object_name)
+            if root_desc:
+                for field in root_desc['fields']:
+                    ref_to = field.get('referenceTo', [])
+                    if not ref_to:
+                        continue
+                    if field['name'] in _SYSTEM_SKIP:
+                        continue
+                    rel_name = field.get('relationshipName')
+                    if not rel_name:
+                        continue
+
+                    parent_obj = ref_to[0]
+                    _add_relationship_fields(
+                        fields_info, parent_obj, rel_name,
+                        current_depth=1, visited={object_name}
+                    )
+        except Exception:
+            pass  # relationship extraction failed — fall back to direct fields only
+
         return fields_info
+
     except Exception as e:
         st.error(f"Error retrieving fields with relationships for {object_name}: {str(e)}")
         return {}
@@ -4795,6 +4859,10 @@ def show_org_migration(credentials: dict):
                         result = source_sf.query(soql)
                         source_data = pd.DataFrame(result['records']).drop(columns=['attributes'], errors='ignore')
                         
+                        # ── Save FULL source data (including skipped fields) ──────────────
+                        st.session_state.migration_original_source_data = source_data.copy()
+                        # ──────────────────────────────────────────────────────────────────
+                        
                         # Filter to keep only mapped fields (exclude unmapped/auto-generated fields like Id)
                         mapped_source_fields = [src for src, tgt in st.session_state.migration_field_mappings.items() 
                                                 if tgt != "-- Skip --"]
@@ -5005,6 +5073,11 @@ def show_org_migration(credentials: dict):
                     source_data = pd.DataFrame(all_records).drop(columns=['attributes'], errors='ignore')
                     
                     st.success(f"✅ Extracted {len(source_data)} records from source org")
+                    
+                    # ── Save FULL source data (including fields the user skipped) ──────────
+                    # This is used later to enrich the success file with skipped field values.
+                    st.session_state.migration_original_source_data = source_data.copy()
+                    # ──────────────────────────────────────────────────────────────────────
                     
                     # Apply field mappings
                     st.info("🗺️ Step 2/5: Applying field mappings and filtering to ONLY mapped fields...")
@@ -5263,21 +5336,73 @@ def show_org_migration(credentials: dict):
                     if success_count > 0:
                         st.success(f"✅ {success_count} records successfully {migration_operation.lower()}ed")
                         
-                        # Create success summary table if success_details exists
-                        if 'success_details' in locals() and success_details:
-                            success_df = pd.DataFrame([
-                                {
-                                    'Record #': d['record_index'] + 1,
-                                    'Salesforce ID': d['salesforce_id'],
-                                    'Operation': d['operation']
-                                }
-                                for d in success_details[:20]  # Show first 20
-                            ])
+                        # ── Build enriched success file ──────────────────────────────────
+                        # Columns: New SF ID (target) + submitted field values + skipped field values
+                        #
+                        # How it works:
+                        #  - bulk_result['successful_records'] has [{sf_id, submitted_data}] in row order
+                        #  - migration_original_source_data has ALL source fields (including skipped ones)
+                        #    also in row order (same SOQL, same records, same position)
+                        #  - We identify skipped fields = fields in original that were mapped to '-- Skip --'
+                        #  - We join them positionally (row 0 of successes matches row 0 of original)
+                        #    NOTE: when some records fail, we must skip those original rows.
+                        #    We identify failed row numbers from bulk_result['failed_records'] and skip them.
+                        try:
+                            sf_successful = bulk_result.get('successful_records', [])
+                            original_df   = st.session_state.get('migration_original_source_data', pd.DataFrame())
                             
-                            with st.expander(f"View Success Details ({len(success_details)} total)", expanded=False):
-                                st.dataframe(success_df, use_container_width=True, hide_index=True)
-                                if len(success_details) > 20:
-                                    st.info(f"Showing 20 of {len(success_details)} successful records")
+                            # Determine which source row indices correspond to failed records
+                            failed_row_numbers = set()
+                            for fr in bulk_result.get('failed_records', []):
+                                failed_row_numbers.add(fr['row_number'] - 1)  # convert 1-based to 0-based
+                            
+                            # Skipped source fields = those set to '-- Skip --' in field mapping
+                            all_mapped = st.session_state.get('migration_field_mappings', {})
+                            skipped_source_fields = [f for f, t in all_mapped.items() if t == '-- Skip --']
+                            
+                            enriched_rows = []
+                            orig_idx = 0   # cursor into original_df (all rows)
+                            for success_pos, sr in enumerate(sf_successful):
+                                # Advance orig_idx past any failed rows to reach the matching original row
+                                while orig_idx < len(original_df) and orig_idx in failed_row_numbers:
+                                    orig_idx += 1
+                                
+                                row = {'Target_Salesforce_ID': sr['sf_id']}
+                                # Add submitted (mapped) field values
+                                row.update(sr['submitted_data'])
+                                # Add skipped field values from original source data
+                                if orig_idx < len(original_df) and skipped_source_fields:
+                                    orig_row = original_df.iloc[orig_idx]
+                                    for sf_field in skipped_source_fields:
+                                        if sf_field in orig_row.index:
+                                            row[f'(skipped) {sf_field}'] = orig_row[sf_field]
+                                enriched_rows.append(row)
+                                orig_idx += 1
+                            
+                            if enriched_rows:
+                                enriched_df = pd.DataFrame(enriched_rows)
+                                
+                                with st.expander(f"✅ View Success Details ({len(enriched_rows)} records)", expanded=False):
+                                    st.dataframe(enriched_df.head(20), use_container_width=True, hide_index=True)
+                                    if len(enriched_rows) > 20:
+                                        st.info(f"Showing 20 of {len(enriched_rows)} records. Download for full list.")
+                                
+                                # Download as CSV
+                                success_csv_buf = io.StringIO()
+                                enriched_df.to_csv(success_csv_buf, index=False)
+                                st.download_button(
+                                    label="📥 Download Success File (CSV)",
+                                    data=success_csv_buf.getvalue(),
+                                    file_name=f"success_records_{object_name}_{migration_operation}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    mime="text/csv",
+                                    key="download_success_csv"
+                                )
+                                if skipped_source_fields:
+                                    st.caption(f"ℹ️ Success file includes {len(skipped_source_fields)} skipped field(s): {', '.join(skipped_source_fields)}")
+                            else:
+                                st.info("ℹ️ No per-record details available (Salesforce did not return successful-records CSV).")
+                        except Exception as _se:
+                            st.warning(f"⚠️ Could not build success file: {_se}")
                     
                     # Display Error Details if any
                     if error_count > 0 and 'error_details' in locals() and error_details:

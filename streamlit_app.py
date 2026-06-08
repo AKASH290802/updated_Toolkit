@@ -23,6 +23,7 @@ from ui_components import (
     object_comparison
 )
 from ui_components.data_hub import show_data_hub_interface, initialize_data_hub
+from ui_components.file_library_ui import show_file_library
 
 # Page configuration
 st.set_page_config(
@@ -339,6 +340,7 @@ def main():
             "🏠 Dashboard",
             "⚙️ Configuration",
             "📊 Data Hub",
+            "📁 File Library",
             "1️⃣ Validation",
             "2️⃣ Data Operations",
             "3️⃣ Unit Testing",
@@ -410,6 +412,8 @@ def main():
         config_management.show_configuration(current_credentials)
     elif current_page == "📊 Data Hub":
         show_data_hub_interface(st.session_state.get('sf_connection', None))
+    elif current_page == "📁 File Library":
+        show_file_library()
     elif current_page == "1️⃣ Validation":
         validation_operations.show_validation_operations(current_credentials)
     elif current_page == "2️⃣ Data Operations":

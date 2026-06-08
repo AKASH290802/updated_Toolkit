@@ -15,6 +15,19 @@ import streamlit.components.v1 as components
 project_root = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(project_root)
 
+# File Library integration (graceful — does not break if module unavailable)
+try:
+    from ui_components.file_library_ui import show_file_picker_inline
+    from ui_components.file_store_manager import register_source_file, register_output_file
+except ImportError:
+    try:
+        from file_library_ui import show_file_picker_inline
+        from file_store_manager import register_source_file, register_output_file
+    except ImportError:
+        show_file_picker_inline = None
+        register_source_file = None
+        register_output_file = None
+
 # Lookup resolution functions are imported locally from data_operations when needed
 
 # Import lookup resolution validator for enhanced reference field validation
@@ -51,12 +64,36 @@ def get_timestamped_filename(base_name: str, file_extension: str = 'csv') -> str
 def save_validation_results_to_file(df: pd.DataFrame, folder_path: str, filename: str, file_type: str = 'csv') -> str:
     """Save validation results to file and return full path"""
     full_path = os.path.join(folder_path, filename)
-    
+
     if file_type.lower() == 'csv':
         df.to_csv(full_path, index=False)
     elif file_type.lower() == 'xlsx':
         df.to_excel(full_path, index=False)
-    
+
+    # Register in File Library
+    if register_output_file:
+        try:
+            abs_path = os.path.abspath(full_path)
+            # Infer operation type from folder path
+            op_type = 'Validation'
+            if 'genai' in folder_path.lower():
+                op_type = 'GenAI Validation'
+            elif 'schema' in folder_path.lower():
+                op_type = 'Schema Validation'
+            elif 'enhanced' in folder_path.lower():
+                op_type = 'Enhanced Validation'
+            register_output_file(
+                abs_path,
+                original_name=filename,
+                org_name=st.session_state.get('current_org', 'unknown'),
+                object_name=st.session_state.get('current_object', ''),
+                operation_type=op_type,
+                row_count=len(df),
+                status='generated',
+            )
+        except Exception:
+            pass
+
     return full_path
 
 def display_file_location_info(folder_path: str, saved_files: list = None):
@@ -694,9 +731,9 @@ def show_schema_validation(sf_conn):
         
         # Build source options based on Data Hub availability
         if data_hub_available:
-            source_options = ["Use Data Hub", "Upload File", "Select Existing File", "Use Sample Data"]
+            source_options = ["Use Data Hub", "Upload File", "Select Existing File", "📁 File Library", "Use Sample Data"]
         else:
-            source_options = ["Upload File", "Select Existing File", "Use Sample Data"]
+            source_options = ["Upload File", "Select Existing File", "📁 File Library", "Use Sample Data"]
         
         data_source = st.radio(
             "Select Data Source",
@@ -727,7 +764,7 @@ def show_schema_validation(sf_conn):
                     st.success(f"✅ Data loaded from Hub: {len(hub_df)} rows, {len(hub_df.columns)} columns")
                     with st.expander("📊 Data Preview", expanded=False):
                         st.dataframe(hub_df.head(10), use_container_width=True)
-        
+
         elif data_source == "Upload File":
             uploaded_file = st.file_uploader(
                 "Upload data file for validation",
@@ -735,12 +772,29 @@ def show_schema_validation(sf_conn):
                 help="Upload CSV, Excel, or PSV (Pipe-separated) files",
                 key="schema_validation_upload"
             )
-            
+
             if uploaded_file and validate_file_upload(uploaded_file):
                 loaded_data = load_data_file(uploaded_file)
                 st.session_state.schema_validation_data = loaded_data
                 validation_data = loaded_data
-        
+                if loaded_data is not None and register_source_file:
+                    register_source_file(
+                        uploaded_file, uploaded_file.name,
+                        org_name=st.session_state.get('current_org', 'unknown'),
+                        object_name=selected_object,
+                        row_count=len(loaded_data), col_count=len(loaded_data.columns),
+                    )
+
+        elif data_source == "📁 File Library":
+            picked_df, picked_name = (show_file_picker_inline(
+                "schema_validation",
+                org_name=st.session_state.get('current_org'),
+                object_name=selected_object,
+            ) if show_file_picker_inline else (None, None))
+            if picked_df is not None:
+                st.session_state.schema_validation_data = picked_df
+                validation_data = picked_df
+
         elif data_source == "Select Existing File":
             existing_files = get_validation_files(selected_object)
             
@@ -812,7 +866,8 @@ def show_schema_validation(sf_conn):
                         org_name=st.session_state.get('current_org', 'unknown'),
                         object_name=selected_object,
                         csv_columns=csv_columns,
-                        auto_apply=False
+                        auto_apply=False,
+                        key_suffix='_schema_val'
                     )
                     
                     if auto_loaded_mappings and st.session_state.get('use_saved_mappings', False):
@@ -2048,18 +2103,22 @@ def show_genai_validation(sf_conn):
                     if data_hub_available:
                         data_source_option = st.radio(
                             "📊 **Data Source:**",
-                            ["Use Data Hub", "Upload File"],
+                            ["Use Data Hub", "Upload File", "📁 File Library"],
                             key="genai_data_source"
                         )
                     else:
-                        data_source_option = "Upload File"
+                        data_source_option = st.radio(
+                            "📊 **Data Source:**",
+                            ["Upload File", "📁 File Library"],
+                            key="genai_data_source"
+                        )
                     
                     # Initialize session state for SF Validation Rules data
                     if 'genai_validation_data' not in st.session_state:
                         st.session_state.genai_validation_data = None
                     
                     df = st.session_state.genai_validation_data
-                    
+
                     if data_source_option == "Use Data Hub" and data_hub_available:
                         hub_df = select_dataset_from_hub("genai_validation")
                         if hub_df is not None:
@@ -2069,6 +2128,17 @@ def show_genai_validation(sf_conn):
                                 st.success(f"✅ Data loaded from Hub: {len(df)} rows, {len(df.columns)} columns")
                                 with st.expander("📊 Data Preview", expanded=False):
                                     st.dataframe(df.head(10), use_container_width=True)
+
+                    elif data_source_option == "📁 File Library":
+                        picked_df, picked_name = (show_file_picker_inline(
+                            "genai_validation",
+                            org_name=st.session_state.get('current_org'),
+                            object_name=selected_object,
+                        ) if show_file_picker_inline else (None, None))
+                        if picked_df is not None:
+                            df = picked_df
+                            st.session_state.genai_validation_data = df
+
                     else:
                         uploaded_file = st.file_uploader(
                             "📁 **Choose your data file:**",
@@ -2076,13 +2146,20 @@ def show_genai_validation(sf_conn):
                             key="genai_data_upload",
                             help="Upload CSV, Excel, or PSV (Pipe-separated) files containing the data to validate"
                         )
-                        
+
                         if uploaded_file is not None:
                             df = load_data_file(uploaded_file)
                             if df is not None:
                                 st.session_state.genai_validation_data = df
+                                if register_source_file:
+                                    register_source_file(
+                                        uploaded_file, uploaded_file.name,
+                                        org_name=st.session_state.get('current_org', 'unknown'),
+                                        object_name=selected_object,
+                                        row_count=len(df), col_count=len(df.columns),
+                                    )
                                 st.success(f"✅ Successfully loaded {len(df)} records from {uploaded_file.name}")
-                                
+
                                 # Show data preview
                                 with st.expander("📊 Data Preview", expanded=False):
                                     st.markdown(f"**File:** {uploaded_file.name}")
@@ -2137,7 +2214,8 @@ def show_genai_validation(sf_conn):
                                         org_name=st.session_state.get('current_org', 'unknown'),
                                         object_name=selected_object,
                                         csv_columns=csv_columns,
-                                        auto_apply=False
+                                        auto_apply=False,
+                                        key_suffix='_genai_val'
                                     )
                                     
                                     if auto_loaded_mappings and st.session_state.get('use_saved_mappings', False):
@@ -8566,14 +8644,18 @@ def show_enhanced_validation(sf_conn):
     if data_hub_available:
         source_choice = st.radio(
             "📊 **Data Source:**",
-            ["Use Data Hub", "Upload File"],
+            ["Use Data Hub", "Upload File", "📁 File Library"],
             key="enhanced_validation_source_choice",
             horizontal=True
         )
     else:
-        source_choice = "Upload File"
-        st.info("💡 No data in Data Hub. Upload a file below or load data in the 📊 Data Hub tab first.")
-    
+        source_choice = st.radio(
+            "📊 **Data Source:**",
+            ["Upload File", "📁 File Library"],
+            key="enhanced_validation_source_choice",
+            horizontal=True
+        )
+
     if source_choice == "Use Data Hub":
         hub_df = select_dataset_from_hub("enhanced_validation")
         if hub_df is not None:
@@ -8584,21 +8666,39 @@ def show_enhanced_validation(sf_conn):
                 st.success(f"✅ **Data loaded from Hub!** {len(hub_df)} rows, {len(hub_df.columns)} columns")
                 with st.expander("📊 Data Preview", expanded=False):
                     st.dataframe(hub_df.head(10), use_container_width=True)
-        
+
         # Use data from session state if previously loaded
         if st.session_state.enhanced_validation_data is not None:
             data_source = st.session_state.enhanced_validation_source
             df_original = st.session_state.enhanced_validation_data
         else:
             return
+
+    elif source_choice == "📁 File Library":
+        picked_df, picked_name = (show_file_picker_inline(
+            "enhanced_validation",
+            org_name=st.session_state.get('current_org'),
+        ) if show_file_picker_inline else (None, None))
+        if picked_df is not None:
+            st.session_state.enhanced_validation_data = picked_df
+            st.session_state.enhanced_validation_source = "upload"
+            st.session_state.enhanced_validation_object = None
+            df_original = picked_df
+            data_source = "upload"
+        elif st.session_state.enhanced_validation_data is not None:
+            data_source = st.session_state.enhanced_validation_source
+            df_original = st.session_state.enhanced_validation_data
+        else:
+            return
+
     else:
         data_source = "upload"
         if st.session_state.enhanced_validation_data is not None and st.session_state.enhanced_validation_source == "upload":
             data_source = "upload"
             df_original = st.session_state.enhanced_validation_data
-    
-    # File upload (if user chooses or no data yet)
-    if data_source == "upload" or st.session_state.enhanced_validation_data is None:
+
+    # File upload (if user chooses Upload File and no data yet)
+    if source_choice == "Upload File" and (data_source == "upload" or st.session_state.enhanced_validation_data is None):
         st.write("**Upload a File:**")
         uploaded_file = st.file_uploader(
             "Choose a CSV, Excel, or PSV file",
@@ -8624,16 +8724,25 @@ def show_enhanced_validation(sf_conn):
             if loaded_data.empty:
                 st.error("❌ The uploaded file is empty. Please upload a file with data.")
                 return
-            
+
             # Store in session state (PERSISTENCE FIX)
             st.session_state.enhanced_validation_data = loaded_data
             st.session_state.enhanced_validation_source = "upload"
             st.session_state.enhanced_validation_object = None  # Reset object selection
             df_original = loaded_data
             data_source = "upload"
-            
+
+            # Auto-register in File Library
+            if register_source_file:
+                register_source_file(
+                    uploaded_file, uploaded_file.name,
+                    org_name=st.session_state.get('current_org', 'unknown'),
+                    object_name='',
+                    row_count=len(loaded_data), col_count=len(loaded_data.columns),
+                )
+
             st.success(f"✅ **Data loaded successfully!** {len(loaded_data)} rows, {len(loaded_data.columns)} columns")
-            
+
             # Show data preview
             with st.expander("📊 Data Preview", expanded=False):
                 st.dataframe(loaded_data.head(10), use_container_width=True)
@@ -8740,7 +8849,8 @@ def show_enhanced_validation(sf_conn):
                 org_name=st.session_state.get('current_org', 'unknown'),
                 object_name=selected_object,
                 csv_columns=csv_columns,
-                auto_apply=False
+                auto_apply=False,
+                key_suffix='_enhanced_val'
             )
             
             if auto_loaded_mappings and st.session_state.get('use_saved_mappings', False):

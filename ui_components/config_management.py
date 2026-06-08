@@ -245,17 +245,32 @@ def show_database_settings(credentials: Dict):
                 )
             
             with col2:
+                # Auto-detect installed SQL Server drivers
+                try:
+                    import pyodbc as _pyodbc
+                    installed_sql_drivers = [
+                        d for d in _pyodbc.drivers()
+                        if 'sql server' in d.lower() or 'sql native' in d.lower()
+                    ]
+                except Exception:
+                    installed_sql_drivers = []
+
+                driver_options = ["Auto-detect (recommended)"] + installed_sql_drivers + [
+                    "{ODBC Driver 18 for SQL Server}",
+                    "{ODBC Driver 17 for SQL Server}",
+                    "{ODBC Driver 13 for SQL Server}",
+                    "{SQL Server}",
+                    "{SQL Server Native Client 11.0}"
+                ]
+                # Remove duplicates while preserving order
+                seen = set()
+                driver_options = [x for x in driver_options if not (x in seen or seen.add(x))]
+
                 driver = st.selectbox(
-                    "ODBC Driver*", 
-                    [
-                        "{ODBC Driver 17 for SQL Server}",
-                        "{ODBC Driver 18 for SQL Server}",
-                        "{ODBC Driver 13 for SQL Server}",
-                        "{SQL Server}",
-                        "{SQL Server Native Client 11.0}"
-                    ],
+                    "ODBC Driver (optional)",
+                    driver_options,
                     index=0,
-                    help="Select the ODBC driver installed on your system"
+                    help="Auto-detect will pick the best available driver on this machine. You can also choose manually."
                 )
                 
                 encrypt = st.selectbox(
@@ -583,19 +598,51 @@ def show_system_settings():
         else:
             st.error("❌ Failed to save settings")
 
+def _resolve_driver(driver_setting: str) -> str:
+    """
+    Resolve driver string. If 'Auto-detect', pick the best installed SQL Server driver.
+    Priority: ODBC 18 > 17 > 13 > Native Client > SQL Server
+    """
+    if driver_setting and driver_setting != 'Auto-detect (recommended)':
+        return driver_setting
+    try:
+        import pyodbc
+        installed = [d for d in pyodbc.drivers() if 'sql server' in d.lower() or 'sql native' in d.lower()]
+        priority = [
+            'ODBC Driver 18 for SQL Server',
+            'ODBC Driver 17 for SQL Server',
+            'ODBC Driver 13 for SQL Server',
+            'SQL Server Native Client 11.0',
+            'SQL Server',
+        ]
+        for preferred in priority:
+            for d in installed:
+                if preferred.lower() in d.lower():
+                    return '{' + d + '}' if not d.startswith('{') else d
+        if installed:
+            d = installed[0]
+            return '{' + d + '}' if not d.startswith('{') else d
+    except Exception:
+        pass
+    return '{ODBC Driver 17 for SQL Server}'
+
+
 def test_database_connection(db_config: Dict, db_name: str):
     """Test database connection with enhanced feedback"""
     try:
         import pyodbc
         
         with st.spinner(f"Testing connection to {db_name.replace('sql_', '')}..."):
+            # Resolve driver (handles Auto-detect)
+            resolved_driver = _resolve_driver(db_config.get('driver', 'Auto-detect (recommended)'))
+
             # Build connection string
-            connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']};DATABASE={db_config['database']}"
-            
+            connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']};DATABASE={db_config['database']}"
+
             # Add port if specified
             if db_config.get('port') and db_config.get('port') != '1433':
                 if '\\' not in db_config['server']:  # Only add port if not using named instance
-                    connection_string = f"DRIVER={db_config['driver']};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
+                    connection_string = f"DRIVER={resolved_driver};SERVER={db_config['server']},{db_config['port']};DATABASE={db_config['database']}"
             
             # Add authentication
             if db_config.get('Trusted_Connection') == 'yes':
@@ -604,16 +651,21 @@ def test_database_connection(db_config: Dict, db_name: str):
                 connection_string += f";UID={db_config['username']};PWD={db_config['password']}"
             
             # Add encryption settings
-            if db_config.get('encrypt'):
-                connection_string += f";Encrypt={db_config['encrypt']}"
-            
-            if db_config.get('trust_server_cert'):
+            encrypt_val = db_config.get('encrypt', 'no')
+            if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+                connection_string += f";Encrypt={encrypt_val}"
+
+            # TrustServerCertificate: respect explicit setting OR auto-enable for Azure SQL with older drivers
+            trust_cert = db_config.get('trust_server_cert', False)
+            is_azure = '.database.windows.net' in db_config.get('server', '')
+            older_driver = any(d in db_config.get('driver', '') for d in ['13', '11', 'Native', 'SQL Server}'])
+            if trust_cert or (is_azure and older_driver):
                 connection_string += ";TrustServerCertificate=yes"
-            
+
             # Add timeout
             if db_config.get('connection_timeout'):
                 connection_string += f";Connection Timeout={db_config['connection_timeout']}"
-            
+
             # Add application name
             if db_config.get('application_name'):
                 connection_string += f";APP={db_config['application_name']}"
@@ -623,7 +675,7 @@ def test_database_connection(db_config: Dict, db_name: str):
                 cursor = conn.cursor()
                 
                 # Test basic query
-                cursor.execute("SELECT @@VERSION as sql_version, DB_NAME() as current_db, SYSTEM_USER as current_user")
+                cursor.execute("SELECT @@VERSION as sql_version, DB_NAME() as current_db, SYSTEM_USER as connected_user")
                 result = cursor.fetchone()
                 
                 if result:
@@ -634,7 +686,7 @@ def test_database_connection(db_config: Dict, db_name: str):
                     
                     with col1:
                         st.info(f"**Database:** {result.current_db}")
-                        st.info(f"**Connected User:** {result.current_user}")
+                        st.info(f"**Connected User:** {result.connected_user}")
                     
                     with col2:
                         # Get table count
@@ -667,17 +719,26 @@ def test_database_connection(db_config: Dict, db_name: str):
         """)
     except pyodbc.Error as e:
         st.error(f"❌ **Database connection failed**")
-        
+
         # Parse error for better user guidance
+        # NOTE: checks must come BEFORE the driver check because pyodbc always
+        # embeds the driver name in the error text, e.g. "[ODBC Driver 18 for SQL Server]"
+        # which would make "driver" in error_msg match every single error.
         error_msg = str(e)
-        if "Login failed" in error_msg:
+        st.code(error_msg, language="text")  # Always show full error for diagnosis
+
+        if "40615" in error_msg or "IP address" in error_msg:
+            st.warning("🔥 **Firewall Issue:** Your IP is not whitelisted on the Azure SQL Server. Add it in Azure Portal → SQL Server → Networking → Firewall rules.")
+        elif "SSL" in error_msg or "certificate" in error_msg.lower() or "TLS" in error_msg:
+            st.warning("🔒 **SSL Issue:** Enable 'Trust Server Certificate' in Advanced Settings and retry.")
+        elif "Login failed" in error_msg:
             st.warning("🔐 **Authentication Issue:** Check username and password")
-        elif "server was not found" in error_msg:
-            st.warning("🌐 **Server Issue:** Check server address and port")
+        elif "server was not found" in error_msg or "network-related" in error_msg:
+            st.warning("🌐 **Server Issue:** Check server address and network connectivity")
         elif "database" in error_msg.lower() and "does not exist" in error_msg.lower():
             st.warning("🗄️ **Database Issue:** Check database name")
-        elif "driver" in error_msg.lower():
-            st.warning("🔧 **Driver Issue:** Check if the selected ODBC driver is installed")
+        elif "IM002" in error_msg or "data source name not found" in error_msg.lower():
+            st.warning("🔧 **Driver Issue:** The selected ODBC driver is not installed on this machine.")
         else:
             st.warning(f"**Error Details:** {error_msg}")
             

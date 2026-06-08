@@ -29,18 +29,6 @@
     "security_token": "nUHynabsg1wfKFNsBPOpcalF0",
     "domain": "test"
   },
-  "KBT_Europe_DEV": {
-    "username": "datamigrationengine@tavant.kubotaeudev.com",
-    "password": "R@kesh@0266M",
-    "security_token": "s6XC598jPKBg8hJRVGNuIRAl",
-    "domain": "test"
-  },
-  "Tav": {
-    "username": "datamigrationengine@tavant.kubotaeudev.com",
-    "password": "R@kesh@0266M",
-    "security_token": "",
-    "domain": "login"
-  },
   "ValmontQA": {
     "username": "epparlanarayana.chowdhary@valmont.com.vrmqa",
     "password": "Tavant@12345",
@@ -69,6 +57,28 @@
     "username": "manish.kohale@tavant.com.hdiprod.hdidevspt",
     "password": "Manish@hdiprod1",
     "security_token": "1DAqWwa9XOWXS1Ugl6tK9Jtk",
+    "domain": "test"
+  },
+  "sql_SQL Server": {
+    "server": "sqlsrvtmapthermokingdev.database.windows.net",
+    "database": "sqlsbtmaptkdevstg",
+    "driver": "ODBC Driver 18 for SQL Server",
+    "port": "",
+    "encrypt": "yes",
+    "trust_server_cert": false,
+    "connection_timeout": 30,
+    "application_name": "DM_Toolkit",
+    "mars_connection": false,
+    "command_timeout": 300,
+    "auto_commit": true,
+    "username": "tkdevuser",
+    "password": "Pass@word1",
+    "Trusted_Connection": "no"
+  },
+  "ContractorTraneTechnology_shivaram": {
+    "username": "sivaram.prasadd@contractor.tranetechnologies.com.fcqa",
+    "password": "June2026@1209",
+    "security_token": "ZiThfBVnjNBnHKIOOKRzb0Ui",
     "domain": "test"
   }
 }

@@ -157,7 +157,8 @@ def show_managed_mappings(org_name: str):
 
 
 def auto_load_mapping(org_name: str, object_name: str, 
-                      csv_columns: list, auto_apply: bool = False) -> Optional[Dict[str, str]]:
+                      csv_columns: list, auto_apply: bool = False,
+                      key_suffix: str = '') -> Optional[Dict[str, str]]:
     """
     Automatically check for and load saved mappings for an object
     Shows UI to apply saved mappings or create new ones
@@ -167,6 +168,9 @@ def auto_load_mapping(org_name: str, object_name: str,
         object_name: Salesforce object name
         csv_columns: List of CSV columns
         auto_apply: Whether to automatically apply saved mappings without asking
+        key_suffix: Extra string appended to Streamlit widget keys to avoid
+                    duplicate-key errors when this function is called from
+                    multiple places in the same page render.
     
     Returns:
         Dictionary of field mappings or None
@@ -195,13 +199,13 @@ def auto_load_mapping(org_name: str, object_name: str,
         col1, col2 = st.columns(2)
         with col1:
             if st.button("✅ Use Saved Mappings", type="primary", 
-                        key=f"use_saved_mappings_{org_name}_{object_name}"):
+                        key=f"use_saved_mappings_{org_name}_{object_name}{key_suffix}"):
                 st.session_state.use_saved_mappings = True
                 return field_mappings
         
         with col2:
             if st.button("🔄 Create New Mappings",
-                        key=f"create_new_mappings_{org_name}_{object_name}"):
+                        key=f"create_new_mappings_{org_name}_{object_name}{key_suffix}"):
                 st.session_state.use_saved_mappings = False
                 return None
     
@@ -212,7 +216,7 @@ def auto_load_mapping(org_name: str, object_name: str,
         st.info("These columns were not in the previous mapping. You can map them now or use partial saved mappings.")
         
         if st.button("📥 Partially Apply Saved Mappings",
-                    key=f"partial_apply_mappings_{org_name}_{object_name}"):
+                    key=f"partial_apply_mappings_{org_name}_{object_name}{key_suffix}"):
             return field_mappings
     
     else:
