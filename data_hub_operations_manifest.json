@@ -4951,7 +4951,43 @@
       "validation_failed": 0,
       "created_by": "Unknown",
       "notes": "Migration from ValmontQA to ValmontUAT. Details: {'migration_operation': 'INSERT', 'batch_size': 500, 'max_records': 10000, 'where_filter': 'tvnt__Parent_Question_Association__c<>null', 'field_mappings_count': 10, 'lookup_configs_count': 4, 'main_match_strategy': 'field_combination', 'main_match_fields': ['Name']}"
+    },
+    {
+      "operation_id": "OP-20260609163037",
+      "timestamp": "2026-06-09T16:30:37.019682",
+      "operation_type": "Validation_Check_Schema",
+      "source_org": "ValmontUAT",
+      "target_org": null,
+      "object_name": "WOD_2__Claim__c",
+      "record_count": 1393,
+      "status": "COMPLETE",
+      "data_location": "data_hub_operations/OP-20260609163037_WOD_2__Claim__c.csv",
+      "query": null,
+      "file_uploaded": null,
+      "validation_status": "PASSED",
+      "validation_passed": 1393,
+      "validation_failed": 0,
+      "created_by": "Unknown",
+      "notes": "Validation Type: Schema. Details: {'validation_options': ['Required Fields', 'Data Types', 'Picklist Values'], 'checks_performed': ['required_fields', 'data_types', 'picklist_values'], 'source_org': 'ValmontQA'}"
+    },
+    {
+      "operation_id": "OP-20260609163056",
+      "timestamp": "2026-06-09T16:30:56.493929",
+      "operation_type": "Validation_Check_Business_Rules",
+      "source_org": "ValmontUAT",
+      "target_org": null,
+      "object_name": "WOD_2__Claim__c",
+      "record_count": 1393,
+      "status": "COMPLETE",
+      "data_location": "data_hub_operations/OP-20260609163056_WOD_2__Claim__c.csv",
+      "query": null,
+      "file_uploaded": null,
+      "validation_status": "PASSED",
+      "validation_passed": 1393,
+      "validation_failed": 0,
+      "created_by": "Unknown",
+      "notes": "Validation Type: Business_Rules. Details: {'custom_rules_passed': 1393, 'custom_rules_failed': 0, 'salesforce_rules_checked': True, 'source_org': 'ValmontQA', 'rules_config': {}}"
     }
   ],
-  "last_updated": "2026-04-27T16:38:25.077931"
+  "last_updated": "2026-06-09T16:30:56.493949"
 }

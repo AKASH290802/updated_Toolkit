@@ -3603,35 +3603,673 @@ def load_to_salesforce(sf_conn):
                                           upsert_matching_strategy, upsert_match_fields, upsert_concat_separator)
 
 def show_sql_migration(credentials: Dict):
-    """SQL migration operations"""
+    """SQL Migration — SF→SQL backup and SQL→SF load, with persistent pipeline history."""
     st.subheader("🔄 SQL Migration")
-    st.markdown("Migrate data from Salesforce or files to SQL Server")
-    
-    # SQL connection selection
-    sql_connections = {k: v for k, v in credentials.items() if 'sql' in k.lower()}
-    
-    if not sql_connections:
-        st.warning("⚠️ No SQL Server connections configured.")
-        return
-    
-    target_db = st.selectbox(
-        "Select Target Database",
-        options=[""] + list(sql_connections.keys()),
-        key="sql_migration_target"
-    )
-    
-    if target_db:
-        # Migration source
-        migration_source = st.radio(
-            "Migration Source",
-            ["From Salesforce", "From File"],
-            key="migration_source"
+    st.markdown("Move data between **Salesforce** and **SQL Server** in either direction — with full pipeline history persisted across sessions.")
+
+    # Sub-tabs
+    mig_tab1, mig_tab2 = st.tabs(["🆕 New Pipeline", "📋 Pipeline History"])
+
+    with mig_tab1:
+        _show_new_pipeline(credentials)
+
+    with mig_tab2:
+        _show_pipeline_history()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New Pipeline tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_new_pipeline(credentials: Dict):
+    """Configure and run a new pipeline."""
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        direction = st.radio(
+            "Pipeline Direction",
+            ["⬇️  Salesforce → SQL Server  (Backup / Archive)",
+             "⬆️  SQL Server → Salesforce  (Load / Upsert)"],
+            key="migration_direction"
         )
-        
-        if migration_source == "From Salesforce":
-            migrate_from_salesforce_to_sql(credentials, target_db)
+    with col_d2:
+        st.info("**SF → SQL**: Extract Salesforce records → auto-create table in SQL Server (like ADF Copy Activity).\n\n"
+                "**SQL → SF**: Read SQL table/query → Insert / Update / Upsert into Salesforce.")
+
+    st.divider()
+    if "Salesforce → SQL" in direction:
+        _pipeline_sf_to_sql(credentials)
+    else:
+        _pipeline_sql_to_sf(credentials)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction 1: Salesforce → SQL Server (Backup)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pipeline_sf_to_sql(credentials: Dict):
+    """Salesforce → SQL Server backup pipeline."""
+    st.markdown("### ⬇️ Salesforce → SQL Server")
+
+    # ── Source: Salesforce ──────────────────────────────────────────────────
+    st.markdown("#### 1. Source — Salesforce")
+    sf_orgs = [k for k, v in credentials.items() if 'username' in v and 'sql' not in k.lower()
+               and not any(k.startswith(p) for p in ['oracle_', 'snowflake_', 'pg_'])]
+    if not sf_orgs:
+        st.warning("⚠️ No Salesforce orgs configured. Add one in Configuration → Organizations.")
+        return
+    src_org = st.selectbox("Source Salesforce Org", sf_orgs, key="mig_src_org")
+    sf_object = st.text_input("Salesforce Object API Name", placeholder="e.g. Account, Contact, Opportunity__c",
+                               key="mig_sf_object")
+
+    filter_mode = st.radio("Record Filter", ["All Records", "Custom WHERE clause", "SOQL Query (full)"],
+                           horizontal=True, key="mig_filter_mode")
+    soql_where = ""
+    full_soql = ""
+    if filter_mode == "Custom WHERE clause":
+        soql_where = st.text_input("WHERE clause (without the WHERE keyword)",
+                                   placeholder="CreatedDate = LAST_N_DAYS:30 AND IsDeleted = false",
+                                   key="mig_where")
+        st.caption("e.g. `CreatedDate = LAST_N_DAYS:30` — toolkit will prepend SELECT fields FROM Object WHERE …")
+    elif filter_mode == "SOQL Query (full)":
+        full_soql = st.text_area("Full SOQL Query", placeholder="SELECT Id, Name FROM Account WHERE Industry = 'Technology'",
+                                  key="mig_soql", height=80)
+
+    field_mode = st.radio("Fields to Extract", ["All Fields", "Select Specific Fields"], horizontal=True, key="mig_field_mode")
+    selected_fields_input = ""
+    if field_mode == "Select Specific Fields":
+        selected_fields_input = st.text_input("Field API Names (comma-separated)", placeholder="Id, Name, Industry, AnnualRevenue",
+                                               key="mig_fields_input")
+
+    # ── Target: SQL Server ───────────────────────────────────────────────────
+    st.markdown("#### 2. Target — SQL Server")
+    sql_connections = {k: v for k, v in credentials.items() if k.lower().startswith('sql_')}
+    if not sql_connections:
+        st.warning("⚠️ No SQL Server connections configured. Add one in Configuration → Source Connections.")
+        return
+    tgt_db = st.selectbox("Target SQL Server Connection", list(sql_connections.keys()), key="mig_tgt_db")
+    db_cfg = sql_connections[tgt_db]
+
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        default_table = f"SF_{sf_object.replace('__c','').replace('__','_')}_{pd.Timestamp.now().strftime('%Y%m%d')}" if sf_object else "SF_Backup"
+        table_name = st.text_input("Target Table Name", value=default_table, key="mig_table_name",
+                                   help="Table will be created automatically if it does not exist")
+        schema_name = st.text_input("Schema", value="dbo", key="mig_schema")
+    with col_t2:
+        if_exists = st.selectbox("If Table Already Exists", ["Auto-create (new name)", "Append rows", "Replace (truncate+load)", "Fail with error"],
+                                  key="mig_if_exists")
+        batch_size_sf = st.number_input("Fetch Batch Size (SOQL)", min_value=200, max_value=2000, value=2000, step=200, key="mig_batch_sf")
+
+    pipeline_name = st.text_input("Pipeline Name (optional)",
+                                   value=f"{src_org}→{tgt_db.replace('sql_','')}_{sf_object}",
+                                   key="mig_pipeline_name_sf")
+
+    st.divider()
+    if st.button("▶️ Run SF → SQL Pipeline", type="primary", key="run_sf_sql_btn"):
+        if not sf_object:
+            st.error("❌ Please enter the Salesforce object API name"); return
+        _execute_sf_to_sql(credentials, src_org, sf_object, filter_mode, soql_where, full_soql,
+                            field_mode, selected_fields_input, db_cfg, tgt_db, table_name,
+                            schema_name, if_exists, batch_size_sf, pipeline_name)
+
+
+def _execute_sf_to_sql(credentials, src_org, sf_object, filter_mode, soql_where, full_soql,
+                        field_mode, selected_fields_input, db_cfg, tgt_db, table_name,
+                        schema_name, if_exists, batch_size_sf, pipeline_name):
+    """Execute the SF → SQL pipeline and persist the run."""
+    from datetime import datetime as _dt
+    try:
+        from ui_components.file_store_manager import save_pipeline_run, update_pipeline_run
+    except ImportError:
+        from file_store_manager import save_pipeline_run, update_pipeline_run
+
+    started_at = _dt.now().isoformat()
+    run_id = save_pipeline_run(
+        pipeline_name=pipeline_name,
+        direction="SF→SQL",
+        source_label=f"{src_org} / {sf_object}",
+        target_label=f"{tgt_db} / {schema_name}.{table_name}",
+        object_name=sf_object,
+        table_name=f"{schema_name}.{table_name}",
+        operation="Backup",
+        status="running",
+        records_success=0, records_failed=0, error_message="",
+        config_dict={
+            "src_org": src_org, "sf_object": sf_object,
+            "filter_mode": filter_mode, "soql_where": soql_where, "full_soql": full_soql,
+            "field_mode": field_mode, "selected_fields": selected_fields_input,
+            "tgt_db": tgt_db, "table_name": table_name, "schema_name": schema_name,
+            "if_exists": if_exists, "batch_size": batch_size_sf,
+        },
+        started_at=started_at
+    )
+
+    progress = st.progress(0, text="Starting pipeline…")
+    status_box = st.empty()
+    try:
+        # Step 1 — Connect to Salesforce
+        status_box.info("🔗 Step 1/5 — Connecting to Salesforce…")
+        sf_conn = establish_sf_connection(credentials, src_org)
+        if not sf_conn:
+            raise RuntimeError("Failed to establish Salesforce connection")
+        progress.progress(10, text="Connected to Salesforce")
+
+        # Step 2 — Discover fields
+        status_box.info("🔍 Step 2/5 — Discovering object fields…")
+        obj_desc = getattr(sf_conn, sf_object).describe()
+        all_field_names = [f['name'] for f in obj_desc['fields'] if f.get('type') not in ('address', 'location')]
+
+        if field_mode == "Select Specific Fields" and selected_fields_input.strip():
+            chosen = [f.strip() for f in selected_fields_input.split(',') if f.strip()]
+            # Always include Id
+            if 'Id' not in chosen:
+                chosen.insert(0, 'Id')
+            fields_to_fetch = [f for f in chosen if f in all_field_names]
+            unknown = [f for f in chosen if f not in all_field_names]
+            if unknown:
+                st.warning(f"⚠️ Unrecognised fields skipped: {', '.join(unknown)}")
         else:
-            migrate_from_file_to_sql(credentials, target_db)
+            fields_to_fetch = all_field_names
+        progress.progress(20, text=f"Found {len(fields_to_fetch)} fields")
+
+        # Step 3 — Build and execute SOQL
+        status_box.info("📋 Step 3/5 — Extracting records from Salesforce…")
+        if filter_mode == "SOQL Query (full)" and full_soql.strip():
+            soql = full_soql.strip()
+        else:
+            field_list = ', '.join(fields_to_fetch)
+            soql = f"SELECT {field_list} FROM {sf_object}"
+            if filter_mode == "Custom WHERE clause" and soql_where.strip():
+                soql += f" WHERE {soql_where.strip()}"
+
+        all_records = []
+        result = sf_conn.query(soql)
+        while True:
+            batch = result.get('records', [])
+            # Strip SF metadata from each record
+            for rec in batch:
+                rec.pop('attributes', None)
+            all_records.extend(batch)
+            if result.get('done', True):
+                break
+            result = sf_conn.query_more(result['nextRecordsUrl'], identifier_is_url=True)
+
+        if not all_records:
+            status_box.warning("⚠️ No records returned by the SOQL query. Nothing to load.")
+            update_pipeline_run(run_id, "success", 0, 0, "No records returned", _dt.now().isoformat())
+            progress.progress(100, text="Complete — 0 records")
+            return
+
+        df = pd.DataFrame(all_records)
+        progress.progress(50, text=f"Fetched {len(df):,} records")
+
+        # Step 4 — Connect to SQL and auto-create table
+        status_box.info("🗄️ Step 4/5 — Writing to SQL Server…")
+        try:
+            import pyodbc
+            from sqlalchemy import create_engine, text as sa_text
+            import urllib.parse
+            from ui_components.config_management import _resolve_driver
+        except ImportError:
+            from config_management import _resolve_driver
+
+        resolved_driver = _resolve_driver(db_cfg.get('driver', 'Auto-detect (recommended)'))
+        cs = f"DRIVER={resolved_driver};SERVER={db_cfg['server']};DATABASE={db_cfg['database']}"
+        if db_cfg.get('port') and db_cfg.get('port') != '1433':
+            if '\\' not in db_cfg['server']:
+                cs = f"DRIVER={resolved_driver};SERVER={db_cfg['server']},{db_cfg['port']};DATABASE={db_cfg['database']}"
+        if db_cfg.get('Trusted_Connection') == 'yes':
+            cs += ";Trusted_Connection=yes"
+        else:
+            cs += f";UID={db_cfg['username']};PWD={db_cfg['password']}"
+        encrypt_val = db_cfg.get('encrypt', 'no')
+        if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+            cs += f";Encrypt={encrypt_val}"
+        if db_cfg.get('trust_server_cert', False):
+            cs += ";TrustServerCertificate=yes"
+
+        engine = create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(cs)}", echo=False)
+
+        # Resolve if-exists mode
+        final_table = table_name
+        with engine.connect() as conn_sql:
+            exists_result = conn_sql.execute(sa_text(
+                f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='{schema_name}' AND TABLE_NAME='{table_name}'"
+            ))
+            table_exists = exists_result.fetchone()[0] > 0
+
+        if table_exists:
+            if if_exists == "Auto-create (new name)":
+                final_table = f"{table_name}_{pd.Timestamp.now().strftime('%H%M%S')}"
+                st.info(f"ℹ️ Table `{table_name}` already exists — creating `{final_table}` instead")
+                pandas_if_exists = 'fail'
+            elif if_exists == "Append rows":
+                pandas_if_exists = 'append'
+            elif if_exists == "Replace (truncate+load)":
+                pandas_if_exists = 'replace'
+            else:
+                raise RuntimeError(f"Table [{schema_name}].[{table_name}] already exists. Change the 'If Table Exists' setting.")
+        else:
+            pandas_if_exists = 'fail'
+
+        # Write in chunks
+        chunk = 1000
+        total = len(df)
+        for i in range(0, total, chunk):
+            df.iloc[i:i+chunk].to_sql(
+                name=final_table, con=engine, schema=schema_name,
+                if_exists=pandas_if_exists if i == 0 else 'append',
+                index=False, method='multi'
+            )
+            pct = min(50 + int(40 * (i + chunk) / total), 90)
+            progress.progress(pct, text=f"Inserted {min(i+chunk, total):,} / {total:,} rows…")
+
+        progress.progress(100, text="Complete ✅")
+
+        # Step 5 — Done
+        finished_at = _dt.now().isoformat()
+        update_pipeline_run(run_id, "success", total, 0, "", finished_at)
+        full_tname = f"[{schema_name}].[{final_table}]"
+        status_box.success(f"✅ **Pipeline complete** — {total:,} records written to `{full_tname}`")
+        st.balloons()
+
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.metric("Records Written", f"{total:,}")
+            st.metric("Table", full_tname)
+        with col_r2:
+            st.metric("SQL Server", db_cfg.get('server', 'N/A'))
+            st.metric("Database", db_cfg.get('database', 'N/A'))
+
+        st.code(f"SELECT TOP 100 * FROM {full_tname}", language="sql")
+        st.caption("Copy the query above and paste it into SSMS to view your data.")
+
+    except Exception as e:
+        err_msg = str(e)
+        update_pipeline_run(run_id, "failed", 0, 0, err_msg, _dt.now().isoformat())
+        progress.progress(100, text="Failed ❌")
+        status_box.error(f"❌ **Pipeline failed:** {err_msg}")
+        st.code(err_msg, language="text")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction 2: SQL Server → Salesforce (Load/Upsert)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pipeline_sql_to_sf(credentials: Dict):
+    """SQL Server → Salesforce load pipeline."""
+    st.markdown("### ⬆️ SQL Server → Salesforce")
+
+    # ── Source: SQL Server ───────────────────────────────────────────────────
+    st.markdown("#### 1. Source — SQL Server")
+    sql_connections = {k: v for k, v in credentials.items() if k.lower().startswith('sql_')}
+    if not sql_connections:
+        st.warning("⚠️ No SQL Server connections configured. Add one in Configuration → Source Connections.")
+        return
+    src_db = st.selectbox("Source SQL Server Connection", list(sql_connections.keys()), key="mig_sql_src")
+    db_cfg = sql_connections[src_db]
+
+    query_mode = st.radio("Data Source", ["Table Name", "Custom SQL Query"], horizontal=True, key="mig_query_mode")
+    sql_query = ""
+    if query_mode == "Table Name":
+        schema_src = st.text_input("Schema", value="dbo", key="mig_src_schema")
+        sql_table_src = st.text_input("Table Name", placeholder="e.g. Account_Backup_20240601", key="mig_src_table")
+        if schema_src and sql_table_src:
+            sql_query = f"SELECT * FROM [{schema_src}].[{sql_table_src}]"
+    else:
+        sql_query = st.text_area("SQL Query", placeholder="SELECT Id, Name, Industry FROM [dbo].[AccountBackup]",
+                                  key="mig_src_query", height=80)
+
+    preview_clicked = st.button("👁️ Preview First 5 Rows", key="mig_preview_btn")
+    df_preview = st.session_state.get('mig_preview_df')
+
+    if preview_clicked and sql_query.strip():
+        with st.spinner("Fetching preview…"):
+            try:
+                df_preview = _sql_query_to_df(db_cfg, sql_query + " " if "TOP" not in sql_query.upper() else sql_query)
+                # Only take first 5 for preview
+                df_preview_show = df_preview.head(5)
+                st.session_state['mig_preview_df'] = df_preview
+                st.session_state['mig_preview_cols'] = list(df_preview.columns)
+                st.dataframe(df_preview_show, use_container_width=True)
+                st.caption(f"Showing 5 rows. Full dataset has {len(df_preview):,} rows, {len(df_preview.columns)} columns.")
+            except Exception as e:
+                st.error(f"❌ Preview failed: {str(e)}")
+
+    # ── Target: Salesforce ───────────────────────────────────────────────────
+    st.markdown("#### 2. Target — Salesforce")
+    sf_orgs = [k for k, v in credentials.items() if 'username' in v and 'sql' not in k.lower()
+               and not any(k.startswith(p) for p in ['oracle_', 'snowflake_', 'pg_'])]
+    if not sf_orgs:
+        st.warning("⚠️ No Salesforce orgs configured.")
+        return
+    tgt_org = st.selectbox("Target Salesforce Org", sf_orgs, key="mig_tgt_org")
+    tgt_object = st.text_input("Target Object API Name", placeholder="e.g. Account, Contact, MyObject__c",
+                                key="mig_tgt_object")
+
+    col_op1, col_op2 = st.columns(2)
+    with col_op1:
+        sf_operation = st.selectbox("Operation", ["insert", "update", "upsert"], key="mig_sf_op")
+    with col_op2:
+        ext_id_field = ""
+        if sf_operation == "upsert":
+            ext_id_field = st.text_input("External ID Field (for upsert)", placeholder="e.g. External_Id__c, Id",
+                                          key="mig_ext_id")
+
+    batch_size_load = st.number_input("Batch Size", min_value=1, max_value=200, value=200, key="mig_batch_load",
+                                       help="Max 200 per Salesforce API limit")
+
+    # ── Auto Field Mapping ───────────────────────────────────────────────────
+    st.markdown("#### 3. Field Mapping")
+    preview_cols = st.session_state.get('mig_preview_cols', [])
+
+    if preview_cols and tgt_object:
+        st.info("Auto-mapping detects SQL columns → Salesforce fields by name (case-insensitive). Override any mismatches below.")
+        sf_conn_map = establish_sf_connection(credentials, tgt_org)
+        sf_field_options = ["(skip)"]
+        if sf_conn_map:
+            try:
+                desc = getattr(sf_conn_map, tgt_object).describe()
+                sf_field_options += [f['name'] for f in desc['fields'] if f.get('createable') or f.get('updateable')]
+            except Exception:
+                pass
+
+        sf_field_lower = {f.lower(): f for f in sf_field_options}
+        mapping = {}
+        st.write("**SQL Column → Salesforce Field**")
+        for col in preview_cols:
+            auto_match = sf_field_lower.get(col.lower(), "(skip)")
+            options_ordered = sf_field_options[:]
+            if auto_match in options_ordered:
+                options_ordered.insert(0, options_ordered.pop(options_ordered.index(auto_match)))
+            chosen = st.selectbox(f"`{col}`", options_ordered, key=f"mig_map_{col}")
+            if chosen != "(skip)":
+                mapping[col] = chosen
+        st.session_state['mig_field_mapping'] = mapping
+        st.caption(f"✅ {len(mapping)} columns mapped, {len(preview_cols)-len(mapping)} skipped")
+    elif not preview_cols:
+        st.info("Click **Preview First 5 Rows** above to enable auto field mapping.")
+    else:
+        st.info("Enter the target Salesforce object to enable field mapping.")
+        mapping = {}
+
+    pipeline_name = st.text_input("Pipeline Name (optional)",
+                                   value=f"{src_db.replace('sql_','')}→{tgt_org}_{tgt_object}",
+                                   key="mig_pipeline_name_sql")
+
+    st.divider()
+    if st.button("▶️ Run SQL → SF Pipeline", type="primary", key="run_sql_sf_btn"):
+        if not sql_query.strip():
+            st.error("❌ Please enter a table name or SQL query"); return
+        if not tgt_object:
+            st.error("❌ Please enter the target Salesforce object"); return
+        if sf_operation == "upsert" and not ext_id_field:
+            st.error("❌ Please enter the External ID field for upsert"); return
+        mapping = st.session_state.get('mig_field_mapping', {})
+        if not mapping:
+            st.error("❌ No field mappings defined. Use Preview to auto-map fields first."); return
+        _execute_sql_to_sf(credentials, db_cfg, src_db, sql_query, tgt_org, tgt_object,
+                            sf_operation, ext_id_field, mapping, batch_size_load, pipeline_name)
+
+
+def _sql_query_to_df(db_cfg: dict, query: str) -> pd.DataFrame:
+    """Execute a SQL query and return a DataFrame."""
+    from sqlalchemy import create_engine, text as sa_text
+    import urllib.parse
+    try:
+        from ui_components.config_management import _resolve_driver
+    except ImportError:
+        from config_management import _resolve_driver
+
+    resolved_driver = _resolve_driver(db_cfg.get('driver', 'Auto-detect (recommended)'))
+    cs = f"DRIVER={resolved_driver};SERVER={db_cfg['server']};DATABASE={db_cfg['database']}"
+    if db_cfg.get('port') and db_cfg.get('port') != '1433':
+        if '\\' not in db_cfg['server']:
+            cs = f"DRIVER={resolved_driver};SERVER={db_cfg['server']},{db_cfg['port']};DATABASE={db_cfg['database']}"
+    if db_cfg.get('Trusted_Connection') == 'yes':
+        cs += ";Trusted_Connection=yes"
+    else:
+        cs += f";UID={db_cfg['username']};PWD={db_cfg['password']}"
+    encrypt_val = db_cfg.get('encrypt', 'no')
+    if encrypt_val and str(encrypt_val).lower() not in ('no', 'false', ''):
+        cs += f";Encrypt={encrypt_val}"
+    if db_cfg.get('trust_server_cert', False):
+        cs += ";TrustServerCertificate=yes"
+    engine = create_engine(f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(cs)}", echo=False)
+    with engine.connect() as conn_sql:
+        return pd.read_sql(sa_text(query), conn_sql)
+
+
+def _execute_sql_to_sf(credentials, db_cfg, src_db, sql_query, tgt_org, tgt_object,
+                        sf_operation, ext_id_field, mapping, batch_size_load, pipeline_name):
+    """Execute the SQL → SF pipeline and persist the run."""
+    from datetime import datetime as _dt
+    try:
+        from ui_components.file_store_manager import save_pipeline_run, update_pipeline_run, register_output_file
+    except ImportError:
+        from file_store_manager import save_pipeline_run, update_pipeline_run, register_output_file
+
+    started_at = _dt.now().isoformat()
+    run_id = save_pipeline_run(
+        pipeline_name=pipeline_name,
+        direction="SQL→SF",
+        source_label=f"{src_db} / query",
+        target_label=f"{tgt_org} / {tgt_object}",
+        object_name=tgt_object,
+        table_name="",
+        operation=sf_operation,
+        status="running",
+        records_success=0, records_failed=0, error_message="",
+        config_dict={
+            "src_db": src_db, "sql_query": sql_query,
+            "tgt_org": tgt_org, "tgt_object": tgt_object,
+            "operation": sf_operation, "ext_id_field": ext_id_field,
+            "mapping": mapping, "batch_size": batch_size_load,
+        },
+        started_at=started_at
+    )
+
+    progress = st.progress(0, text="Starting pipeline…")
+    status_box = st.empty()
+    total_success = 0
+    total_failed = 0
+    error_rows = []
+
+    try:
+        # Step 1 — Read SQL
+        status_box.info("🗄️ Step 1/4 — Reading data from SQL Server…")
+        df = _sql_query_to_df(db_cfg, sql_query)
+        total_rows = len(df)
+        if total_rows == 0:
+            status_box.warning("⚠️ SQL query returned 0 rows. Nothing to load.")
+            update_pipeline_run(run_id, "success", 0, 0, "0 rows from SQL", _dt.now().isoformat())
+            progress.progress(100); return
+        progress.progress(20, text=f"Read {total_rows:,} rows from SQL Server")
+
+        # Step 2 — Connect to Salesforce
+        status_box.info("🔗 Step 2/4 — Connecting to Salesforce…")
+        sf_conn = establish_sf_connection(credentials, tgt_org)
+        if not sf_conn:
+            raise RuntimeError("Failed to establish Salesforce connection")
+        progress.progress(30, text="Connected to Salesforce")
+
+        # Step 3 — Apply mapping and load in batches
+        status_box.info(f"📤 Step 3/4 — Loading to Salesforce ({sf_operation})…")
+        sf_obj = getattr(sf_conn, tgt_object)
+        batches = [df.iloc[i:i+batch_size_load] for i in range(0, total_rows, batch_size_load)]
+
+        for batch_idx, batch_df in enumerate(batches):
+            records = []
+            for _, row in batch_df.iterrows():
+                rec = {}
+                for sql_col, sf_field in mapping.items():
+                    val = row.get(sql_col)
+                    if pd.isna(val) if hasattr(val, '__class__') and val.__class__.__name__ in ('float', 'Float64') else False:
+                        val = None
+                    elif pd.isnull(val) if not isinstance(val, str) else False:
+                        val = None
+                    rec[sf_field] = val
+                records.append(rec)
+
+            try:
+                if sf_operation == "insert":
+                    results = sf_obj.insert_many(records)
+                elif sf_operation == "update":
+                    results = sf_obj.update_many(records)
+                elif sf_operation == "upsert":
+                    results = sf_obj.upsert_many(ext_id_field, records)
+                else:
+                    results = sf_obj.insert_many(records)
+
+                for i, res in enumerate(results):
+                    if isinstance(res, dict) and res.get('success'):
+                        total_success += 1
+                    else:
+                        total_failed += 1
+                        row_data = records[i].copy()
+                        row_data['_error'] = str(res.get('errors', res)) if isinstance(res, dict) else str(res)
+                        error_rows.append(row_data)
+            except Exception as batch_err:
+                total_failed += len(records)
+                for rec in records:
+                    rec['_error'] = str(batch_err)
+                    error_rows.append(rec)
+
+            pct = min(30 + int(65 * (batch_idx + 1) / len(batches)), 95)
+            progress.progress(pct, text=f"Processed {(batch_idx+1)*batch_size_load:,} / {total_rows:,} records…")
+
+        # Step 4 — Save error file if any
+        progress.progress(100, text="Complete ✅")
+        finished_at = _dt.now().isoformat()
+        final_status = "success" if total_failed == 0 else ("partial" if total_success > 0 else "failed")
+        update_pipeline_run(run_id, final_status, total_success, total_failed, "", finished_at)
+
+        status_box.success(f"✅ **Pipeline complete** — {total_success:,} succeeded, {total_failed:,} failed")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.metric("✅ Successful", f"{total_success:,}")
+        with col_r2:
+            st.metric("❌ Failed", f"{total_failed:,}")
+
+        if error_rows:
+            err_df = pd.DataFrame(error_rows)
+            import os, tempfile
+            err_path = os.path.join(tempfile.gettempdir(), f"mig_errors_{tgt_object}_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            err_df.to_csv(err_path, index=False)
+            register_output_file(err_path, os.path.basename(err_path), tgt_org, tgt_object, "SQL Migration Error", len(err_df), "failed")
+            st.warning(f"⚠️ {total_failed:,} records failed. Download error file:")
+            st.download_button("⬇️ Download Error CSV", err_df.to_csv(index=False).encode(), f"migration_errors_{tgt_object}.csv", "text/csv")
+
+    except Exception as e:
+        err_msg = str(e)
+        update_pipeline_run(run_id, "failed", total_success, total_failed, err_msg, _dt.now().isoformat())
+        progress.progress(100, text="Failed ❌")
+        status_box.error(f"❌ **Pipeline failed:** {err_msg}")
+        st.code(err_msg, language="text")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline History tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_pipeline_history():
+    """Show all past pipeline runs from SQLite."""
+    try:
+        from ui_components.file_store_manager import list_pipeline_runs, delete_pipeline_run, get_pipeline_run
+    except ImportError:
+        from file_store_manager import list_pipeline_runs, delete_pipeline_run, get_pipeline_run
+    import json as _json
+
+    runs = list_pipeline_runs(limit=200)
+    if not runs:
+        st.info("No pipeline runs yet. Run a pipeline from the **New Pipeline** tab.")
+        return
+
+    # Summary metrics
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1: st.metric("Total Runs", len(runs))
+    with col_m2: st.metric("Successful", sum(1 for r in runs if r['status'] == 'success'))
+    with col_m3: st.metric("Partial",    sum(1 for r in runs if r['status'] == 'partial'))
+    with col_m4: st.metric("Failed",     sum(1 for r in runs if r['status'] == 'failed'))
+
+    st.divider()
+
+    # Filter
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        dir_filter = st.selectbox("Filter by Direction", ["All", "SF→SQL", "SQL→SF"], key="hist_dir_filter")
+    with col_f2:
+        status_filter = st.selectbox("Filter by Status", ["All", "success", "partial", "failed", "running"], key="hist_status_filter")
+
+    filtered = [r for r in runs
+                if (dir_filter == "All" or r['direction'] == dir_filter)
+                and (status_filter == "All" or r['status'] == status_filter)]
+
+    if not filtered:
+        st.info("No runs match the current filter.")
+        return
+
+    STATUS_ICON = {"success": "✅", "partial": "⚠️", "failed": "❌", "running": "🔄", "pending": "⏳"}
+    DIR_ICON    = {"SF→SQL": "⬇️", "SQL→SF": "⬆️"}
+
+    for run in filtered:
+        icon = STATUS_ICON.get(run['status'], "❓")
+        dir_icon = DIR_ICON.get(run['direction'], "🔄")
+        label = f"{icon} {dir_icon} **{run['pipeline_name']}** | {run['started_at'][:19].replace('T', ' ')} | {run['records_success']:,} ok / {run['records_failed']:,} failed"
+        with st.expander(label, expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Direction:** {run['direction']}")
+                st.write(f"**Source:** {run['source_label']}")
+                st.write(f"**Target:** {run['target_label']}")
+                st.write(f"**Operation:** {run['operation']}")
+            with col2:
+                st.write(f"**Status:** {icon} {run['status'].upper()}")
+                st.write(f"**Records OK:** {run['records_success']:,}")
+                st.write(f"**Records Failed:** {run['records_failed']:,}")
+                st.write(f"**Started:** {run['started_at'][:19].replace('T', ' ')}")
+                if run['finished_at']:
+                    st.write(f"**Finished:** {run['finished_at'][:19].replace('T', ' ')}")
+
+            if run['error_message']:
+                st.error(f"**Error:** {run['error_message']}")
+
+            if run.get('table_name') and run['direction'] == 'SF→SQL':
+                st.code(f"SELECT TOP 100 * FROM {run['table_name']}", language="sql")
+                st.caption("Paste into SSMS to query your backup table.")
+
+            # Config details
+            with st.expander("🔧 Pipeline Config", expanded=False):
+                try:
+                    cfg = _json.loads(run.get('config_json', '{}'))
+                    st.json(cfg)
+                except Exception:
+                    st.write(run.get('config_json', ''))
+
+            # Action buttons
+            col_btn1, col_btn2 = st.columns([1, 1])
+            with col_btn1:
+                if st.button("🗑️ Delete this run", key=f"del_run_{run['id']}"):
+                    delete_pipeline_run(run['id'])
+                    st.success("Deleted")
+                    st.rerun()
+            with col_btn2:
+                st.info("To re-run: go to **New Pipeline** tab and use the same config shown above.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kept stubs for any external callers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def migrate_from_salesforce_to_sql(credentials: Dict, target_db: str):
+    """Delegated to the new pipeline system."""
+    _pipeline_sf_to_sql(credentials)
+
+def migrate_from_file_to_sql(credentials: Dict, target_db: str):
+    """Delegated to the new pipeline system."""
+    _pipeline_sf_to_sql(credentials)
+
+
 
 def show_bulk_operations(sf_conn, credentials: Dict):
     """Bulk operations interface"""
@@ -4895,14 +5533,6 @@ def show_cross_org_migration(credentials: Dict):
 def show_bulk_validation(sf_conn):
     """Bulk validation interface"""
     st.write("🔄 Bulk validation feature coming soon...")
-
-def migrate_from_salesforce_to_sql(credentials: Dict, target_db: str):
-    """Migrate from Salesforce to SQL"""
-    st.write("🔄 Salesforce to SQL migration feature coming soon...")
-
-def migrate_from_file_to_sql(credentials: Dict, target_db: str):
-    """Migrate from file to SQL"""
-    st.write("🔄 File to SQL migration feature coming soon...")
 
 # ================================
 # SQL SERVER HELPER FUNCTIONS

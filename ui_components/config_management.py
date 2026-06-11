@@ -13,7 +13,7 @@ def show_configuration(credentials: Dict):
     
     tab1, tab2, tab3, tab4 = st.tabs([
         "🏢 Organizations", 
-        "🗄️ Database Settings", 
+        "� Source Connections", 
         "📁 Directory Structure",
         "🔧 System Settings"
     ])
@@ -22,7 +22,7 @@ def show_configuration(credentials: Dict):
         show_org_management(credentials)
     
     with tab2:
-        show_database_settings(credentials)
+        show_source_connections(credentials)
     
     with tab3:
         show_directory_structure()
@@ -147,289 +147,555 @@ def show_org_management(credentials: Dict):
                 else:
                     st.error("Please fill in all required fields (Name, Username, Password)")
 
-def show_database_settings(credentials: Dict):
-    """Manage database connections"""
-    st.subheader("🗄️ SQL Server Database Settings")
-    st.markdown("Manage your SQL Server database connections for data operations")
-    
-    # Display existing SQL connections
-    sql_connections = {k: v for k, v in credentials.items() if 'sql' in k.lower()}
-    
-    if sql_connections:
-        st.write("### Configured Database Connections")
-        
-        # Create a more detailed table view
-        db_data = []
-        for db_name, db_config in sql_connections.items():
-            db_data.append({
-                "Connection Name": db_name.replace('sql_', '').upper(),
-                "Server": db_config.get('server', 'N/A'),
-                "Database": db_config.get('database', 'N/A'),
-                "Username": db_config.get('username', 'Windows Auth' if db_config.get('Trusted_Connection') == 'yes' else 'N/A'),
-                "Driver": db_config.get('driver', 'N/A'),
-                "Auth Type": "Windows Authentication" if db_config.get('Trusted_Connection') == 'yes' else "SQL Authentication"
+def show_source_connections(credentials: Dict):
+    """Manage all source database connections: SQL Server, Oracle, Snowflake, PostgreSQL"""
+    st.subheader("🔌 Source Connections")
+    st.markdown("Configure source database connections. Salesforce target orgs are managed in the **Organizations** tab.")
+
+    # ── Source type labels and key prefixes ──────────────────────────────────
+    SOURCE_TYPES = {
+        "SQL Server":   {"prefix": "sql_",        "icon": "🗄️",  "pkg": "pyodbc"},
+        "Oracle":       {"prefix": "oracle_",     "icon": "🔶",  "pkg": "oracledb"},
+        "Snowflake":    {"prefix": "snowflake_",  "icon": "❄️",  "pkg": "snowflake-connector-python"},
+        "PostgreSQL":   {"prefix": "pg_",         "icon": "🐘",  "pkg": "psycopg2"},
+    }
+
+    # ── Collect all existing source connections ───────────────────────────────
+    all_source_conns = {}
+    for k, v in credentials.items():
+        for stype, meta in SOURCE_TYPES.items():
+            if k.lower().startswith(meta["prefix"]):
+                all_source_conns[k] = {**v, "_source_type": stype, "_display_name": k[len(meta["prefix"]):].upper()}
+
+    # ── Overview table ────────────────────────────────────────────────────────
+    if all_source_conns:
+        st.write("### Configured Source Connections")
+        overview = []
+        for k, v in all_source_conns.items():
+            stype = v["_source_type"]
+            host = (v.get("server") or v.get("host") or v.get("account") or "N/A")
+            db   = (v.get("database") or v.get("service_name") or v.get("sid") or "N/A")
+            overview.append({
+                "Name":        v["_display_name"],
+                "Type":        f"{SOURCE_TYPES[stype]['icon']} {stype}",
+                "Host/Account": host,
+                "Database":    db,
+                "Username":    v.get("username", "Windows Auth"),
             })
-        
-        if db_data:
-            df_dbs = pd.DataFrame(db_data)
-            st.dataframe(df_dbs, use_container_width=True)
-        
-        # Detailed view with test connections
+        st.dataframe(pd.DataFrame(overview), use_container_width=True)
+
         st.write("### Connection Details & Testing")
-        for db_name, db_config in sql_connections.items():
-            with st.expander(f"📊 {db_name.replace('sql_', '').upper()} - Connection Details", expanded=False):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write("**Server:**", db_config.get('server', 'N/A'))
-                    st.write("**Database:**", db_config.get('database', 'N/A'))
-                    st.write("**Port:**", db_config.get('port', '1433 (default)'))
-                    st.write("**Driver:**", db_config.get('driver', 'N/A'))
-                
-                with col2:
-                    auth_type = "Windows Authentication" if db_config.get('Trusted_Connection') == 'yes' else "SQL Authentication"
-                    st.write("**Authentication:**", auth_type)
-                    if auth_type == "SQL Authentication":
-                        st.write("**Username:**", db_config.get('username', 'N/A'))
-                        st.write("**Password:**", "***" if db_config.get('password') else 'Not set')
-                    st.write("**Encryption:**", db_config.get('encrypt', 'No'))
-                
-                # Test connection with detailed feedback
-                col_test1, col_test2 = st.columns([1, 1])
-                
-                with col_test1:
-                    if st.button(f"🔍 Test {db_name.replace('sql_', '')} Connection", key=f"test_db_{db_name}"):
-                        test_database_connection(db_config, db_name)
-                
-                with col_test2:
-                    if st.button(f"🗑️ Remove {db_name.replace('sql_', '')}", key=f"remove_db_{db_name}"):
-                        if remove_database_connection(credentials, db_name):
-                            st.success(f"✅ Database connection '{db_name.replace('sql_', '')}' removed successfully!")
-                            st.rerun()
-                        else:
-                            st.error("❌ Failed to remove database connection")
+        for conn_key, conn_val in all_source_conns.items():
+            stype = conn_val["_source_type"]
+            display = conn_val["_display_name"]
+            with st.expander(f"{SOURCE_TYPES[stype]['icon']} {display} ({stype})", expanded=False):
+                _show_connection_detail(conn_key, conn_val, stype, credentials)
     else:
-        st.info("🔍 No database connections configured. Add your first SQL Server connection below.")
-    
+        st.info("No source connections configured yet. Add one below.")
+
     st.divider()
-    
-    # Add new database connection with enhanced UI
-    st.write("### Add New SQL Server Connection")
-    
-    with st.expander("➕ Add New SQL Server Database Connection", expanded=False):
-        st.markdown("**Configure a new SQL Server database connection for data operations**")
-        
-        with st.form("add_db_form"):
-            # Basic connection details
-            st.markdown("#### 🔧 **Connection Details**")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                db_name = st.text_input(
-                    "Connection Name*", 
-                    help="Unique identifier for this database connection (e.g., 'Production', 'Staging', 'Dev')"
-                )
-                server = st.text_input(
-                    "Server Address*", 
-                    help="SQL Server instance name or IP address (e.g., 'localhost', '192.168.1.100\\SQLEXPRESS')"
-                )
-                database = st.text_input(
-                    "Database Name*", 
-                    help="Name of the database to connect to"
-                )
-                port = st.text_input(
-                    "Port", 
-                    value="1433",
-                    help="SQL Server port (default: 1433)"
-                )
-            
-            with col2:
-                # Auto-detect installed SQL Server drivers
-                try:
-                    import pyodbc as _pyodbc
-                    installed_sql_drivers = [
-                        d for d in _pyodbc.drivers()
-                        if 'sql server' in d.lower() or 'sql native' in d.lower()
-                    ]
-                except Exception:
-                    installed_sql_drivers = []
 
-                driver_options = ["Auto-detect (recommended)"] + installed_sql_drivers + [
-                    "{ODBC Driver 18 for SQL Server}",
-                    "{ODBC Driver 17 for SQL Server}",
-                    "{ODBC Driver 13 for SQL Server}",
-                    "{SQL Server}",
-                    "{SQL Server Native Client 11.0}"
-                ]
-                # Remove duplicates while preserving order
-                seen = set()
-                driver_options = [x for x in driver_options if not (x in seen or seen.add(x))]
+    # ── Add new connection ────────────────────────────────────────────────────
+    st.write("### Add New Source Connection")
 
-                driver = st.selectbox(
-                    "ODBC Driver (optional)",
-                    driver_options,
-                    index=0,
-                    help="Auto-detect will pick the best available driver on this machine. You can also choose manually."
-                )
-                
-                encrypt = st.selectbox(
-                    "Encryption",
-                    ["no", "yes", "strict"],
-                    index=0,
-                    help="Connection encryption level"
-                )
-                
-                trust_server_cert = st.checkbox(
-                    "Trust Server Certificate",
-                    value=False,
-                    help="Trust the server certificate (use with caution in production)"
-                )
-                
-                connection_timeout = st.number_input(
-                    "Connection Timeout (seconds)",
-                    min_value=5,
-                    max_value=300,
-                    value=30,
-                    help="Maximum time to wait for connection"
-                )
-            
-            st.divider()
-            
-            # Authentication section
-            st.markdown("#### 🔐 **Authentication Settings**")
-            
-            auth_type = st.radio(
-                "Authentication Type",
-                ["Windows Authentication", "SQL Server Authentication"],
-                help="Choose authentication method"
-            )
-            
-            if auth_type == "SQL Server Authentication":
-                col_auth1, col_auth2 = st.columns(2)
-                
-                with col_auth1:
-                    username = st.text_input(
-                        "Username*", 
-                        help="SQL Server username"
-                    )
-                
-                with col_auth2:
-                    password = st.text_input(
-                        "Password*", 
-                        type="password", 
-                        help="SQL Server password"
-                    )
+    source_type = st.selectbox(
+        "Select Source Type",
+        list(SOURCE_TYPES.keys()),
+        key="new_source_type_selector",
+        help="Choose the database technology you want to connect to"
+    )
+
+    # Check package availability and warn immediately
+    pkg = SOURCE_TYPES[source_type]["pkg"]
+    pkg_available = _check_package(pkg)
+    if not pkg_available:
+        install_cmd = f"pip install {pkg}"
+        st.warning(f"⚠️ **Required package `{pkg}` is not installed.**  \nRun in your terminal:  \n```\n{install_cmd}\n```\nYou can still configure the connection now and test it after installing the package.")
+
+    with st.expander(f"➕ Add New {source_type} Connection", expanded=True):
+        if source_type == "SQL Server":
+            _form_sqlserver(credentials)
+        elif source_type == "Oracle":
+            _form_oracle(credentials)
+        elif source_type == "Snowflake":
+            _form_snowflake(credentials)
+        elif source_type == "PostgreSQL":
+            _form_postgresql(credentials)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Package availability check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_package(pkg_name: str) -> bool:
+    """Return True if the package is importable."""
+    import importlib
+    import_name = {
+        "pyodbc": "pyodbc",
+        "oracledb": "oracledb",
+        "snowflake-connector-python": "snowflake.connector",
+        "psycopg2": "psycopg2",
+    }.get(pkg_name, pkg_name)
+    try:
+        importlib.import_module(import_name)
+        return True
+    except ImportError:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection detail panel (test + remove)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_connection_detail(conn_key: str, conn_val: dict, stype: str, credentials: Dict):
+    col1, col2 = st.columns(2)
+    with col1:
+        if stype == "SQL Server":
+            st.write("**Server:**",   conn_val.get("server",   "N/A"))
+            st.write("**Database:**", conn_val.get("database", "N/A"))
+            st.write("**Port:**",     conn_val.get("port",     "1433"))
+        elif stype == "Oracle":
+            st.write("**Host:**",         conn_val.get("host",         "N/A"))
+            st.write("**Port:**",         conn_val.get("port",         "1521"))
+            st.write("**Service/SID:**",  conn_val.get("service_name") or conn_val.get("sid", "N/A"))
+        elif stype == "Snowflake":
+            st.write("**Account:**",   conn_val.get("account",   "N/A"))
+            st.write("**Warehouse:**", conn_val.get("warehouse", "N/A"))
+            st.write("**Database:**",  conn_val.get("database",  "N/A"))
+            st.write("**Schema:**",    conn_val.get("schema",    "N/A"))
+        elif stype == "PostgreSQL":
+            st.write("**Host:**",     conn_val.get("host",     "N/A"))
+            st.write("**Port:**",     conn_val.get("port",     "5432"))
+            st.write("**Database:**", conn_val.get("database", "N/A"))
+    with col2:
+        st.write("**Username:**", conn_val.get("username", "Windows Auth"))
+        st.write("**Password:**", "***" if conn_val.get("password") else "Not set")
+        if stype == "Snowflake":
+            st.write("**Role:**", conn_val.get("role", "default"))
+        if stype == "SQL Server":
+            st.write("**Auth:**", "Windows" if conn_val.get("Trusted_Connection") == "yes" else "SQL")
+
+    col_t, col_r = st.columns(2)
+    with col_t:
+        if st.button(f"🔍 Test Connection", key=f"test_{conn_key}"):
+            _dispatch_test(conn_val, stype, conn_key)
+    with col_r:
+        if st.button(f"🗑️ Remove", key=f"remove_{conn_key}"):
+            if remove_database_connection(credentials, conn_key):
+                st.success(f"✅ Removed '{conn_val['_display_name']}'")
+                st.rerun()
             else:
-                username = ""
-                password = ""
-                st.info("ℹ️ Windows Authentication will use your current Windows credentials")
-            
-            st.divider()
-            
-            # Advanced settings
-            with st.expander("⚙️ Advanced Settings", expanded=False):
-                col_adv1, col_adv2 = st.columns(2)
-                
-                with col_adv1:
-                    application_name = st.text_input(
-                        "Application Name",
-                        value="DM_Toolkit",
-                        help="Application name for connection tracking"
-                    )
-                    
-                    mars_connection = st.checkbox(
-                        "Enable MARS",
-                        value=False,
-                        help="Multiple Active Result Sets"
-                    )
-                
-                with col_adv2:
-                    command_timeout = st.number_input(
-                        "Command Timeout (seconds)",
-                        min_value=30,
-                        max_value=3600,
-                        value=300,
-                        help="Maximum time to wait for command execution"
-                    )
-                    
-                    auto_commit = st.checkbox(
-                        "Auto Commit",
-                        value=True,
-                        help="Automatically commit transactions"
-                    )
-            
-            # Test connection before saving
-            col_submit1, col_submit2 = st.columns([1, 2])
-            
-            with col_submit1:
-                test_before_save = st.form_submit_button("🔍 Test Connection")
-            
-            with col_submit2:
-                submit_db = st.form_submit_button("✅ Save Database Connection", type="primary")
-            
-            # Handle test connection
-            if test_before_save:
-                if db_name and server and database:
-                    # Create temporary config for testing
-                    test_config = create_db_config(
-                        server, database, username, password, driver, port,
-                        auth_type == "Windows Authentication", encrypt, trust_server_cert,
-                        connection_timeout, application_name, mars_connection, 
-                        command_timeout, auto_commit
-                    )
-                    
-                    st.write("#### 🧪 Testing Connection...")
-                    test_database_connection(test_config, f"Test_{db_name}")
-                else:
-                    st.error("❌ Please fill in required fields (Connection Name, Server, Database)")
-            
-            # Handle save connection
-            if submit_db:
-                if db_name and server and database:
-                    if auth_type == "SQL Server Authentication" and (not username or not password):
-                        st.error("❌ Username and password are required for SQL Server Authentication")
+                st.error("❌ Failed to remove connection")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dispatch_test(config: dict, stype: str, display_name: str = ""):
+    if stype == "SQL Server":
+        test_database_connection(config, display_name)
+    elif stype == "Oracle":
+        _test_oracle_connection(config)
+    elif stype == "Snowflake":
+        _test_snowflake_connection(config)
+    elif stype == "PostgreSQL":
+        _test_postgresql_connection(config)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Oracle
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _form_oracle(credentials: Dict):
+    st.markdown("**Configure Oracle Database connection**")
+    with st.form("add_oracle_form"):
+        st.markdown("#### 🔧 Connection Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            conn_name  = st.text_input("Connection Name*", help="Unique name e.g. 'OracleProd'")
+            host       = st.text_input("Host*", help="Oracle server hostname or IP")
+            port       = st.text_input("Port", value="1521", help="Default: 1521")
+        with col2:
+            connect_by = st.radio("Connect by", ["Service Name", "SID"], horizontal=True)
+            service_or_sid = st.text_input(
+                "Service Name*" if connect_by == "Service Name" else "SID*",
+                help="Oracle service name (preferred) or SID"
+            )
+            encoding   = st.selectbox("Encoding", ["UTF-8", "AL32UTF8", "US7ASCII"], index=0)
+
+        st.markdown("#### 🔐 Authentication")
+        col3, col4 = st.columns(2)
+        with col3:
+            ora_user = st.text_input("Username*")
+        with col4:
+            ora_pass = st.text_input("Password*", type="password")
+        connect_mode = st.selectbox("Connection Mode", ["Default", "SYSDBA", "SYSOPER"], index=0)
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            test_btn = st.form_submit_button("🔍 Test Connection")
+        with col_s2:
+            save_btn = st.form_submit_button("✅ Save Connection", type="primary")
+
+        if test_btn or save_btn:
+            if not (conn_name and host and service_or_sid and ora_user and ora_pass):
+                st.error("❌ Please fill in all required fields")
+            else:
+                cfg = {
+                    "db_type": "oracle",
+                    "host": host,
+                    "port": port or "1521",
+                    "service_name": service_or_sid if connect_by == "Service Name" else "",
+                    "sid": service_or_sid if connect_by == "SID" else "",
+                    "username": ora_user,
+                    "password": ora_pass,
+                    "encoding": encoding,
+                    "connect_mode": connect_mode,
+                }
+                if test_btn:
+                    _test_oracle_connection(cfg)
+                if save_btn:
+                    key = f"oracle_{conn_name}"
+                    if key in credentials:
+                        st.error(f"❌ Connection '{conn_name}' already exists")
+                    elif save_credentials(credentials, key, cfg):
+                        st.balloons()
+                        st.success(f"🎉 Oracle connection '{conn_name}' saved!")
+                        import time; time.sleep(1); st.rerun()
                     else:
-                        # Create database config
-                        new_db_config = create_db_config(
-                            server, database, username, password, driver, port,
-                            auth_type == "Windows Authentication", encrypt, trust_server_cert,
-                            connection_timeout, application_name, mars_connection, 
-                            command_timeout, auto_commit
-                        )
-                        
-                        # Check if connection name already exists
-                        if f"sql_{db_name}" in credentials:
-                            st.error(f"❌ Database connection '{db_name}' already exists! Please choose a different name.")
-                        else:
-                            # Save to credentials
-                            if save_credentials(credentials, f"sql_{db_name}", new_db_config):
-                                # Show success with balloons effect
-                                st.balloons()
-                                st.success(f"🎉 **Database connection '{db_name}' created successfully!**")
-                                
-                                # Show detailed success information
-                                st.markdown(f"""
-                                **✅ What happened:**
-                                - New SQL Server connection saved securely
-                                - Connection added to your available databases list
-                                - You can now use it in Data Operations for extraction and loading
-                                
-                                **🚀 Next steps:**
-                                1. Go to Data Operations → SQL Server tab
-                                2. Select '{db_name}' from the database dropdown
-                                3. Test queries and data operations
-                                4. Use for data extraction or loading operations
-                                """)
-                                
-                                # Auto-refresh after showing success
-                                import time
-                                time.sleep(2)
-                                st.rerun()
-                            else:
-                                st.error("❌ Failed to save database connection")
+                        st.error("❌ Failed to save connection")
+
+
+def _test_oracle_connection(cfg: dict):
+    with st.spinner("Testing Oracle connection..."):
+        try:
+            import oracledb
+            dsn = cfg.get("service_name") or cfg.get("sid", "")
+            host = cfg.get("host", "")
+            port = int(cfg.get("port", 1521))
+            if cfg.get("service_name"):
+                dsn_str = oracledb.makedsn(host, port, service_name=cfg["service_name"])
+            else:
+                dsn_str = oracledb.makedsn(host, port, sid=cfg.get("sid", ""))
+            mode = 0
+            if cfg.get("connect_mode") == "SYSDBA":
+                mode = oracledb.AUTH_MODE_SYSDBA
+            elif cfg.get("connect_mode") == "SYSOPER":
+                mode = oracledb.AUTH_MODE_SYSOPER
+            conn = oracledb.connect(user=cfg["username"], password=cfg["password"], dsn=dsn_str, mode=mode)
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM DUAL")
+            cursor.execute("SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM DUAL")
+            db_name = cursor.fetchone()[0]
+            cursor.execute("SELECT USER FROM DUAL")
+            db_user = cursor.fetchone()[0]
+            conn.close()
+            st.success("✅ **Oracle connection successful!**")
+            st.info(f"**Database:** {db_name}")
+            st.info(f"**Connected as:** {db_user}")
+        except ImportError:
+            st.error("❌ `oracledb` package not installed. Run: `pip install oracledb`")
+        except Exception as e:
+            err = str(e)
+            st.error("❌ **Oracle connection failed**")
+            st.code(err, language="text")
+            if "ORA-01017" in err:
+                st.warning("🔐 Invalid username or password")
+            elif "ORA-12541" in err or "TNS:no listener" in err:
+                st.warning("🌐 Cannot reach Oracle listener — check host, port, and firewall")
+            elif "ORA-12154" in err:
+                st.warning("🔧 TNS could not resolve service name / SID")
+            elif "DPY-6000" in err or "DPY-4011" in err:
+                st.warning("📦 Oracle Client libraries may be required for thick mode — try thin mode (default with oracledb)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Snowflake
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _form_snowflake(credentials: Dict):
+    st.markdown("**Configure Snowflake connection**")
+    with st.form("add_snowflake_form"):
+        st.markdown("#### 🔧 Connection Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            conn_name  = st.text_input("Connection Name*", help="Unique name e.g. 'SnowflakeDW'")
+            account    = st.text_input("Account Identifier*", help="e.g. xyz12345.us-east-1  (from your Snowflake URL)")
+            warehouse  = st.text_input("Warehouse*", help="Compute warehouse name e.g. COMPUTE_WH")
+        with col2:
+            sf_database = st.text_input("Database*",  help="Snowflake database name")
+            sf_schema   = st.text_input("Schema",     value="PUBLIC", help="Schema name (default: PUBLIC)")
+            sf_role     = st.text_input("Role",       help="Optional: Snowflake role e.g. SYSADMIN")
+
+        st.markdown("#### 🔐 Authentication")
+        col3, col4 = st.columns(2)
+        with col3:
+            sf_user = st.text_input("Username*")
+        with col4:
+            sf_pass = st.text_input("Password*", type="password")
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            test_btn = st.form_submit_button("🔍 Test Connection")
+        with col_s2:
+            save_btn = st.form_submit_button("✅ Save Connection", type="primary")
+
+        if test_btn or save_btn:
+            if not (conn_name and account and warehouse and sf_database and sf_user and sf_pass):
+                st.error("❌ Please fill in all required fields")
+            else:
+                cfg = {
+                    "db_type": "snowflake",
+                    "account": account,
+                    "warehouse": warehouse,
+                    "database": sf_database,
+                    "schema": sf_schema or "PUBLIC",
+                    "role": sf_role or "",
+                    "username": sf_user,
+                    "password": sf_pass,
+                }
+                if test_btn:
+                    _test_snowflake_connection(cfg)
+                if save_btn:
+                    key = f"snowflake_{conn_name}"
+                    if key in credentials:
+                        st.error(f"❌ Connection '{conn_name}' already exists")
+                    elif save_credentials(credentials, key, cfg):
+                        st.balloons()
+                        st.success(f"🎉 Snowflake connection '{conn_name}' saved!")
+                        import time; time.sleep(1); st.rerun()
+                    else:
+                        st.error("❌ Failed to save connection")
+
+
+def _test_snowflake_connection(cfg: dict):
+    with st.spinner("Testing Snowflake connection..."):
+        try:
+            import snowflake.connector
+            kwargs = {
+                "user":      cfg["username"],
+                "password":  cfg["password"],
+                "account":   cfg["account"],
+                "warehouse": cfg["warehouse"],
+                "database":  cfg["database"],
+                "schema":    cfg.get("schema", "PUBLIC"),
+            }
+            if cfg.get("role"):
+                kwargs["role"] = cfg["role"]
+            conn = snowflake.connector.connect(**kwargs)
+            cur = conn.cursor()
+            cur.execute("SELECT CURRENT_VERSION(), CURRENT_DATABASE(), CURRENT_USER(), CURRENT_WAREHOUSE()")
+            row = cur.fetchone()
+            conn.close()
+            st.success("✅ **Snowflake connection successful!**")
+            st.info(f"**Snowflake Version:** {row[0]}")
+            st.info(f"**Database:** {row[1]}")
+            st.info(f"**User:** {row[2]}")
+            st.info(f"**Warehouse:** {row[3]}")
+        except ImportError:
+            st.error("❌ `snowflake-connector-python` not installed. Run: `pip install snowflake-connector-python`")
+        except Exception as e:
+            err = str(e)
+            st.error("❌ **Snowflake connection failed**")
+            st.code(err, language="text")
+            if "250001" in err or "Incorrect username or password" in err:
+                st.warning("🔐 Incorrect username or password")
+            elif "404" in err or "account" in err.lower():
+                st.warning("🌐 Account identifier not found — check your Snowflake account URL format")
+            elif "250006" in err:
+                st.warning("🏭 Warehouse not found or suspended — check warehouse name")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _form_postgresql(credentials: Dict):
+    st.markdown("**Configure PostgreSQL connection**")
+    with st.form("add_pg_form"):
+        st.markdown("#### 🔧 Connection Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            conn_name = st.text_input("Connection Name*", help="Unique name e.g. 'PostgresProd'")
+            host      = st.text_input("Host*", help="PostgreSQL server hostname or IP")
+            port      = st.text_input("Port", value="5432", help="Default: 5432")
+        with col2:
+            pg_db     = st.text_input("Database*", help="Database name")
+            ssl_mode  = st.selectbox("SSL Mode", ["prefer", "require", "disable", "verify-full"], index=0,
+                                     help="SSL/TLS mode for the connection")
+
+        st.markdown("#### 🔐 Authentication")
+        col3, col4 = st.columns(2)
+        with col3:
+            pg_user = st.text_input("Username*")
+        with col4:
+            pg_pass = st.text_input("Password*", type="password")
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            test_btn = st.form_submit_button("🔍 Test Connection")
+        with col_s2:
+            save_btn = st.form_submit_button("✅ Save Connection", type="primary")
+
+        if test_btn or save_btn:
+            if not (conn_name and host and pg_db and pg_user and pg_pass):
+                st.error("❌ Please fill in all required fields")
+            else:
+                cfg = {
+                    "db_type": "postgresql",
+                    "host":     host,
+                    "port":     port or "5432",
+                    "database": pg_db,
+                    "username": pg_user,
+                    "password": pg_pass,
+                    "ssl_mode": ssl_mode,
+                }
+                if test_btn:
+                    _test_postgresql_connection(cfg)
+                if save_btn:
+                    key = f"pg_{conn_name}"
+                    if key in credentials:
+                        st.error(f"❌ Connection '{conn_name}' already exists")
+                    elif save_credentials(credentials, key, cfg):
+                        st.balloons()
+                        st.success(f"🎉 PostgreSQL connection '{conn_name}' saved!")
+                        import time; time.sleep(1); st.rerun()
+                    else:
+                        st.error("❌ Failed to save connection")
+
+
+def _test_postgresql_connection(cfg: dict):
+    with st.spinner("Testing PostgreSQL connection..."):
+        try:
+            import psycopg2
+            conn = psycopg2.connect(
+                host=cfg["host"],
+                port=int(cfg.get("port", 5432)),
+                dbname=cfg["database"],
+                user=cfg["username"],
+                password=cfg["password"],
+                sslmode=cfg.get("ssl_mode", "prefer"),
+                connect_timeout=15,
+            )
+            cur = conn.cursor()
+            cur.execute("SELECT version(), current_database(), current_user")
+            row = cur.fetchone()
+            conn.close()
+            st.success("✅ **PostgreSQL connection successful!**")
+            st.info(f"**Database:** {row[1]}")
+            st.info(f"**User:** {row[2]}")
+            with st.expander("📊 Server Details"):
+                st.text(row[0])
+        except ImportError:
+            st.error("❌ `psycopg2` not installed. Run: `pip install psycopg2-binary`")
+        except Exception as e:
+            err = str(e)
+            st.error("❌ **PostgreSQL connection failed**")
+            st.code(err, language="text")
+            if "password authentication failed" in err:
+                st.warning("🔐 Incorrect username or password")
+            elif "could not connect to server" in err or "Connection refused" in err:
+                st.warning("🌐 Cannot reach PostgreSQL server — check host, port, and firewall")
+            elif "database" in err and "does not exist" in err:
+                st.warning("🗄️ Database not found — check database name")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL Server form (kept from original show_database_settings)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _form_sqlserver(credentials: Dict):
+    """SQL Server add-connection form — original logic, now called from show_source_connections"""
+    # Display existing SQL connections (kept inside for consistency)
+    sql_connections = {k: v for k, v in credentials.items() if k.lower().startswith("sql_")}
+    if not sql_connections:
+        st.info("No SQL Server connections configured yet.")
+
+    st.markdown("**Configure a new SQL Server database connection**")
+
+    with st.form("add_db_form"):
+        st.markdown("#### 🔧 **Connection Details**")
+        col1, col2 = st.columns(2)
+        with col1:
+            db_name = st.text_input("Connection Name*", help="e.g. 'Production', 'Staging'")
+            server  = st.text_input("Server Address*", help="e.g. 'localhost' or '192.168.1.100\\SQLEXPRESS'")
+            database = st.text_input("Database Name*")
+            port    = st.text_input("Port", value="1433")
+        with col2:
+            try:
+                import pyodbc as _pyodbc
+                installed_sql_drivers = [d for d in _pyodbc.drivers()
+                                         if 'sql server' in d.lower() or 'sql native' in d.lower()]
+            except Exception:
+                installed_sql_drivers = []
+            driver_options = ["Auto-detect (recommended)"] + installed_sql_drivers + [
+                "{ODBC Driver 18 for SQL Server}", "{ODBC Driver 17 for SQL Server}",
+                "{ODBC Driver 13 for SQL Server}", "{SQL Server}", "{SQL Server Native Client 11.0}"]
+            seen = set()
+            driver_options = [x for x in driver_options if not (x in seen or seen.add(x))]
+            driver = st.selectbox("ODBC Driver (optional)", driver_options, index=0)
+            encrypt = st.selectbox("Encryption", ["no", "yes", "strict"], index=0)
+            trust_server_cert = st.checkbox("Trust Server Certificate", value=False)
+            connection_timeout = st.number_input("Connection Timeout (s)", min_value=5, max_value=300, value=30)
+
+        st.divider()
+        st.markdown("#### 🔐 **Authentication**")
+        auth_type = st.radio("Authentication Type", ["Windows Authentication", "SQL Server Authentication"])
+        if auth_type == "SQL Server Authentication":
+            col_a1, col_a2 = st.columns(2)
+            with col_a1:
+                username = st.text_input("Username*")
+            with col_a2:
+                password = st.text_input("Password*", type="password")
+        else:
+            username = password = ""
+            st.info("ℹ️ Windows Authentication will use your current Windows credentials")
+
+        with st.expander("⚙️ Advanced Settings", expanded=False):
+            col_adv1, col_adv2 = st.columns(2)
+            with col_adv1:
+                application_name = st.text_input("Application Name", value="DM_Toolkit")
+                mars_connection  = st.checkbox("Enable MARS", value=False)
+            with col_adv2:
+                command_timeout = st.number_input("Command Timeout (s)", min_value=30, max_value=3600, value=300)
+                auto_commit     = st.checkbox("Auto Commit", value=True)
+
+        col_s1, col_s2 = st.columns([1, 2])
+        with col_s1:
+            test_before_save = st.form_submit_button("🔍 Test Connection")
+        with col_s2:
+            submit_db = st.form_submit_button("✅ Save Database Connection", type="primary")
+
+        if test_before_save or submit_db:
+            if not (db_name and server and database):
+                st.error("❌ Please fill in required fields (Connection Name, Server, Database)")
+            else:
+                if auth_type == "SQL Server Authentication" and (not username or not password):
+                    st.error("❌ Username and password required for SQL Server Authentication")
                 else:
-                    st.error("❌ Please fill in all required fields (Connection Name, Server, Database)")
+                    cfg = create_db_config(server, database, username, password, driver, port,
+                                           auth_type == "Windows Authentication", encrypt,
+                                           trust_server_cert, connection_timeout,
+                                           application_name, mars_connection, command_timeout, auto_commit)
+                    if test_before_save:
+                        test_database_connection(cfg, f"Test_{db_name}")
+                    if submit_db:
+                        key = f"sql_{db_name}"
+                        if key in credentials:
+                            st.error(f"❌ Connection '{db_name}' already exists")
+                        elif save_credentials(credentials, key, cfg):
+                            st.balloons()
+                            st.success(f"🎉 SQL Server connection '{db_name}' saved!")
+                            import time; time.sleep(2); st.rerun()
+                        else:
+                            st.error("❌ Failed to save connection")
+
+
+def show_database_settings(credentials: Dict):
+    """Kept for backward compatibility — delegates to show_source_connections"""
+    show_source_connections(credentials)
+
 
 def show_directory_structure():
     """Show and manage directory structure"""

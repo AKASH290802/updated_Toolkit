@@ -58,6 +58,25 @@ def initialize_db():
                 FOREIGN KEY (source_file_id) REFERENCES source_files(id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline_name   TEXT    NOT NULL,
+                direction       TEXT    NOT NULL,
+                source_label    TEXT    DEFAULT '',
+                target_label    TEXT    DEFAULT '',
+                object_name     TEXT    DEFAULT '',
+                table_name      TEXT    DEFAULT '',
+                operation       TEXT    DEFAULT '',
+                status          TEXT    DEFAULT 'pending',
+                records_success INTEGER DEFAULT 0,
+                records_failed  INTEGER DEFAULT 0,
+                error_message   TEXT    DEFAULT '',
+                config_json     TEXT    DEFAULT '{}',
+                started_at      TEXT    NOT NULL,
+                finished_at     TEXT    DEFAULT ''
+            )
+        """)
         conn.commit()
 
 
@@ -346,3 +365,75 @@ def scan_and_register_existing():
                         registered += 1
 
     return registered
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline run persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_pipeline_run(pipeline_name, direction, source_label, target_label,
+                      object_name, table_name, operation, status,
+                      records_success, records_failed, error_message, config_dict,
+                      started_at, finished_at=''):
+    """Persist a pipeline run record. Returns the new run id."""
+    initialize_db()
+    import json as _json
+    config_json = _json.dumps(config_dict or {})
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """INSERT INTO pipeline_runs
+               (pipeline_name, direction, source_label, target_label,
+                object_name, table_name, operation, status,
+                records_success, records_failed, error_message,
+                config_json, started_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (pipeline_name, direction, source_label, target_label,
+             object_name, table_name, operation, status,
+             records_success, records_failed, error_message,
+             config_json, started_at, finished_at)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def update_pipeline_run(run_id, status, records_success, records_failed,
+                        error_message='', finished_at=''):
+    """Update an existing pipeline run after completion."""
+    initialize_db()
+    with _get_connection() as conn:
+        conn.execute(
+            """UPDATE pipeline_runs
+               SET status=?, records_success=?, records_failed=?,
+                   error_message=?, finished_at=?
+               WHERE id=?""",
+            (status, records_success, records_failed, error_message, finished_at, run_id)
+        )
+        conn.commit()
+
+
+def list_pipeline_runs(limit=100):
+    """Return all pipeline runs, newest first."""
+    initialize_db()
+    with _get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_pipeline_run(run_id):
+    """Return a single pipeline run dict by id."""
+    initialize_db()
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM pipeline_runs WHERE id=?", (run_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_pipeline_run(run_id):
+    """Delete a pipeline run record."""
+    initialize_db()
+    with _get_connection() as conn:
+        conn.execute("DELETE FROM pipeline_runs WHERE id=?", (run_id,))
+        conn.commit()
